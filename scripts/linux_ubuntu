@@ -1,0 +1,348 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Minimal Ubuntu bootstrap for Aletheia's local ONNX Runtime + TensorRT path.
+# Target: Ubuntu 24.04, NVIDIA GPU, CUDA 12.6, cuDNN 9, TensorRT 10.
+# Run from anywhere:
+#   bash scripts/linux_ubuntu
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SUDO=""
+if [[ "${EUID}" -ne 0 ]]; then
+  SUDO="sudo"
+fi
+
+CUDA_VERSION="${TELLODB_CUDA_VERSION:-12.6}"
+CUDA_HOME_DEFAULT="/usr/local/cuda-${CUDA_VERSION}"
+CUDA_TOOLKIT_PACKAGE="${TELLODB_CUDA_TOOLKIT_PACKAGE:-cuda-toolkit-12-6}"
+
+EMBED_BACKEND="${TEMPORAL_MEMORY_EMBEDDING_BACKEND:-candle}"
+EMBED_MODEL="${TEMPORAL_MEMORY_EMBEDDING_MODEL:-BAAI/bge-small-en-v1.5}"
+EMBED_TOKENIZER_MODEL="${TEMPORAL_MEMORY_EMBEDDING_TOKENIZER_MODEL:-${EMBED_MODEL}}"
+EMBED_DIM="${TEMPORAL_MEMORY_EMBEDDING_DIM:-384}"
+ENGINE_DEVICE="${TEMPORAL_MEMORY_DEVICE:-auto}"
+CUDA_DEVICES="${TEMPORAL_MEMORY_CUDA_DEVICES:-}"
+ORT_EP="${TEMPORAL_MEMORY_ORT_EP:-cuda}"
+ORT_CUDA_SAFE_ATTENTION="${TEMPORAL_MEMORY_ORT_CUDA_SAFE_ATTENTION:-1}"
+TRT_FP16="${TEMPORAL_MEMORY_TRT_FP16:-1}"
+TRT_CACHE_DIR="${TEMPORAL_MEMORY_TRT_CACHE_DIR:-${ROOT_DIR}/trt-cache}"
+GPU_CHUNK_SIZE="${TEMPORAL_MEMORY_GPU_CHUNK_SIZE:-4}"
+EMBED_BATCH_MAX="${TEMPORAL_MEMORY_EMBED_BATCH_MAX:-32}"
+EMBED_BATCH_WAIT_MS="${TEMPORAL_MEMORY_EMBED_BATCH_WAIT_MS:-2}"
+
+MAX_INPUT_CHARS="${TEMPORAL_MEMORY_MAX_INPUT_CHARS:-2048}"
+ENABLE_ATTENTION_POOLING="${TEMPORAL_MEMORY_ENABLE_ATTENTION_POOLING:-0}"
+ENABLE_FACT_GRAPH_SEMANTICS="${TEMPORAL_MEMORY_ENABLE_FACT_GRAPH_SEMANTICS:-0}"
+ENABLE_ICT_SHADOWS="${TEMPORAL_MEMORY_ENABLE_ICT_SHADOWS:-0}"
+ENABLE_CONTENT_TYPE_CHUNKING="${TEMPORAL_MEMORY_ENABLE_CONTENT_TYPE_CHUNKING:-0}"
+
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
+
+version_at_least() {
+  local current="$1"
+  local minimum="$2"
+  [[ "$(printf '%s\n%s\n' "${minimum}" "${current}" | sort -V | head -n 1)" == "${minimum}" ]]
+}
+
+ubuntu_version_id() {
+  if [[ -r /etc/os-release ]]; then
+    # shellcheck source=/dev/null
+    . /etc/os-release
+    echo "${VERSION_ID:-}"
+  fi
+}
+
+ubuntu_cuda_repo_slug() {
+  case "$(ubuntu_version_id)" in
+    "24.04") echo "ubuntu2404" ;;
+    *) die "ORT GPU provider binaries require Ubuntu 24.04+ for glibc >= 2.38. Use Ubuntu 24.04." ;;
+  esac
+}
+
+glibc_version() {
+  getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}'
+}
+
+require_runtime() {
+  command -v ldd >/dev/null 2>&1 || die "ldd not found"
+  local glibc
+  glibc="$(glibc_version)"
+  version_at_least "${glibc}" "2.38" || die "glibc ${glibc} is too old for ORT GPU provider binaries; use Ubuntu 24.04"
+}
+
+install_cuda_repo_keyring() {
+  local repo_slug
+  repo_slug="$(ubuntu_cuda_repo_slug)"
+  local keyring_url="https://developer.download.nvidia.com/compute/cuda/repos/${repo_slug}/x86_64/cuda-keyring_1.1-1_all.deb"
+  local keyring_deb="/tmp/cuda-keyring_1.1-1_all.deb"
+  local source_list="/etc/apt/sources.list.d/cuda-${repo_slug}-x86_64.list"
+  local source_line="deb [signed-by=/usr/share/keyrings/cuda-archive-keyring.gpg] https://developer.download.nvidia.com/compute/cuda/repos/${repo_slug}/x86_64/ /"
+
+  cleanup_legacy_cuda_sources
+  curl -fsSL "${keyring_url}" -o "${keyring_deb}"
+  ${SUDO} dpkg -i "${keyring_deb}"
+  printf '%s\n' "${source_line}" | ${SUDO} tee "${source_list}" >/dev/null
+  ${SUDO} apt update
+}
+
+cleanup_legacy_cuda_sources() {
+  local repo_slug
+  repo_slug="$(ubuntu_cuda_repo_slug)"
+  local repo_url="developer.download.nvidia.com/compute/cuda/repos/${repo_slug}/x86_64"
+  local file
+  local files=()
+
+  [[ -f /etc/apt/sources.list ]] && files+=(/etc/apt/sources.list)
+  shopt -s nullglob
+  files+=(/etc/apt/sources.list.d/*.list)
+  files+=(/etc/apt/sources.list.d/*.sources)
+  shopt -u nullglob
+
+  for file in "${files[@]}"; do
+    [[ -f "${file}" ]] || continue
+    grep -Fq "${repo_url}" "${file}" || continue
+    ${SUDO} cp "${file}" "${file}..bak"
+    if [[ "${file}" == *.sources ]]; then
+      ${SUDO} mv "${file}" "${file}..disabled"
+    else
+      ${SUDO} sed -i "\#${repo_url}#s#^deb #\\# disabled by Aletheia bootstrap: deb #" "${file}"
+    fi
+  done
+}
+
+apt_has_package() {
+  apt-cache show "$1" >/dev/null 2>&1
+}
+
+install_cudnn9_cuda12() {
+  local runtime_pkg="libcudnn9-cuda-12"
+  local dev_pkg="libcudnn9-dev-cuda-12"
+  local runtime_versions
+  local dev_versions
+  local version=""
+  local candidate
+
+  runtime_versions="$(apt-cache madison "${runtime_pkg}" | awk '{print $3}')"
+  dev_versions="$(apt-cache madison "${dev_pkg}" | awk '{print $3}')"
+
+  for candidate in $(printf '%s\n' "${dev_versions}" | sort -Vr); do
+    if printf '%s\n' "${runtime_versions}" | grep -Fxq "${candidate}"; then
+      version="${candidate}"
+      break
+    fi
+  done
+
+  if [[ -z "${version}" ]]; then
+    echo "Available ${runtime_pkg} versions:" >&2
+    apt-cache madison "${runtime_pkg}" >&2 || true
+    echo "Available ${dev_pkg} versions:" >&2
+    apt-cache madison "${dev_pkg}" >&2 || true
+    die "No matching cuDNN 9 runtime/dev version found for CUDA 12"
+  fi
+
+  echo "Installing cuDNN 9 CUDA 12 packages at version ${version}..."
+  ${SUDO} env DEBIAN_FRONTEND=noninteractive apt install -y \
+    --allow-downgrades \
+    --allow-change-held-packages \
+    "${runtime_pkg}=${version}" \
+    "${dev_pkg}=${version}"
+}
+
+append_once() {
+  local line="$1"
+  local file="${HOME}/.bashrc"
+  touch "${file}"
+  if ! grep -Fq "${line}" "${file}"; then
+    echo "${line}" >> "${file}"
+  fi
+}
+
+echo "[1/6] Checking Ubuntu/glibc..."
+require_runtime
+cleanup_legacy_cuda_sources
+
+echo "[2/6] Installing base packages..."
+${SUDO} apt update
+${SUDO} env DEBIAN_FRONTEND=noninteractive apt install -y \
+  build-essential \
+  pkg-config \
+  libssl-dev \
+  clang \
+  cmake \
+  curl \
+  git \
+  unzip \
+  ca-certificates \
+  jq \
+  gcc-12 \
+  g++-12
+
+echo "[3/6] Installing CUDA 12.6, cuDNN 9, and TensorRT..."
+install_cuda_repo_keyring
+${SUDO} env DEBIAN_FRONTEND=noninteractive apt install -y \
+  "${CUDA_TOOLKIT_PACKAGE}"
+install_cudnn9_cuda12
+if apt_has_package tensorrt-libs; then
+  ${SUDO} env DEBIAN_FRONTEND=noninteractive apt install -y \
+    tensorrt-libs \
+    libnvinfer10 \
+    libnvinfer-plugin10 \
+    libnvonnxparsers10
+elif apt_has_package tensorrt; then
+  ${SUDO} env DEBIAN_FRONTEND=noninteractive apt install -y tensorrt
+else
+  die "TensorRT packages not found in NVIDIA CUDA repo"
+fi
+${SUDO} ldconfig
+
+echo "[4/6] Installing Rust toolchain..."
+if ! command -v rustup >/dev/null 2>&1; then
+  curl https://sh.rustup.rs -sSf | sh -s -- -y
+fi
+# shellcheck source=/dev/null
+. "${HOME}/.cargo/env"
+rustup default stable
+
+echo "[5/6] Configuring Aletheia environment..."
+if [[ -d "${CUDA_HOME_DEFAULT}" ]]; then
+  export CUDA_HOME="${CUDA_HOME_DEFAULT}"
+elif [[ -d /usr/local/cuda-12 ]]; then
+  export CUDA_HOME=/usr/local/cuda-12
+else
+  die "CUDA 12 install directory not found"
+fi
+
+export CC=gcc-12
+export CXX=g++-12
+export PATH="${CUDA_HOME}/bin:${PATH}"
+export LD_LIBRARY_PATH="${CUDA_HOME}/targets/x86_64-linux/lib:${CUDA_HOME}/lib64:/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
+export CUDA_COMPUTE_CAP="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits 2>/dev/null | head -n 1 | tr -d '.' || true)"
+export CUDA_COMPUTE_CAP="${CUDA_COMPUTE_CAP:-86}"
+
+export TEMPORAL_MEMORY_DEVICE="${ENGINE_DEVICE}"
+if [[ -n "${CUDA_DEVICES}" ]]; then
+  export TEMPORAL_MEMORY_CUDA_DEVICES="${CUDA_DEVICES}"
+fi
+export TEMPORAL_MEMORY_EMBEDDING_BACKEND="${EMBED_BACKEND}"
+export TEMPORAL_MEMORY_EMBEDDING_MODEL="${EMBED_MODEL}"
+export TEMPORAL_MEMORY_EMBEDDING_TOKENIZER_MODEL="${EMBED_TOKENIZER_MODEL}"
+export TEMPORAL_MEMORY_EMBEDDING_DIM="${EMBED_DIM}"
+export TEMPORAL_MEMORY_ORT_EP="${ORT_EP}"
+export TEMPORAL_MEMORY_ORT_CUDA_SAFE_ATTENTION="${ORT_CUDA_SAFE_ATTENTION}"
+export TEMPORAL_MEMORY_TRT_FP16="${TRT_FP16}"
+export TEMPORAL_MEMORY_TRT_CACHE_DIR="${TRT_CACHE_DIR}"
+export TEMPORAL_MEMORY_GPU_CHUNK_SIZE="${GPU_CHUNK_SIZE}"
+export TEMPORAL_MEMORY_EMBED_BATCH_MAX="${EMBED_BATCH_MAX}"
+export TEMPORAL_MEMORY_EMBED_BATCH_WAIT_MS="${EMBED_BATCH_WAIT_MS}"
+export TEMPORAL_MEMORY_MAX_INPUT_CHARS="${MAX_INPUT_CHARS}"
+export TEMPORAL_MEMORY_ENABLE_ATTENTION_POOLING="${ENABLE_ATTENTION_POOLING}"
+export TEMPORAL_MEMORY_ENABLE_FACT_GRAPH_SEMANTICS="${ENABLE_FACT_GRAPH_SEMANTICS}"
+export TEMPORAL_MEMORY_ENABLE_ICT_SHADOWS="${ENABLE_ICT_SHADOWS}"
+export TEMPORAL_MEMORY_ENABLE_CONTENT_TYPE_CHUNKING="${ENABLE_CONTENT_TYPE_CHUNKING}"
+
+mkdir -p "${TRT_CACHE_DIR}" "${HOME}/.cargo"
+if [[ ! -f "${HOME}/.cargo/config.toml" ]]; then
+  {
+    echo "[env]"
+    echo 'CC = "gcc-12"'
+    echo 'CXX = "g++-12"'
+  } > "${HOME}/.cargo/config.toml"
+fi
+
+append_once "export CUDA_HOME=${CUDA_HOME}"
+append_once 'export PATH=$CUDA_HOME/bin:$PATH'
+append_once 'export LD_LIBRARY_PATH=$CUDA_HOME/targets/x86_64-linux/lib:$CUDA_HOME/lib64:/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH'
+append_once 'export CC=gcc-12'
+append_once 'export CXX=g++-12'
+append_once 'export CUDA_COMPUTE_CAP="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits 2>/dev/null | head -n 1 | tr -d ".")"'
+append_once "export TEMPORAL_MEMORY_DEVICE=${ENGINE_DEVICE}"
+if [[ -n "${CUDA_DEVICES}" ]]; then
+  append_once "export TEMPORAL_MEMORY_CUDA_DEVICES=${CUDA_DEVICES}"
+fi
+append_once "export TEMPORAL_MEMORY_EMBEDDING_BACKEND=${EMBED_BACKEND}"
+append_once "export TEMPORAL_MEMORY_EMBEDDING_MODEL=${EMBED_MODEL}"
+append_once "export TEMPORAL_MEMORY_EMBEDDING_TOKENIZER_MODEL=${EMBED_TOKENIZER_MODEL}"
+append_once "export TEMPORAL_MEMORY_EMBEDDING_DIM=${EMBED_DIM}"
+append_once "export TEMPORAL_MEMORY_ORT_EP=${ORT_EP}"
+append_once "export TEMPORAL_MEMORY_ORT_CUDA_SAFE_ATTENTION=${ORT_CUDA_SAFE_ATTENTION}"
+append_once "export TEMPORAL_MEMORY_TRT_FP16=${TRT_FP16}"
+append_once "export TEMPORAL_MEMORY_TRT_CACHE_DIR=${TRT_CACHE_DIR}"
+append_once "export TEMPORAL_MEMORY_GPU_CHUNK_SIZE=${GPU_CHUNK_SIZE}"
+append_once "export TEMPORAL_MEMORY_EMBED_BATCH_MAX=${EMBED_BATCH_MAX}"
+append_once "export TEMPORAL_MEMORY_EMBED_BATCH_WAIT_MS=${EMBED_BATCH_WAIT_MS}"
+append_once "export TEMPORAL_MEMORY_MAX_INPUT_CHARS=${MAX_INPUT_CHARS}"
+append_once "export TEMPORAL_MEMORY_ENABLE_ATTENTION_POOLING=${ENABLE_ATTENTION_POOLING}"
+append_once "export TEMPORAL_MEMORY_ENABLE_FACT_GRAPH_SEMANTICS=${ENABLE_FACT_GRAPH_SEMANTICS}"
+append_once "export TEMPORAL_MEMORY_ENABLE_ICT_SHADOWS=${ENABLE_ICT_SHADOWS}"
+append_once "export TEMPORAL_MEMORY_ENABLE_CONTENT_TYPE_CHUNKING=${ENABLE_CONTENT_TYPE_CHUNKING}"
+
+echo "[6/6] Verifying runtime libraries..."
+command -v nvcc >/dev/null 2>&1 || die "nvcc not found"
+nvcc --version | tail -n 1
+ldconfig -p | grep -E 'libcudart.so.12|libcublas.so.12|libcufft.so.11|libcurand.so.10|libcudnn.so.9|libnvinfer.so.10|libnvinfer_plugin.so.10' || true
+
+cd "${ROOT_DIR}"
+cargo fetch
+
+cat <<EOF
+
+Done.
+
+Default runtime:
+  model: ${EMBED_MODEL}
+  dim: ${EMBED_DIM}
+  backend: ${EMBED_BACKEND}
+  provider: ${ORT_EP}
+  device: ${ENGINE_DEVICE}
+  cuda devices: ${CUDA_DEVICES:-auto-detect visible GPUs}
+
+Start Aletheia:
+  cd ${ROOT_DIR}
+  cargo run --release --features gpu-cuda
+
+Force all four GPUs explicitly:
+  TEMPORAL_MEMORY_DEVICE=auto TEMPORAL_MEMORY_CUDA_DEVICES=0,1,2,3 cargo run --release --features gpu-cuda
+
+For benchmark throughput on multi-GPU, use higher ingest concurrency:
+  --ingest-concurrency 8
+
+Optional TensorRT run after CUDA EP is stable:
+  TEMPORAL_MEMORY_ORT_EP=tensorrt cargo run --release --features gpu-tensorrt
+
+Warm it before benchmarking:
+  curl -i -X POST http://localhost:3000/warmup -H 'x-api-key: XXX1111AAA'
+  curl -i -X POST http://localhost:3000/warmup -H 'x-api-key: XXX1111AAA'
+
+Verify TensorRT/ORT CUDA is loaded after startup:
+  grep -E 'libonnxruntime_providers_tensorrt|libonnxruntime_providers_cuda|libnvinfer' /proc/\$(pgrep -n )/maps
+  nvidia-smi dmon -s pucm -d 1
+
+Run LongMemEval recall:
+  cargo run --release --manifest-path ./benchmarks/rust_evaluator/Cargo.toml -- \\
+    --dataset-kind longmemeval \\
+    --dataset ./benchmarks/LongMemEval/data/longmemeval_s_cleaned.json \\
+    --engine-url http://localhost:3000 \\
+    --engine-api-key XXX1111AAA \\
+    --reset-first \\
+    --start-index 0 --limit 500 \\
+    --ingest-concurrency 4 \\
+    --top-k 8 \\
+    --max-chunks-per-session 4 \\
+    recall
+
+Run LoCoMo recall:
+  cargo run --release --manifest-path ./benchmarks/rust_evaluator/Cargo.toml -- \\
+    --dataset-kind locomo \\
+    --dataset ./benchmarks/LoCoMo/data/locomo10.json \\
+    --engine-url http://localhost:3000 \\
+    --engine-api-key XXX1111AAA \\
+    --reset-first \\
+    --start-index 0 --limit 500 \\
+    --ingest-concurrency 4 \\
+    --top-k 8 \\
+    --max-chunks-per-session 4 \\
+    recall
+EOF

@@ -1,0 +1,98 @@
+name: Build & Deploy Engine
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      vm_ip:
+        description: "Override: deploy to specific VM IP"
+        required: false
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Production Binary
+        run: |
+          cargo build --release --locked
+          ls -lh target/release/tellodb
+
+      # Upload to Supabase Storage (for platform-provisioned VMs)
+      - name: Publish to Supabase Storage
+        env:
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          SUPABASE_URL="https://fnovrnadrvimlvqwecgs.supabase.co"
+          # Update "latest" alias
+          curl -s -X POST "$SUPABASE_URL/storage/v1/object/tellodb-binaries/tellodb-latest" \
+            -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @target/release/tellodb
+          echo "Published to: $SUPABASE_URL/storage/v1/object/public/tellodb-binaries/tellodb-latest"
+
+      # Deploy to a specific VM via SCP
+      - name: Deploy to Azure VM via SCP
+        if: github.ref == 'refs/heads/main'
+        uses: appleboy/scp-action@master
+        with:
+          host: ${{ inputs.vm_ip || secrets.AZURE_VM_IP }}
+          username: ubuntu
+          key: ${{ secrets.AZURE_SSH_PRIVATE_KEY }}
+          source: "target/release/tellodb"
+          target: "/tmp/"
+          strip_components: 2
+
+      - name: Install and Restart Service on VM
+        if: github.ref == 'refs/heads/main'
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ inputs.vm_ip || secrets.AZURE_VM_IP }}
+          username: ubuntu
+          key: ${{ secrets.AZURE_SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+            sudo mv /tmp/tellodb /usr/local/bin/tellodb-engine
+            sudo chmod +x /usr/local/bin/tellodb-engine
+            sudo mkdir -p /var/lib/tellodb
+
+            sudo tee /etc/systemd/system/tellodb.service > /dev/null <<'EOF'
+            [Unit]
+            Description=Tellodb Core Engine
+            After=network.target
+
+            [Service]
+            Type=simple
+            User=ubuntu
+            WorkingDirectory=/var/lib/tellodb
+            ExecStart=/usr/local/bin/tellodb-engine
+            Restart=on-failure
+            RestartSec=5
+            Environment=TELLODB_API_KEY=${{ secrets.TELLODB_ADMIN_KEY }}
+            Environment=TELLODB_EMBEDDING_MODEL=BAAI/bge-small-en-v1.5
+
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+
+            sudo systemctl daemon-reload
+            sudo systemctl enable tellodb
+            sudo systemctl restart tellodb
+            sleep 3
+            sudo systemctl status tellodb --no-pager
+
+      # GitHub Release (tags only)
+      - name: GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/release/tellodb
+          generate_release_notes: true

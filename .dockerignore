@@ -1,0 +1,11 @@
+.git
+.gitignore
+target
+benchmarks
+temporal.redb
+graph.redb
+fts.redb
+platform.redb
+vector.hnsw
+embedding_cache.redb
+*.log
