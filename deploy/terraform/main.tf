@@ -103,7 +103,7 @@ resource "azurerm_linux_virtual_machine" "vm" {
   resource_group_name = azurerm_resource_group.rg.name
   location            = azurerm_resource_group.rg.location
   size                = "Standard_D2as_v7"
-  zone                = "2"
+  zone                = null
   admin_username      = "ubuntu"
 
   network_interface_ids = [

@@ -30,7 +30,7 @@ jobs:
         env:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
-          SUPABASE_URL="https://fnovrnadrvimlvqwecgs.supabase.co"
+          SUPABASE_URL="https://gxnmgtgizykhunreudhy.supabase.co"
           # Update "latest" alias
           curl -s -X POST "$SUPABASE_URL/storage/v1/object/tellodb-binaries/tellodb-latest" \
             -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
