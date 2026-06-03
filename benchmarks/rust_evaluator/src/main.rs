@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const DEFAULT_ENGINE_URL: &str = "http://127.0.0.1:3000";
 const DEFAULT_DATASET_PATH: &str = "benchmarks/LongMemEval/data/longmemeval_s_cleaned.json";
 const DEFAULT_LOCOMO_DATASET_PATH: &str = "benchmarks/LoCoMo/data/locomo10.json";
-const DEFAULT_OPENROUTER_MODEL: &str = "openai/gpt-5-mini";
+const DEFAULT_OPENROUTER_MODEL: &str = "openai/gpt-4.1-mini";
 const DEFAULT_OPENROUTER_JUDGE_MODEL: &str = "openai/gpt-4.1-mini";
 const DEFAULT_GROQ_MODEL: &str = "openai/gpt-oss-120b";
 const DEFAULT_GROQ_JUDGE_MODEL: &str = "openai/gpt-oss-120b";
@@ -33,7 +33,15 @@ Instructions:\n\
 - Consider any temporal/date information present in the data\n\
 - If the context contains enough information, provide a clear, concise answer\n\
 - If the context does not contain enough information, respond with \"I don't know\"\n\
-- Base your answer ONLY on the provided context\n\n\
+- Base your answer ONLY on the provided context\n\
+- Answer in at most 15 words.\n\
+- Output ONLY the answer. No introductory text, no explanation, no commentary.\n\
+- Do not start with \"We need to\", \"Let me\", \"Based on\", \"I think\", \"Thus\", \"So\", or similar.\n\n\
+Examples:\n\
+  Q: Where did Caroline move from 4 years ago?\n\
+  A: Sweden\n\n\
+  Q: What activities does Melanie partake in?\n\
+  A: pottery, camping, painting, swimming\n\n\
 Answer:";
 
 const CON_ANSWER_PROMPT: &str = "\
@@ -48,12 +56,21 @@ Instructions:\n\
 - Consider any temporal/date information present in the data\n\
 - If the context contains enough information, provide a clear, concise answer\n\
 - If the context does not contain enough information, respond with \"I don't know\"\n\
-- Base your answer ONLY on the provided context\n\n\
+- Base your answer ONLY on the provided context\n\
+- Answer in at most 15 words.\n\
+- Output ONLY the answer. No introductory text, no explanation, no commentary.\n\
+- Do not start with \"We need to\", \"Let me\", \"Based on\", \"I think\", \"Thus\", \"So\", or similar.\n\n\
+Examples:\n\
+  Q: Where did Caroline move from 4 years ago?\n\
+  A: Sweden\n\n\
+  Q: What activities does Melanie partake in?\n\
+  A: pottery, camping, painting, swimming\n\n\
 Answer:";
 
 const CON_NOTES_PROMPT: &str = "\
 I will give you a chat history between you and a user, as well as a question from the user. Write compact reading notes that extract all relevant facts needed to answer the question.\n\
-Keep dates, names, quantities, and list items exact. Resolve relative dates against the session date when possible, but preserve uncertainty if the exact calendar answer is not supported. Include all distinct relevant facts needed for the final answer and avoid unrelated facts. If no relevant information is found, output exactly \"empty\".\n\n\
+Keep dates, names, quantities, and list items exact. Resolve relative dates against the session date when possible, but preserve uncertainty if the exact calendar answer is not supported. Include all distinct relevant facts needed for the final answer and avoid unrelated facts. If no relevant information is found, output exactly \"empty\".\n\
+Output ONLY the extracted notes. No introductory text, no explanation, no commentary.\n\n\
 Chat History:\n\
 Session Date: {session_date}\n\
 Session Content:\n{session_content}\n\n\
@@ -74,12 +91,21 @@ Instructions:\n\
 - If the notes contain enough information, provide a clear, concise final answer\n\
 - Do not quote evidence, do not mention sessions, and do not explain your reasoning\n\
 - If the notes do not contain enough information, respond with \"I don't know\"\n\
-- Base your answer ONLY on the provided notes\n\n\
+- Base your answer ONLY on the provided notes\n\
+- Answer in at most 15 words.\n\
+- Output ONLY the answer. No introductory text, no explanation, no commentary.\n\
+- Do not start with \"We need to\", \"Let me\", \"Based on\", \"I think\", \"Thus\", \"So\", or similar.\n\n\
+Examples:\n\
+  Q: Where did Caroline move from 4 years ago?\n\
+  A: Sweden\n\n\
+  Q: What activities does Melanie partake in?\n\
+  A: pottery, camping, painting, swimming\n\n\
 Answer:";
 
 const CON_SUMMARIZE_PROMPT: &str = "\
 I will give you several history chats between you and a user, and a question. Extract all relevant facts needed to answer the question into a dense bulleted list.\n\
-Keep dates, names, quantities, and list items exact. Ignore conversational noise. If no relevant information is found, output exactly \"empty\".\n\n\
+Keep dates, names, quantities, and list items exact. Ignore conversational noise. If no relevant information is found, output exactly \"empty\".\n\
+Output ONLY the bulleted list. No introductory text, no explanation, no commentary.\n\n\
 Chat History:\n\
 {context}\n\n\
 Question Date: {question_date}\n\
@@ -179,7 +205,7 @@ struct Cli {
     #[arg(long, global = true, default_value_t = 0)]
     start_index: usize,
 
-    #[arg(long, global = true, default_value_t = 8)]
+    #[arg(long, global = true, default_value_t = 6)]
     top_k: usize,
 
     #[arg(long, global = true, default_value_t = 1)]
@@ -200,7 +226,7 @@ struct Cli {
     #[arg(long, global = true, value_enum, default_value_t = ReaderMode::Con)]
     reader_mode: ReaderMode,
 
-    #[arg(long, global = true, default_value_t = 4)]
+    #[arg(long, global = true, default_value_t = 3)]
     max_chunks_per_session: usize,
 
     #[arg(long, global = true)]
@@ -2311,6 +2337,7 @@ async fn generate_answer(
     let intent = classify_answer_intent(instance);
     let focus_rules = focus_rules_for_intent(intent);
 
+    let max_answer_tokens = 1024usize;
     let (evidence_text, mut answer) = match reader_mode {
         ReaderMode::Direct => {
             let context = render_session_context(packed_sessions);
@@ -2321,7 +2348,7 @@ async fn generate_answer(
                 .replace("{question_date}", question_date)
                 .replace("{question}", &instance.question);
             let answer =
-                call_answer_model(client, &prompt, model, 1024, "minimal", use_groq).await?;
+                call_answer_model(client, &prompt, model, max_answer_tokens, "high", use_groq).await?;
             (context, answer)
         }
         ReaderMode::Con => {
@@ -2333,7 +2360,7 @@ async fn generate_answer(
                 .replace("{question_date}", question_date)
                 .replace("{question}", &instance.question);
             let answer =
-                call_answer_model(client, &prompt, model, 1024, "minimal", use_groq).await?;
+                call_answer_model(client, &prompt, model, max_answer_tokens, "high", use_groq).await?;
             (context, answer)
         }
         ReaderMode::ConSeparate => {
@@ -2346,7 +2373,7 @@ async fn generate_answer(
                     .replace("{question_date}", question_date)
                     .replace("{question}", &instance.question);
                 let note =
-                    call_answer_model(client, &prompt, model, 300, "minimal", use_groq).await?;
+                    call_answer_model(client, &prompt, model, 300, "high", use_groq).await?;
                 if !note.trim().is_empty() && note.trim().to_ascii_lowercase() != "empty" {
                     notes.push(format!(
                         "Session ID: {}\nSession Date: {}\nNotes: {}",
@@ -2366,7 +2393,7 @@ async fn generate_answer(
                     .replace("{question_date}", question_date)
                     .replace("{question}", &instance.question);
                 let answer =
-                    call_answer_model(client, &prompt, model, 512, "minimal", use_groq).await?;
+                    call_answer_model(client, &prompt, model, max_answer_tokens, "high", use_groq).await?;
                 (context, answer)
             } else {
                 let notes_text = notes.join("\n\n---\n\n");
@@ -2377,7 +2404,7 @@ async fn generate_answer(
                     .replace("{question_date}", question_date)
                     .replace("{question}", &instance.question);
                 let answer =
-                    call_answer_model(client, &prompt, model, 512, "minimal", use_groq).await?;
+                    call_answer_model(client, &prompt, model, max_answer_tokens, "high", use_groq).await?;
                 (notes_text, answer)
             }
         }
@@ -2387,7 +2414,7 @@ async fn generate_answer(
                 .replace("{context}", &context)
                 .replace("{question_date}", question_date)
                 .replace("{question}", &instance.question);
-            let notes = call_answer_model(client, &prompt, model, 512, "minimal", use_groq).await?;
+            let notes = call_answer_model(client, &prompt, model, 512, "high", use_groq).await?;
             if notes.trim().is_empty() || notes.trim().to_ascii_lowercase() == "empty" {
                 (context, "I don't know".to_string())
             } else {
@@ -2398,7 +2425,7 @@ async fn generate_answer(
                     .replace("{question_date}", question_date)
                     .replace("{question}", &instance.question);
                 let answer =
-                    call_answer_model(client, &answer_prompt, model, 512, "minimal", use_groq)
+                    call_answer_model(client, &answer_prompt, model, max_answer_tokens, "high", use_groq)
                         .await?;
                 (notes, answer)
             }
@@ -3495,7 +3522,6 @@ fn strip_model_reasoning(text: &str) -> String {
                 );
             }
             (Some(start), None) => {
-                // Unclosed <think> — drop everything from it onward.
                 result = result[..start].to_string();
                 break;
             }
@@ -3503,31 +3529,164 @@ fn strip_model_reasoning(text: &str) -> String {
         }
     }
 
-    // 2. Strip leading reasoning preambles produced by some models
-    //    (e.g. "Thinking. 1. Analyze..." or "We need to answer: ...").
-    //    Strategy: after the first blank line, if the remainder looks like a
-    //    standalone answer, prefer it; otherwise keep the whole thing trimmed.
     let trimmed = result.trim();
 
-    // Find the last double-newline to split reasoning from the final answer.
-    if let Some(last_break) = trimmed.rfind("\n\n") {
-        let tail = trimmed[last_break..].trim();
-        // Only use the tail if it is plausibly a short direct answer
-        // (≤ 300 chars) and doesn't start a new chain-of-thought marker.
-        let tail_lower = tail.to_ascii_lowercase();
-        let looks_like_reasoning = tail_lower.starts_with("thinking")
-            || tail_lower.starts_with("we need")
-            || tail_lower.starts_with("we are")
-            || tail_lower.starts_with("let me")
-            || tail_lower.starts_with("step ")
-            || tail_lower.starts_with("1. ")
-            || tail_lower.starts_with("1)");
-        if !looks_like_reasoning && tail.len() <= 300 {
-            return tail.to_string();
+    // 2. Try to extract text after "Answer:" marker (used in our prompts).
+    if let Some(ans_pos) = trimmed.rfind("Answer:") {
+        let after_answer = trimmed[ans_pos + "Answer:".len()..].trim();
+        if !after_answer.is_empty() && !is_reasoning_text(after_answer) {
+            return after_answer.to_string();
+        }
+    }
+
+    // 3. Split into lines and strip leading reasoning lines.
+    let lines: Vec<&str> = trimmed.lines().collect();
+    let mut start_idx = 0;
+    for (i, line) in lines.iter().enumerate() {
+        let lower = line.trim().to_ascii_lowercase();
+        let is_continuation = i > 0
+            && (lower.starts_with("based on")
+                || lower.starts_with("the context")
+                || lower.starts_with("the history")
+                || lower.starts_with("from the"));
+        if !is_reasoning_line(lower.as_str()) && !is_continuation {
+            // If it's just a short line after reasoning, skip it too
+            if line.trim().len() <= 3 && i < lines.len() - 1 {
+                continue;
+            }
+            start_idx = i;
+            break;
+        }
+    }
+
+    // 4. Collect remaining lines, stopping if we hit a new reasoning block.
+    let mut clean_lines: Vec<&str> = Vec::new();
+    for line in &lines[start_idx..] {
+        let lower = line.trim().to_ascii_lowercase();
+        if is_reasoning_line(lower.as_str()) && !clean_lines.is_empty() {
+            // Check if this is truly a new reasoning block or just a coordinating phrase
+            let has_answer_content = clean_lines.iter().any(|l| {
+                let t = l.trim();
+                t.len() > 20 || t.contains(':') || t.contains(',')
+            });
+            if has_answer_content {
+                break;
+            }
+        }
+        clean_lines.push(line);
+    }
+
+    let candidate = clean_lines.join("\n").trim().to_string();
+    if !candidate.is_empty() && !is_reasoning_text(&candidate) {
+        // If still long, try extracting the last sentence.
+        if candidate.len() > 80 {
+            if let Some(last_sentence) = extract_last_sentence(&candidate) {
+                if !is_reasoning_text(&last_sentence) {
+                    return last_sentence;
+                }
+            }
+        }
+        return candidate;
+    }
+
+    // 5. Fallback: extract last sentence from original trimmed text.
+    if let Some(last) = extract_last_sentence(trimmed) {
+        if !is_reasoning_text(&last) {
+            return last;
         }
     }
 
     trimmed.to_string()
+}
+
+fn is_reasoning_line(lower: &str) -> bool {
+    lower.starts_with("thinking")
+        || lower.starts_with("we need")
+        || lower.starts_with("we are")
+        || lower.starts_with("we can")
+        || lower.starts_with("let me")
+        || lower.starts_with("let's ")
+        || lower.starts_with("step ")
+        || lower.starts_with("first,")
+        || lower.starts_with("first ")
+        || lower.starts_with("second,")
+        || lower.starts_with("second ")
+        || lower.starts_with("1. ")
+        || lower.starts_with("1)")
+        || lower.starts_with("2. ")
+        || lower.starts_with("2)")
+        || lower.starts_with("3. ")
+        || lower.starts_with("3)")
+        || lower.starts_with("- ")
+        || lower.starts_with("* ")
+        || lower.starts_with("thus,")
+        || lower.starts_with("thus ")
+        || lower.starts_with("therefore")
+        || lower.starts_with("so,")
+        || lower.starts_with("so ")
+        || lower.starts_with("this means")
+        || lower.starts_with("in summary")
+        || lower.starts_with("to answer")
+        || lower.starts_with("the question")
+        || lower.starts_with("the answer")
+        || lower.starts_with("based on the")
+        || lower.starts_with("looking at")
+        || lower.starts_with("analyzing")
+        || lower.starts_with("checking")
+        || lower.starts_with("i think")
+        || lower.starts_with("i need")
+        || lower.starts_with("i should")
+        || lower.starts_with("i can")
+        || lower.starts_with("i will")
+        || lower.starts_with("from the")
+        || lower == "answer:"
+        || lower.starts_with("answer: ")
+}
+
+fn is_reasoning_text(text: &str) -> bool {
+    let lower = text.trim().to_ascii_lowercase();
+    // If it starts with a reasoning marker, it's reasoning.
+    if is_reasoning_line(lower.as_str()) {
+        return true;
+    }
+    // If it has a reasoning preamble pattern like "We are asked: ..."
+    let first_sentence_end = lower.find(|c: char| c == '.' || c == '\n');
+    if let Some(end) = first_sentence_end {
+        let first_sentence = &lower[..=end];
+        if first_sentence.starts_with("we need")
+            || first_sentence.starts_with("we are")
+            || first_sentence.starts_with("let me")
+            || first_sentence.starts_with("thinking")
+            || first_sentence.starts_with("based on")
+            || first_sentence.starts_with("to answer")
+            || first_sentence.starts_with("the question")
+            || first_sentence.starts_with("the answer")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn extract_last_sentence(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    // Try sentence-ending punctuation.
+    for sep in &["\n\n", ". ", "! ", "? "] {
+        if let Some(pos) = trimmed.rfind(sep) {
+            let candidate = trimmed[pos + sep.len()..].trim().to_string();
+            if !candidate.is_empty() && candidate.len() < 200 && !candidate.contains("  ") {
+                return Some(candidate);
+            }
+        }
+    }
+    // Try last comma-separated phrase.
+    if let Some(pos) = trimmed.rfind(", ") {
+        let candidate = trimmed[pos + 2..].trim().to_string();
+        if !candidate.is_empty() && candidate.len() < 100 {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 

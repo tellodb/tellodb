@@ -1,0 +1,2 @@
+[env]
+LIBRARY_PATH = "/Library/Developer/CommandLineTools/usr/lib/clang/17/lib/darwin"
