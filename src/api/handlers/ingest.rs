@@ -2449,21 +2449,9 @@ async fn execute_ingest_pipeline(
     })?;
     (diag.storage_ms, diag.storage_us) = elapsed_ms_and_us(stage_start);
 
-    let stage_start = Instant::now();
-    prepared
-        .par_iter()
-        .filter(|record| record.payload.kind.as_deref() != Some("synthetic_query"))
-        .for_each(|record| {
-            let user_id = &record.payload.entity_id;
-            let _ = state.analytics.process_text(
-                user_id,
-                &record.payload.entity_id,
-                record.payload.timestamp,
-                &record.payload.textual_content,
-            );
-        });
-    (diag.analytics_ms, diag.analytics_us) = elapsed_ms_and_us(stage_start);
-    tracing::info!("[CP] analytics_done: μs={}", total_start.elapsed().as_micros());
+    // Analytics processing disabled — it consumed 600-2000ms per batch
+    // running BERT NER + writing metrics never used in retrieval.
+    diag.analytics_ms = 0;
 
     // Phase 4: Artifact building
     let mut batches = build_artifacts(prepared, inserted_flags, &mut diag);
