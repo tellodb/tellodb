@@ -1,5 +1,6 @@
 use anyhow::Result;
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
+use ort::ep::CUDA;
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -28,11 +29,24 @@ impl SemanticInference {
         options.model_name = EmbeddingModel::try_from(embedding_model_id.clone())
             .unwrap_or(EmbeddingModel::AllMiniLML6V2);
         options.show_download_progress = true;
+
+        // Use GPU if TEMPORAL_MEMORY_DEVICE=gpu is set.
+        let use_gpu = std::env::var("TEMPORAL_MEMORY_DEVICE")
+            .map(|v| v.eq_ignore_ascii_case("gpu"))
+            .unwrap_or(false);
+        let mut device_label = "CPU";
+        if use_gpu {
+            let cuda_ep: ort::execution_providers::ExecutionProviderDispatch =
+                CUDA::default().into();
+            options.execution_providers.insert(0, cuda_ep);
+            device_label = "CUDA";
+        }
+
         let model = TextEmbedding::try_new(options)?;
 
         let executor = Arc::new(SemanticExecutor {
             fast_embedding: Some(Mutex::new(model)),
-            execution_device_label: "CPU",
+            execution_device_label: device_label,
         });
 
         Ok(Self {
@@ -98,6 +112,15 @@ impl SemanticInference {
 
     pub fn device_label_static() -> &'static str {
         "CPU"
+    }
+
+    /// Number of GPU executors to create (one per detected GPU, capped at 4).
+    fn gpu_executor_count() -> usize {
+        let count = std::env::var("TEMPORAL_MEMORY_EXECUTORS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        if count > 0 { count } else { 0 }
     }
 
     pub fn executor_count(&self) -> usize {
