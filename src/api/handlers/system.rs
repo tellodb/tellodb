@@ -134,16 +134,31 @@ pub async fn reset_handler(
 ) -> Result<impl IntoResponse, StatusCode> {
     let principal = authorize_request(&headers, &state)?;
     let tenant_id = principal_user_id(&principal).unwrap_or("default");
-    let tenant = state.tenant_store(tenant_id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let tenant = state.tenant_store(tenant_id).map_err(|e| {
+        tracing::error!("tenant_store lookup failed for tenant_id={}: {:?}", tenant_id, e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
     let confirm = payload.confirm.as_deref();
     if confirm != Some(RESET_CONFIRM_PHRASE) && confirm != Some("RESET_DATA_DANGEROUS") {
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    tenant.clear_all().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    tenant.fts_clear().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    tenant.graph_clear().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    state.vector_index.clear(None).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    tenant.clear_all().map_err(|e| {
+        tracing::error!(error = ?e, "clear_all failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    tenant.fts_clear().map_err(|e| {
+        tracing::error!(error = ?e, "fts_clear failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    tenant.graph_clear().map_err(|e| {
+        tracing::error!(error = ?e, "graph_clear failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    state.vector_index.clear(None).map_err(|e| {
+        tracing::error!(error = ?e, "vector_index.clear failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     if payload.clear_embedding_cache.unwrap_or(false) {
         // embedding cache clearing not supported in current semantic module

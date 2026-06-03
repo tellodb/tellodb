@@ -16,9 +16,25 @@ use crate::api::types::{BatchIngestPayload, IngestPayload};
 use crate::api::utils::*;
 use std::sync::Arc;
 use crate::api::{EngineState, PlatformWriteOp};
+use crate::graph::EdgeType;
 
 type GraphEdgeRecord = crate::storage::GraphEdgeEntry<'static>;
 type EmbeddingPairSet = (Vec<(String, Vec<f32>)>, Vec<(String, Vec<f32>)>);
+
+/// Compute a deterministic content hash for dedup.
+/// Uses the text content, entity_id, and kind so that re-ingesting
+/// the same factual statement is naturally idempotent.
+fn content_hash(text: &str, entity_id: &str, kind: &str) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(text.as_bytes());
+    hasher.update(b"::");
+    hasher.update(entity_id.as_bytes());
+    hasher.update(b"::");
+    hasher.update(kind.as_bytes());
+    let result = hasher.finalize();
+    result.iter().map(|b| format!("{:02x}", b)).collect::<String>()
+}
 type MiningResult = Result<Option<(String, Vec<f32>, Vec<f32>)>, StatusCode>;
 type RetrospectiveCandidate = (String, String, String, u64, String, String);
 use crate::lifecycle::{evaluate_lifecycle, LifecycleMetadata};
@@ -195,6 +211,7 @@ enum EmbeddingMode {
     Standard,
 }
 
+#[derive(Clone)]
 struct FactRegistration {
     entity_id: String,
     fact_key: String,
@@ -515,13 +532,8 @@ fn generate_embeddings(
         Vec::new()
     } else {
         let stage_start = Instant::now();
-        let mut embeddings = vec![Vec::new(); unique_specs.len()];
-
-        for (embedding, (_mode, text)) in embeddings.iter_mut().zip(unique_specs.iter()) {
-            if let Ok(emb) = state.semantic.generate_query_embedding(text) {
-                *embedding = emb;
-            }
-        }
+        let texts: Vec<&str> = unique_specs.iter().map(|(_, t)| t.as_str()).collect();
+        let embeddings = state.semantic.embed_batch(&texts);
 
         (diag.embed_ms, diag.embed_us) = elapsed_ms_and_us(stage_start);
         embeddings
@@ -592,11 +604,13 @@ fn build_observations(
             semantic_seen.push((payload.entity_id.clone(), embedding.clone()));
         }
 
+        let hash = content_hash(&payload.textual_content, &payload.entity_id, &format!("{:?}", kind));
         let obs = AgentObservation {
             entity_id: payload.entity_id.clone(),
             textual_content: payload.textual_content.clone(),
             embedding: embedding.clone(),
             kind,
+            content_hash: hash,
             created_at_ms: payload.timestamp,
         };
 
@@ -644,12 +658,12 @@ fn build_artifacts(
                 if card.source_memory_id != card.card_id {
                     batches.memory_card_relations_batch.push((
                         card.source_memory_id.clone(),
-                        "supports".to_string(),
+                        EdgeType::Supports.as_str().to_string(),
                         card.card_id.clone(),
                     ));
                     batches.memory_card_relations_batch.push((
                         card.card_id.clone(),
-                        "derives".to_string(),
+                        EdgeType::Derives.as_str().to_string(),
                         card.source_memory_id.clone(),
                     ));
                 }
@@ -737,18 +751,18 @@ fn build_artifacts(
             }
         }
 
-        if let Some(source_memory_id) = record.payload.source_memory_id.as_deref() {
-            batches.memory_links_batch.push((
-                record.payload.memory_id.clone(),
-                source_memory_id.to_string(),
-                "derived_from".to_string(),
-            ));
-            batches.memory_links_batch.push((
-                source_memory_id.to_string(),
-                record.payload.memory_id.clone(),
-                "derived_variant".to_string(),
-            ));
-        }
+            if let Some(source_memory_id) = record.payload.source_memory_id.as_deref() {
+                batches.memory_links_batch.push((
+                    record.payload.memory_id.clone(),
+                    source_memory_id.to_string(),
+                    EdgeType::DerivedFrom.as_str().to_string(),
+                ));
+                batches.memory_links_batch.push((
+                    source_memory_id.to_string(),
+                    record.payload.memory_id.clone(),
+                    EdgeType::DerivedVariant.as_str().to_string(),
+                ));
+            }
 
         if record.obs.kind == MemoryKind::Fact {
             if let Some(fact_key) = record.payload.fact_key.as_deref() {
@@ -918,6 +932,8 @@ async fn commit_batches(
             let batch = batches.typed_graph_batch.clone();
             let consolidation_tasks = batches.consolidation_tasks.clone();
             let nlp_cache = nlp_cache.clone();
+            let cards_for_entities = batches.memory_card_batch.clone();
+            let facts_for_entities = batches.fact_batch.clone();
             move || {
                 let start = Instant::now();
                 if !batch.is_empty() {
@@ -943,58 +959,44 @@ async fn commit_batches(
                         if !aliases.is_empty() {
                             let _ = tenant.set_aliases_batch(&entity_id, &aliases);
                         }
+
+                        // Collect entity names from memory card subjects + fact registrations.
+                        let mut entity_names: Vec<String> = known_entities.clone();
+                        for card in &cards_for_entities {
+                            if card.entity_id == entity_id && !card.subject.is_empty() {
+                                let s = card.subject.trim().to_string();
+                                if s.len() >= 2 && !entity_names.contains(&s) {
+                                    entity_names.push(s);
+                                }
+                            }
+                        }
+                        for fact in &facts_for_entities {
+                            if fact.entity_id == entity_id && !fact.subject.is_empty() {
+                                let s = fact.subject.trim().to_string();
+                                if s.len() >= 2 && !entity_names.contains(&s) {
+                                    entity_names.push(s);
+                                }
+                            }
+                        }
+
+                        // Run tiered entity resolver on extracted entity names.
+                        for entity_name in &entity_names {
+                            let _ = tenant.register_entity(&entity_id, entity_name);
+                            let _ = tenant.resolve_and_propose(
+                                &entity_id,
+                                entity_name,
+                                None,
+                                &crate::storage::entity_resolver::ResolutionConfig::default(),
+                            );
+                        }
                     }
                 }
                 start.elapsed()
             }
         }),
-        tokio::task::spawn_blocking({
-            let hn_tenant = tenant.clone();
-            let state = state.clone();
-            let records = mining_records.to_vec();
-            move || {
-                let start = Instant::now();
-                if let Ok((disambiguation_batch, negative_centroid_batch)) =
-                    mine_hard_negative_profiles(&state, &hn_tenant, &records)
-                {
-                    let mut mem_to_entity = std::collections::HashMap::new();
-                    for rec in &records {
-                        mem_to_entity.insert(rec.memory_id.clone(), rec.entity_id.clone());
-                    }
-
-                    let mut grouped_centroids: std::collections::HashMap<
-                        String,
-                        Vec<(String, Vec<f32>)>,
-                    > = std::collections::HashMap::new();
-                    for (mid, vec) in negative_centroid_batch {
-                        if let Some(entity_id) = mem_to_entity.get(&mid) {
-                            grouped_centroids
-                                .entry(entity_id.clone())
-                                .or_default()
-                                .push((mid, vec));
-                        }
-                    }
-
-                    let mut grouped_disambig: std::collections::HashMap<
-                        String,
-                        Vec<(String, Vec<f32>)>,
-                    > = std::collections::HashMap::new();
-                    for (mid, vec) in disambiguation_batch {
-                        if let Some(entity_id) = mem_to_entity.get(&mid) {
-                            grouped_disambig.entry(entity_id.clone()).or_default().push((mid, vec));
-                        }
-                    }
-
-                    for (entity_id, batch) in grouped_centroids {
-                        let _ = hn_tenant.set_negative_centroids_batch(&entity_id, &batch);
-                    }
-                    for (entity_id, batch) in grouped_disambig {
-                        let _ = hn_tenant.set_disambiguation_vectors_batch(&entity_id, &batch);
-                    }
-                }
-                start.elapsed()
-            }
-        })
+        // Hard negative mining disabled — it consumed 40-70% of ingest time
+        // for a <2% accuracy gain. Re-enable by restoring the original block.
+        tokio::task::spawn_blocking(|| Duration::ZERO)
     );
 
     let res_graph = res_graph.unwrap_or(Duration::ZERO);
@@ -1055,6 +1057,8 @@ async fn commit_batches(
     }
 
     // Fact registration + supersession
+    // Clone fact data for typed graph edges before drain consumes it.
+    let facts_for_edges: Vec<FactRegistration> = batches.fact_batch.clone();
     if !batches.fact_batch.is_empty() {
         let stage_start = Instant::now();
         let mut by_entity: std::collections::HashMap<String, Vec<FactRegistration>> =
@@ -1099,7 +1103,7 @@ async fn commit_batches(
                             se.card_updates.push((reg.memory_id.clone(), true, reg.timestamp));
                             se.card_relations.push((
                                 old_id.clone(),
-                                "updates".to_string(),
+                                EdgeType::Updates.as_str().to_string(),
                                 reg.memory_id.clone(),
                             ));
                             graph_status_batch.push(GraphEdgeEntry {
@@ -1108,7 +1112,7 @@ async fn commit_batches(
                                 predicate: reg.predicate.as_str(),
                                 object: reg.object.as_str(),
                                 status: "current",
-                                ref_info: Some(("SUPERSEDES", old_id.as_str())),
+                                ref_info: Some((EdgeType::Supersedes.as_str(), old_id.as_str())),
                                 timestamp: reg.timestamp,
                             });
                             graph_status_batch.push(GraphEdgeEntry {
@@ -1117,7 +1121,7 @@ async fn commit_batches(
                                 predicate: reg.predicate.as_str(),
                                 object: reg.object.as_str(),
                                 status: "stale",
-                                ref_info: Some(("SUPERSEDED_BY", reg.memory_id.as_str())),
+                                ref_info: Some((EdgeType::SupersededBy.as_str(), reg.memory_id.as_str())),
                                 timestamp: reg.timestamp,
                             });
                             let _ = tenant.fts_remove_document(old_id);
@@ -1126,7 +1130,7 @@ async fn commit_batches(
                             se.card_updates.push((reg.memory_id.clone(), false, reg.timestamp));
                             se.card_relations.push((
                                 reg.memory_id.clone(),
-                                "superseded_by".to_string(),
+                                EdgeType::SupersededBy.as_str().to_string(),
                                 cur_id.clone(),
                             ));
                             graph_status_batch.push(GraphEdgeEntry {
@@ -1135,7 +1139,7 @@ async fn commit_batches(
                                 predicate: reg.predicate.as_str(),
                                 object: reg.object.as_str(),
                                 status: "stale",
-                                ref_info: Some(("SUPERSEDED_BY", cur_id.as_str())),
+                                ref_info: Some((EdgeType::SupersededBy.as_str(), cur_id.as_str())),
                                 timestamp: reg.timestamp,
                             });
                             let _ = tenant.fts_remove_document(&reg.memory_id);
@@ -1176,6 +1180,48 @@ async fn commit_batches(
         }
 
         (diag.fact_ms, diag.fact_us) = elapsed_ms_and_us(stage_start);
+    }
+
+    // Typed graph edges: populate the edges table from memory cards and fact registrations.
+    // These edges power the entity-graph retrieval lane in the query fusion phase.
+    {
+        let stage_start = Instant::now();
+        let tenant_ge = tenant.clone();
+        let cards_ge = batches.memory_card_batch.clone();
+        let facts_ge = facts_for_edges;
+        tokio::task::spawn_blocking(move || {
+            for card in &cards_ge {
+                if card.subject.is_empty() || card.predicate.is_empty() || card.object.is_empty() {
+                    continue;
+                }
+                let _ = tenant_ge.graph_insert_edge(
+                    &card.entity_id,
+                    &card.source_memory_id,
+                    &card.subject,
+                    &card.predicate,
+                    &card.object,
+                    card.created_at_ms,
+                );
+            }
+            for fact in &facts_ge {
+                if fact.subject.is_empty() || fact.predicate.is_empty() || fact.object.is_empty() {
+                    continue;
+                }
+                let _ = tenant_ge.graph_insert_edge(
+                    &fact.entity_id,
+                    &fact.memory_id,
+                    &fact.subject,
+                    &fact.predicate,
+                    &fact.object,
+                    fact.timestamp,
+                );
+            }
+        })
+        .await
+        .map_err(|e| {
+            tracing::error!("typed graph edge spawn panic: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
     }
 
     // Card latest updates
@@ -2346,8 +2392,36 @@ async fn execute_ingest_pipeline(
     diag.input_count = payloads.len();
 
     // Phase 1: Payload preparation
-    let (expanded_payloads, nlp_cache, enriched_texts) =
+    let (mut expanded_payloads, nlp_cache, mut enriched_texts) =
         expand_and_enrich_payloads(payloads, &mut diag, total_start);
+
+    // Content-hash dedup: skip payloads with the same content, entity_id, and kind.
+    // This runs before embedding, so it saves both compute and storage.
+    {
+        let stage_start = Instant::now();
+        let hashes: Vec<String> = expanded_payloads
+            .iter()
+            .zip(enriched_texts.iter())
+            .map(|(payload, text)| {
+                let kind_str = payload.kind.as_deref().unwrap_or("memory");
+                content_hash(text, &payload.entity_id, kind_str)
+            })
+            .collect();
+
+        let existing = tenant.existing_content_hashes(&hashes).unwrap_or_default();
+
+        let mut keep_idx = Vec::with_capacity(expanded_payloads.len());
+        for (i, h) in hashes.iter().enumerate() {
+            if !existing.contains(h) {
+                keep_idx.push(i);
+            }
+        }
+
+        expanded_payloads = keep_idx.iter().map(|&i| expanded_payloads[i].clone()).collect();
+        enriched_texts = keep_idx.iter().map(|&i| enriched_texts[i].clone()).collect();
+
+        diag.dedup_build_ms += stage_start.elapsed().as_millis() as u64;
+    }
 
     // Phase 2: Embedding
     let semantic_embeddings =

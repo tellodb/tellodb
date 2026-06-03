@@ -66,6 +66,24 @@ impl SemanticInference {
         })
     }
 
+    /// Batch-embed multiple texts in a single ONNX inference call.
+    /// This is significantly faster than calling `generate_query_embedding` N times
+    /// because the matrix multiplications are batched across the batch dimension.
+    pub fn embed_batch(&self, texts: &[&str]) -> Vec<Vec<f32>> {
+        if texts.is_empty() {
+            return Vec::new();
+        }
+        let executor = self.next_executor();
+        if let Some(ref model) = executor.fast_embedding {
+            let mut model = model.lock().unwrap_or_else(|e| e.into_inner());
+            model
+                .embed(texts.to_vec(), None)
+                .unwrap_or_else(|_| vec![Vec::new(); texts.len()])
+        } else {
+            vec![Vec::new(); texts.len()]
+        }
+    }
+
     pub fn embedding_dim(&self) -> usize {
         self.embedding_dim
     }

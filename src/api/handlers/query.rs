@@ -185,6 +185,7 @@ pub async fn query_handler(
                 created_at_ms: 0,
                 textual_content: text,
                 evidence: None,
+                inference_notes: None,
             },
         );
     }
@@ -1040,6 +1041,37 @@ fn collect_link_cluster_scores(
         };
         for linked_mid in linked_memories {
             *accumulated.entry(linked_mid.clone()).or_insert(0.0) += path_weight;
+            frontier.push((linked_mid, depth + 1, path_weight * 0.6));
+        }
+    }
+
+    accumulated
+}
+
+fn collect_edge_cluster_scores(
+    tenant: &TenantStore,
+    seed_memory_id: &str,
+    max_depth: usize,
+    edge_type_filter: Option<&str>,
+) -> HashMap<String, f32> {
+    let mut accumulated = HashMap::new();
+    let mut visited = HashSet::new();
+    let mut frontier = vec![(seed_memory_id.to_string(), 0usize, 1.0f32)];
+
+    while let Some((current_mid, depth, path_weight)) = frontier.pop() {
+        if depth >= max_depth {
+            continue;
+        }
+        let visit_key = format!("{current_mid}:{depth}");
+        if !visited.insert(visit_key) {
+            continue;
+        }
+        let Ok(linked_edges) = tenant.get_edge_cluster_neighbors(&current_mid, edge_type_filter, 50) else {
+            continue;
+        };
+        for (linked_mid, weight) in linked_edges {
+            let contribution = path_weight * weight;
+            *accumulated.entry(linked_mid.clone()).or_insert(0.0) += contribution;
             frontier.push((linked_mid, depth + 1, path_weight * 0.6));
         }
     }
@@ -2113,6 +2145,17 @@ fn fusion_phase(s: &mut QueryPipelineState) {
                 entry.0 = ts;
             }
         }
+        let edge_scores = collect_edge_cluster_scores(&s.tenant, &seed_mid, 2, None);
+        for (linked_mid, boost) in edge_scores {
+            if let Some((ts, _)) = s.tenant
+                .lookup_by_memory_id(&linked_mid)
+                .unwrap_or(None)
+            {
+                *graph_scores.entry(linked_mid.clone()).or_insert(0.0) += boost;
+                let entry = fused_map.entry(linked_mid).or_insert((ts, 0.0));
+                entry.0 = ts;
+            }
+        }
     }
     if s.plan.needs_decomposition
         || s.plan.cross_entity
@@ -2135,6 +2178,39 @@ fn fusion_phase(s: &mut QueryPipelineState) {
         graph_seed_nodes.truncate(8);
 
     }
+
+    // Entity-graph retrieval lane: resolve query entities against registry,
+    // then traverse the edges table to find connected memories.
+    if let Some(ref entity_scope) = s.payload.entity_id {
+        if !entity_scope.is_empty() {
+            let mut entity_seeds: Vec<String> = s.plan.subject_entities.clone();
+            let query_lines: Vec<String> = std::iter::once(s.payload.textual_query.clone()).collect();
+            for phrase in extract_named_phrases(&query_lines) {
+                if phrase.len() >= 3
+                    && !entity_seeds.iter().any(|e| e.eq_ignore_ascii_case(&phrase))
+                {
+                    entity_seeds.push(phrase);
+                }
+            }
+            entity_seeds.truncate(8);
+
+            for seed in &entity_seeds {
+                if let Ok(edges) = s.tenant.graph_query_edges(seed, None, "Both", 50) {
+                    for edge in edges {
+                        if !edge.memory_id.is_empty() {
+                            if let Ok(Some((ts, _))) = s.tenant.lookup_by_memory_id(&edge.memory_id) {
+                                let boost = edge.weight * 0.5;
+                                *graph_scores.entry(edge.memory_id.clone()).or_insert(0.0) += boost;
+                                let entry = fused_map.entry(edge.memory_id.clone()).or_insert((ts, 0.0));
+                                entry.0 = ts;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     s.graph_scores = graph_scores;
     (s.diag.graph_ms, s.diag.graph_us) = elapsed_ms_and_us(stage_start);
 
@@ -2191,9 +2267,11 @@ fn score_hydrate(s: &mut QueryPipelineState) {
         .collect();
 
     let invalid_start = Instant::now();
-    s.invalidated_facts = s.tenant
-        .invalidated_set()
-        .unwrap_or_default();
+    s.invalidated_facts = if let Some(pit) = s.payload.point_in_time_ms {
+        s.tenant.invalidated_set_at_time(pit).unwrap_or_default()
+    } else {
+        s.tenant.invalidated_set().unwrap_or_default()
+    };
     (s.diag.fetch_invalid_ms, s.diag.fetch_invalid_us) = elapsed_ms_and_us(invalid_start);
 }
 
@@ -2228,6 +2306,11 @@ fn score_loop(s: &mut QueryPipelineState) -> Vec<EvidenceCard> {
         } else {
             *ts
         };
+        if let Some(pit) = s.payload.point_in_time_ms {
+            if created_at_ms > pit {
+                continue;
+            }
+        }
         let scorable = ScorableObservation::new(&obs.textual_content);
         let entity_hits = entity_hit_count(&scorable, plan);
         let lexical_hits = lexical_hit_count(&scorable, plan);
@@ -2521,6 +2604,7 @@ fn score_build_response(s: &mut QueryPipelineState, mut evidence_cards: Vec<Evid
                 similarity: card.final_score,
                 textual_content: text,
                 evidence,
+                inference_notes: None,
             }
         })
         .collect();
@@ -2545,6 +2629,27 @@ pub fn execute_query_pipeline(
     retrieval_phase(&mut s);
     rerank_phase(&mut s);
     fusion_phase(&mut s);
-    let results = score_phase(&mut s);
+    let mut results = score_phase(&mut s);
+    
+    let intent = s.plan.intent;
+    let entity_id = s.payload.entity_id.clone().unwrap_or_else(|| "default".to_string());
+    if matches!(intent, QueryIntent::Inference | QueryIntent::Recommendation) {
+        let conclusions = crate::graph_inference::run_graph_inference(&s.tenant, &entity_id, intent);
+        if !conclusions.is_empty() {
+            let notes: Vec<String> = conclusions.into_iter().map(|c| c.conclusion_text).collect();
+            results.push(QueryResult {
+                memory_id: "graph_inference_conclusion".to_string(),
+                entity_id: entity_id.clone(),
+                session_id: "system".to_string(),
+                turn_index: 0,
+                similarity: 1.0,
+                created_at_ms: 0,
+                textual_content: "Graph inference conclusions derived from relationship patterns.".to_string(),
+                evidence: None,
+                inference_notes: Some(notes),
+            });
+        }
+    }
+
     Ok((results, s.diag))
 }

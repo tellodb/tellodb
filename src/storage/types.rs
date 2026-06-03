@@ -28,6 +28,7 @@ pub struct AgentObservation {
     pub textual_content: String,
     pub embedding: Vec<f32>,
     pub kind: MemoryKind,
+    pub content_hash: String,
     pub created_at_ms: u64,
 }
 

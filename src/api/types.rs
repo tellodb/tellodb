@@ -215,6 +215,8 @@ pub struct QueryResult {
     pub textual_content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub evidence: Option<ProofPacket>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inference_notes: Option<Vec<String>>,
 }
 
 /// Proof packet for evidence-verified query responses.
@@ -268,6 +270,8 @@ pub struct QueryPayload {
     pub proof_mode: Option<String>,
     /// Nearby turns to attach per evidence result when proof mode is enabled.
     pub max_evidence_turns_per_session: Option<usize>,
+    /// Optional point in time to run the query as-of (milliseconds timestamp).
+    pub point_in_time_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]

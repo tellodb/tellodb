@@ -13,6 +13,7 @@ mod api;
 mod error;
 mod fts;
 mod graph;
+mod graph_inference;
 mod lifecycle;
 mod metrics;
 mod ml;

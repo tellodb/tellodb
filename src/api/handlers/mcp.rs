@@ -214,6 +214,7 @@ async fn handle_tools_call(state: &EngineState, id: Value, params: Value) -> Jso
                 textual_content: text.clone(),
                 embedding: embedding.clone(),
                 kind,
+                content_hash: String::new(),
                 created_at_ms: timestamp,
             };
 

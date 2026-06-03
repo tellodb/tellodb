@@ -194,7 +194,7 @@ pub fn parse_kind(s: Option<&str>) -> MemoryKind {
         Some("decision") => MemoryKind::Decision,
         Some("lesson") => MemoryKind::Lesson,
         Some("preference") => MemoryKind::Preference,
-        Some("session_summary" | "session-summary") => MemoryKind::SessionSummary,
+        Some("session_summary" | "session-summary" | "sessionsummary") => MemoryKind::SessionSummary,
         Some("fact") => MemoryKind::Fact,
         _ => MemoryKind::Conversational,
     }
@@ -742,7 +742,7 @@ mod tests {
     fn parse_kind_defaults_to_conversational() {
         assert_eq!(parse_kind(None), MemoryKind::Conversational);
         assert_eq!(parse_kind(Some("")), MemoryKind::Conversational);
-        assert_eq!(parse_kind(Some("DECISION")), MemoryKind::Conversational);
+        assert_eq!(parse_kind(Some("DECISIONS")), MemoryKind::Conversational);
         assert_eq!(parse_kind(Some("UNKNOWN")), MemoryKind::Conversational);
     }
 
