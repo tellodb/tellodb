@@ -42,9 +42,9 @@ impl SemanticInference {
         let embedding_model_id = "BAAI/bge-small-en-v1.5".to_string();
         let embedding_dim = embedding_dimensions_for_model(&embedding_model_id);
 
-        // Use GPU if TEMPORAL_MEMORY_DEVICE=gpu is set.
+        // Use GPU if TEMPORAL_MEMORY_DEVICE=gpu or cuda is set.
         let device_env = std::env::var("TEMPORAL_MEMORY_DEVICE").unwrap_or_default().to_lowercase();
-        let use_gpu = device_env == "gpu";
+        let use_gpu = device_env == "gpu" || device_env == "cuda";
         let use_coreml = device_env == "coreml" || device_env == "mps" || device_env == "mac";
 
         let device_label: &'static str = if use_gpu { "CUDA" } else if use_coreml { "CoreML" } else { "CPU" };
