@@ -538,13 +538,35 @@ async fn generate_embeddings(
         let embeddings = state.semantic.embed_batch_parallel(texts).await;
 
         (diag.embed_ms, diag.embed_us) = elapsed_ms_and_us(stage_start);
+
+        // Guard: if embed_batch_parallel returned fewer vectors than expected
+        // (e.g. CUDA OOM caused model.embed() to return an empty Vec via
+        // unwrap_or_default()), log a warning and return an internal error so
+        // the request fails cleanly rather than panicking the server.
+        if !embeddings.is_empty() && embeddings.len() < unique_specs.len() {
+            tracing::error!(
+                got = embeddings.len(),
+                expected = unique_specs.len(),
+                "embed_batch_parallel returned fewer vectors than texts (likely CUDA OOM); \
+                 returning 500 to caller"
+            );
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+
         embeddings
     };
 
+    let embed_dim = state.semantic.embedding_dim();
     let mut semantic_embeddings = Vec::with_capacity(semantic_embed_specs.len());
     for spec in semantic_embed_specs {
         let idx = *spec_to_idx.get(&spec).expect("embedding spec not found in index");
-        semantic_embeddings.push(unique_embeddings[idx].clone());
+        // Use .get() instead of direct index to guard against any remaining
+        // edge case where unique_embeddings is empty (all-empty batch etc.).
+        let embedding = unique_embeddings
+            .get(idx)
+            .cloned()
+            .unwrap_or_else(|| vec![0.0f32; embed_dim]);
+        semantic_embeddings.push(embedding);
     }
 
     Ok(semantic_embeddings)
