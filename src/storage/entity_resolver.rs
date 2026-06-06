@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use std::cmp::Ordering;
 use thiserror::Error;
 
@@ -181,21 +182,9 @@ pub fn phonetic_key(name: &str) -> String {
     soundex_key(&transformed)
 }
 
-/// Cosine similarity between two f32 slices.
-///
-/// Returns 0.0 if either vector is empty or dimensions differ.
-pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() || a.is_empty() {
-        return 0.0;
-    }
-    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
-    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm_a == 0.0 || norm_b == 0.0 {
-        return 0.0;
-    }
-    (dot / (norm_a * norm_b)).clamp(-1.0, 1.0)
-}
+/// Re-export of the canonical cosine similarity. Kept for backwards compatibility
+/// with downstream callers in this crate.
+pub use crate::ml::cosine_similarity;
 
 /// Run the 4-tier resolution pipeline against a set of known candidates.
 ///

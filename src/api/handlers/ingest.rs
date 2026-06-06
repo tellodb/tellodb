@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use axum::http::HeaderMap;
 use axum::{
     extract::{Json, State},
@@ -14,6 +15,7 @@ use crate::api::auth::{
 use crate::api::ingest_utils::*;
 use crate::api::types::{BatchIngestPayload, IngestPayload};
 use crate::api::utils::*;
+use crate::ml::cosine_similarity;
 use std::sync::Arc;
 use crate::api::{EngineState, PlatformWriteOp};
 use crate::graph::EdgeType;
@@ -504,7 +506,7 @@ fn expand_and_enrich_payloads(
 }
 
 // ── Phase 2: Embedding generation ──
-fn generate_embeddings(
+async fn generate_embeddings(
     state: &EngineState,
     expanded_payloads: &[IngestPayload],
     enriched_texts: &[String],
@@ -532,8 +534,8 @@ fn generate_embeddings(
         Vec::new()
     } else {
         let stage_start = Instant::now();
-        let texts: Vec<&str> = unique_specs.iter().map(|(_, t)| t.as_str()).collect();
-        let embeddings = state.semantic.embed_batch(&texts);
+        let texts: Vec<String> = unique_specs.iter().map(|(_, t)| t.clone()).collect();
+        let embeddings = state.semantic.embed_batch_parallel(texts).await;
 
         (diag.embed_ms, diag.embed_us) = elapsed_ms_and_us(stage_start);
         embeddings
@@ -562,13 +564,21 @@ fn build_observations(
     let mut semantic_embedding_iter = semantic_embeddings.into_iter();
 
     for payload in expanded_payloads.into_iter() {
+        let mut payload = payload;
+        let kind = parse_kind(payload.kind.as_deref());
+        if (kind == MemoryKind::Preference || kind == MemoryKind::Decision || kind == MemoryKind::Fact)
+            && payload.fact_key.as_ref().map_or(true, |k| k.trim().is_empty())
+        {
+            if let Some(inferred_key) = crate::api::plan::infer_query_fact_key(&payload.textual_content) {
+                payload.fact_key = Some(inferred_key);
+            }
+        }
         let index_semantic = payload.index_semantic.unwrap_or(true);
         let embedding = if index_semantic {
             semantic_embedding_iter.next().unwrap_or_default()
         } else {
             Vec::new()
         };
-        let kind = parse_kind(payload.kind.as_deref());
         let enable_semantic_dedup = payload.enable_semantic_dedup.unwrap_or(true);
         let enable_consolidation = payload.enable_consolidation.unwrap_or(true);
         let is_inference = payload
@@ -593,10 +603,10 @@ fn build_observations(
             && enable_semantic_dedup
             && (kind == MemoryKind::Fact || kind == MemoryKind::Decision)
         {
-            let is_dup = is_semantic_duplicate(state, &payload.entity_id, &embedding, 0.85)?;
+            let is_dup = is_semantic_duplicate(state, &payload.entity_id, &embedding, 0.94)?;
             let in_batch = semantic_seen.iter().any(|(entity_id, prior_embedding)| {
                 entity_id == &payload.entity_id
-                    && cosine_similarity(prior_embedding, &embedding) >= 0.85
+                    && cosine_similarity(prior_embedding, &embedding) >= 0.94
             });
             if is_dup || in_batch {
                 continue;
@@ -764,7 +774,7 @@ fn build_artifacts(
                 ));
             }
 
-        if record.obs.kind == MemoryKind::Fact {
+        if record.obs.kind == MemoryKind::Fact || record.obs.kind == MemoryKind::Preference || record.obs.kind == MemoryKind::Decision {
             if let Some(fact_key) = record.payload.fact_key.as_deref() {
                 batches.fact_batch.push(FactRegistration {
                     entity_id: record.payload.entity_id.clone(),
@@ -810,7 +820,7 @@ async fn commit_batches(
     tenant: &std::sync::Arc<TenantStore>,
     state: &EngineState,
     nlp_cache: &NlpCache,
-    mining_records: &[MiningRecord],
+    _mining_records: &[MiningRecord],
     batches: &mut ArtifactBatches,
     diag: &mut IngestDiagnostics,
 ) -> Result<(), StatusCode> {
@@ -1073,24 +1083,26 @@ async fn commit_batches(
             card_relations: Vec<(String, String, String)>,
         }
 
-        let fact_side_effects: Vec<Result<FactSideEffects, StatusCode>> = by_entity
-            .into_iter()
-            .map(|(entity_id, registrations)| {
+        let tenant_fact = tenant.clone();
+        let fact_side_effects: Vec<Result<FactSideEffects, StatusCode>> = tokio::task::spawn_blocking(move || {
+            by_entity
+                .into_iter()
+                .map(|(entity_id, registrations)| {
                 let mut se = FactSideEffects::default();
-                let items: Vec<(String, u64, String, String, String, String)> = registrations
+                let items: Vec<(&str, u64, &str, &str, &str, &str)> = registrations
                     .iter()
                     .map(|r| {
                         (
-                            r.fact_key.clone(),
+                            r.fact_key.as_str(),
                             r.timestamp,
-                            r.memory_id.clone(),
-                            r.subject.clone(),
-                            r.predicate.clone(),
-                            r.object.clone(),
+                            r.memory_id.as_str(),
+                            r.subject.as_str(),
+                            r.predicate.as_str(),
+                            r.object.as_str(),
                         )
                     })
                     .collect();
-                let statuses = tenant
+                let statuses = tenant_fact
                     .register_fact_versions_batch(&entity_id, &items)
                     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -1124,7 +1136,6 @@ async fn commit_batches(
                                 ref_info: Some((EdgeType::SupersededBy.as_str(), reg.memory_id.as_str())),
                                 timestamp: reg.timestamp,
                             });
-                            let _ = tenant.fts_remove_document(old_id);
                         }
                         FactVersionStatus::Stale { current: (_, cur_id) } => {
                             se.card_updates.push((reg.memory_id.clone(), false, reg.timestamp));
@@ -1142,7 +1153,6 @@ async fn commit_batches(
                                 ref_info: Some((EdgeType::SupersededBy.as_str(), cur_id.as_str())),
                                 timestamp: reg.timestamp,
                             });
-                            let _ = tenant.fts_remove_document(&reg.memory_id);
                         }
                         FactVersionStatus::Current { superseded: None } => {
                             se.card_updates.push((reg.memory_id.clone(), true, reg.timestamp));
@@ -1160,14 +1170,20 @@ async fn commit_batches(
                 }
 
                 if !graph_status_batch.is_empty() {
-                    tenant
+                    tenant_fact
                         .graph_upsert_fact_status_batch(&entity_id, &graph_status_batch)
                         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
                 }
 
                 Ok(se)
             })
-            .collect();
+            .collect()
+        })
+        .await
+        .map_err(|e| {
+            tracing::error!("fact supersession spawn panic: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
         for result in fact_side_effects {
             match result {
@@ -1185,7 +1201,7 @@ async fn commit_batches(
     // Typed graph edges: populate the edges table from memory cards and fact registrations.
     // These edges power the entity-graph retrieval lane in the query fusion phase.
     {
-        let stage_start = Instant::now();
+        let _stage_start = Instant::now();
         let tenant_ge = tenant.clone();
         let cards_ge = batches.memory_card_batch.clone();
         let facts_ge = facts_for_edges;
@@ -2425,7 +2441,7 @@ async fn execute_ingest_pipeline(
 
     // Phase 2: Embedding
     let semantic_embeddings =
-        generate_embeddings(state, &expanded_payloads, &enriched_texts, &mut diag)?;
+        generate_embeddings(state, &expanded_payloads, &enriched_texts, &mut diag).await?;
 
     tracing::info!("[CP] embed_done: μs={}", total_start.elapsed().as_micros());
 

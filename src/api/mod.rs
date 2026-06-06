@@ -34,6 +34,7 @@ pub struct EngineState {
     pub data_root: Arc<str>,
     pub ranking_config: Arc<crate::api::types::RankingConfig>,
     pub intent_classifier: Option<Arc<QueryIntentClassifier>>,
+    pub rate_limiter: Arc<crate::api::auth::RateLimiter>,
 }
 
 impl EngineState {

@@ -23,21 +23,6 @@ mod tests {
             .any(|query| query.contains("bought purchased acquired")));
     }
 
-    #[test]
-    fn retrieval_rewrite_corrects_common_locomo_typos() {
-        assert_eq!(
-            rewrite_query_for_retrieval(
-                "What fields would Caroline be likely to pursue in her educaton?"
-            ),
-            "What fields would Caroline be likely to pursue in her education?"
-        );
-        assert_eq!(
-            rewrite_query_for_retrieval(
-                "When did Caroline and Melanie go to a pride fesetival together?"
-            ),
-            "When did Caroline and Melanie go to a pride festival together?"
-        );
-    }
 
     #[test]
     fn inference_plan_adds_archetype_expansion_terms() {

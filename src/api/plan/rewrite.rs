@@ -2,8 +2,7 @@ use super::types::QueryPlan;
 use crate::api::utils::{normalize_alpha_tokens, singularize_token};
 
 pub fn rewrite_query_for_retrieval(query: &str) -> String {
-    let corrected = correct_query_typos(query.trim());
-    let q = corrected.as_str();
+    let q = query.trim();
     let ql = q.to_lowercase();
 
     let advice_prefixes: &[&str] = &[
@@ -121,36 +120,6 @@ pub fn rewrite_query_for_retrieval(query: &str) -> String {
     q.to_string()
 }
 
-pub fn correct_query_typos(query: &str) -> String {
-    let replacements = [
-        ("educaton", "education"),
-        ("persue", "pursue"),
-        ("fesetival", "festival"),
-        ("tennesee", "tennessee"),
-        ("wtih", "with"),
-        ("des ", "does "),
-    ];
-    let mut corrected = query.to_string();
-    for (from, to) in replacements {
-        corrected = corrected.replace(from, to);
-        let title_from = {
-            let mut chars = from.chars();
-            match chars.next() {
-                Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
-                None => from.to_string(),
-            }
-        };
-        let title_to = {
-            let mut chars = to.chars();
-            match chars.next() {
-                Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
-                None => to.to_string(),
-            }
-        };
-        corrected = corrected.replace(title_from.as_str(), title_to.as_str());
-    }
-    corrected
-}
 
 pub fn build_hyde_query(query: &str, plan: &QueryPlan) -> Option<String> {
     let lower = query.to_ascii_lowercase();

@@ -10,7 +10,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod analytics;
 mod api;
-mod error;
+
 mod fts;
 mod graph;
 mod graph_inference;
@@ -44,7 +44,7 @@ fn env_var_bool(name: &str) -> bool {
     })
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
     init_tracing_subscriber();
     info!("Initializing Temporal Multi-Model Memory Engine...");
@@ -93,7 +93,7 @@ async fn main() -> anyhow::Result<()> {
     let hnsw_ef_add =
         env::var("TELLODB_HNSW_EF_ADD").ok().and_then(|v| v.parse().ok()).unwrap_or(128);
     let hnsw_ef_srch =
-        env::var("TELLODB_HNSW_EF_SEARCH").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
+        env::var("TELLODB_HNSW_EF_SEARCH").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
     info!("Initializing Vector Substrate (HNSW)...");
     let vector_index = vector_index::VectorIndex::new(
         semantic.embedding_dim(),
@@ -148,7 +148,7 @@ async fn main() -> anyhow::Result<()> {
 
     let state = api::EngineState {
         vector_index,
-        tenant_manager,
+        tenant_manager: tenant_manager.clone(),
         analytics,
         semantic,
         auth,
@@ -157,6 +157,7 @@ async fn main() -> anyhow::Result<()> {
         data_root: Arc::<str>::from(runtime_paths.root().display().to_string()),
         ranking_config: Arc::new(ranking_config),
         intent_classifier,
+        rate_limiter: Arc::new(api::auth::RateLimiter::new()),
     };
 
     let app = api::build_api(state);
@@ -193,6 +194,27 @@ async fn main() -> anyhow::Result<()> {
                 for tenant in tenants {
                     if let Err(e) = tenant.checkpoint() {
                         error!("WAL checkpoint failed: {:?}", e);
+                    }
+                }
+            }
+        });
+    }
+
+    // Periodic memory lifecycle expiration sweep
+    {
+        let sweep_tenants = tenant_manager.clone();
+        tokio::spawn(async move {
+            let mut ticker = interval(Duration::from_secs(300)); // every 5 min
+            loop {
+                ticker.tick().await;
+                let now_ms = match std::time::SystemTime::now().duration_since(std::time::SystemTime::UNIX_EPOCH) {
+                    Ok(d) => d.as_millis() as u64,
+                    Err(_) => continue,
+                };
+                let tenants = sweep_tenants.all_tenants();
+                for tenant in tenants {
+                    if let Err(e) = tenant.expire_records(now_ms) {
+                        error!("Lifecycle expiration sweep failed: {:?}", e);
                     }
                 }
             }

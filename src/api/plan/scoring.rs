@@ -93,18 +93,6 @@ pub fn routed_session_from_memory_id(memory_id: &str) -> Option<String> {
     session_id_from_memory_id(memory_id)
 }
 
-pub fn is_query_count_like(query: &str) -> bool {
-    let q = query.to_ascii_lowercase();
-    q.contains("how many")
-        || q.contains("number of")
-        || q.contains("count of")
-        || q.contains("in total")
-        || q.contains("total")
-        || q.contains("combined")
-        || q.contains("altogether")
-        || q.contains("average")
-}
-
 pub fn extract_numeric_tokens(text: &str) -> Vec<f32> {
     let mut values = Vec::new();
     let mut current = String::new();

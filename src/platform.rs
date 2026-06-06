@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use anyhow::{anyhow, Context, Result};
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
@@ -419,30 +420,55 @@ impl PlatformStore {
             .context("failed to initialize usage record")?;
 
         let now = now_ms()?;
-        let mut query = format!(
-            "UPDATE usage SET request_count = request_count + ?, last_request_ms = {}",
-            now
-        );
-        match endpoint {
-            "ingest" => query.push_str(", ingest_count = ingest_count + ?"),
-            "query" => query.push_str(", query_count = query_count + ?"),
-            "temporal_query" => query.push_str(", temporal_query_count = temporal_query_count + ?"),
-            "reset" => query.push_str(", reset_count = reset_count + ?"),
-            "health" => query.push_str(", health_count = health_count + ?"),
-            "version" => query.push_str(", version_count = version_count + ?"),
-            _ => {}
+        // All inputs are bound. The endpoint string only ever matches a
+        // hard-coded set of literals, and user_id / now / count are passed
+        // as bound parameters. Defense in depth: validate user_id format.
+        if !is_safe_user_id(user_id) {
+            return Err(anyhow!("record_usage_n: user_id failed format check"));
         }
-        query.push_str(" WHERE user_id = ?");
-
-        if matches!(
-            endpoint,
-            "ingest" | "query" | "temporal_query" | "reset" | "health" | "version"
-        ) {
-            conn.execute(&query, params![count, count, user_id])
-                .context("failed to update endpoint-specific usage counters")?;
-        } else {
-            conn.execute("UPDATE usage SET request_count = request_count + ?, last_request_ms = ? WHERE user_id = ?", params![count, now, user_id])
-                .context("failed to update generic usage counters")?;
+        match endpoint {
+            "ingest" => {
+                conn.execute(
+                    "UPDATE usage SET request_count = request_count + ?1, last_request_ms = ?2, ingest_count = ingest_count + ?1 WHERE user_id = ?3",
+                    params![count, now, user_id],
+                ).context("failed to update ingest usage counters")?;
+            }
+            "query" => {
+                conn.execute(
+                    "UPDATE usage SET request_count = request_count + ?1, last_request_ms = ?2, query_count = query_count + ?1 WHERE user_id = ?3",
+                    params![count, now, user_id],
+                ).context("failed to update query usage counters")?;
+            }
+            "temporal_query" => {
+                conn.execute(
+                    "UPDATE usage SET request_count = request_count + ?1, last_request_ms = ?2, temporal_query_count = temporal_query_count + ?1 WHERE user_id = ?3",
+                    params![count, now, user_id],
+                ).context("failed to update temporal_query usage counters")?;
+            }
+            "reset" => {
+                conn.execute(
+                    "UPDATE usage SET request_count = request_count + ?1, last_request_ms = ?2, reset_count = reset_count + ?1 WHERE user_id = ?3",
+                    params![count, now, user_id],
+                ).context("failed to update reset usage counters")?;
+            }
+            "health" => {
+                conn.execute(
+                    "UPDATE usage SET request_count = request_count + ?1, last_request_ms = ?2, health_count = health_count + ?1 WHERE user_id = ?3",
+                    params![count, now, user_id],
+                ).context("failed to update health usage counters")?;
+            }
+            "version" => {
+                conn.execute(
+                    "UPDATE usage SET request_count = request_count + ?1, last_request_ms = ?2, version_count = version_count + ?1 WHERE user_id = ?3",
+                    params![count, now, user_id],
+                ).context("failed to update version usage counters")?;
+            }
+            _ => {
+                conn.execute(
+                    "UPDATE usage SET request_count = request_count + ?1, last_request_ms = ?2 WHERE user_id = ?3",
+                    params![count, now, user_id],
+                ).context("failed to update generic usage counters")?;
+            }
         }
 
         Ok(())
@@ -686,6 +712,17 @@ fn verify_password(password_hash: &str, password: &str) -> bool {
         return false;
     };
     Argon2::default().verify_password(password.as_bytes(), &parsed_hash).is_ok()
+}
+
+fn is_safe_user_id(user_id: &str) -> bool {
+    let len = user_id.len();
+    if len < 8 || len > 128 {
+        return false;
+    }
+    if !user_id.starts_with("usr_") {
+        return false;
+    }
+    user_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 fn random_token(length: usize) -> String {

@@ -170,5 +170,63 @@ pub fn build_chunk_memory_id(payload: &IngestPayload, idx: usize) -> String {
 }
 
 pub fn expand_payload_for_content_type(payload: &IngestPayload) -> Vec<IngestPayload> {
-    vec![payload.clone()]
+    let content_type = infer_content_type(payload);
+    let chunks = match content_type.as_str() {
+        "markdown" => chunk_markdown(&payload.textual_content),
+        "code" => chunk_code(&payload.textual_content),
+        "email" => chunk_email(&payload.textual_content),
+        "table" => chunk_table_like(&payload.textual_content),
+        _ => chunk_plain_or_chat(&payload.textual_content),
+    };
+
+    if chunks.len() <= 1 {
+        return vec![payload.clone()];
+    }
+
+    let original_id = payload.memory_id.clone();
+    let mut expanded = Vec::with_capacity(chunks.len());
+    for (idx, chunk) in chunks.into_iter().enumerate() {
+        let mut cloned = payload.clone();
+        cloned.textual_content = chunk;
+        cloned.source_memory_id = Some(original_id.clone());
+        cloned.memory_id = build_chunk_memory_id(payload, idx);
+        expanded.push(cloned);
+    }
+    expanded
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_expand_payload_for_content_type_no_split() {
+        let payload = IngestPayload {
+            entity_id: "user".to_string(),
+            memory_id: "user::sess::0".to_string(),
+            textual_content: "Short text.".to_string(),
+            ..Default::default()
+        };
+        let expanded = expand_payload_for_content_type(&payload);
+        assert_eq!(expanded.len(), 1);
+        assert_eq!(expanded[0].memory_id, "user::sess::0");
+        assert_eq!(expanded[0].source_memory_id, None);
+    }
+
+    #[test]
+    fn test_expand_payload_for_content_type_with_split() {
+        let long_text = "A. ".repeat(600); // 1800 chars
+        let payload_long = IngestPayload {
+            entity_id: "user".to_string(),
+            memory_id: "user::sess::0".to_string(),
+            textual_content: long_text,
+            content_type: Some("plain".to_string()),
+            ..Default::default()
+        };
+        let expanded = expand_payload_for_content_type(&payload_long);
+        assert!(expanded.len() > 1);
+        assert_eq!(expanded[0].source_memory_id, Some("user::sess::0".to_string()));
+        assert_eq!(expanded[0].memory_id, "user::sess::0");
+        assert_eq!(expanded[1].memory_id, "user::sess::1");
+    }
 }

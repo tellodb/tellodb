@@ -522,10 +522,6 @@ pub fn ok_or_500<T, E: std::fmt::Debug>(r: Result<T, E>) -> Result<T, StatusCode
     })
 }
 
-pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
-}
-
 pub fn should_apply_neural_rerank(
     query_text: &str,
     hnsw_raw: &[(u64, f32)],
@@ -1162,20 +1158,6 @@ mod tests {
     fn clip_profile_to_budget_non_object_json_unchanged() {
         let result = clip_profile_to_budget("[1,2,3]", 2);
         assert_eq!(result, "[1,2,3]");
-    }
-
-    #[test]
-    fn cosine_similarity_identical_vectors() {
-        let a = [1.0, 0.0, 0.0];
-        let b = [1.0, 0.0, 0.0];
-        assert!((cosine_similarity(&a, &b) - 1.0).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn cosine_similarity_orthogonal_vectors() {
-        let a = [1.0, 0.0];
-        let b = [0.0, 1.0];
-        assert!((cosine_similarity(&a, &b) - 0.0).abs() < f32::EPSILON);
     }
 
     #[test]

@@ -143,14 +143,36 @@ impl QueryIntentClassifier {
     }
 }
 
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm_a == 0.0 || norm_b == 0.0 {
+/// Cosine similarity of two slices. Returns 0.0 if either vector has zero norm
+/// or the dimensions do not match.
+#[inline]
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
         return 0.0;
     }
-    dot / (norm_a * norm_b)
+    let mut dot = 0.0_f32;
+    let mut norm_a = 0.0_f32;
+    let mut norm_b = 0.0_f32;
+    for i in 0..a.len() {
+        dot += a[i] * b[i];
+        norm_a += a[i] * a[i];
+        norm_b += b[i] * b[i];
+    }
+    let sqrt_a = norm_a.sqrt();
+    let sqrt_b = norm_b.sqrt();
+
+    #[cfg(all(debug_assertions, not(test)))]
+    {
+        if sqrt_a != 0.0 {
+            debug_assert!((sqrt_a - 1.0).abs() < 1e-2, "vector a is not L2 normalized: norm={}", sqrt_a);
+        }
+        if sqrt_b != 0.0 {
+            debug_assert!((sqrt_b - 1.0).abs() < 1e-2, "vector b is not L2 normalized: norm={}", sqrt_b);
+        }
+    }
+
+    let denom = sqrt_a * sqrt_b;
+    if denom == 0.0 { 0.0 } else { dot / denom }
 }
 
 #[cfg(test)]

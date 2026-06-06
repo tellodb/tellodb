@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use anyhow::Context;
 use anyhow::Result;
 use parking_lot::RwLock;
@@ -38,10 +39,23 @@ impl VectorIndex {
         expansion_search: usize,
         persist_dir: Option<&str>,
     ) -> Result<Self> {
+        // Quantization: F32 (full precision, ~4x memory of I8) or I8 (4x smaller,
+        // ~1-3% recall loss on cosine). Choose via TELLODB_HNSW_QUANTIZATION env:
+        // "f32" (default, accurate), "i8" (compact), or "f16" (compromise).
+        let quantization = match std::env::var("TELLODB_HNSW_QUANTIZATION")
+            .ok()
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("i8") => ScalarKind::I8,
+            Some("f16") => ScalarKind::F16,
+            _ => ScalarKind::F32,
+        };
         let options = IndexOptions {
             dimensions,
             metric: MetricKind::Cos,
-            quantization: ScalarKind::F32,
+            quantization,
             connectivity,
             expansion_add,
             expansion_search,

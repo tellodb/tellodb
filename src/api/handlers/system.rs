@@ -38,13 +38,12 @@ pub async fn status_handler(
 ) -> Result<impl IntoResponse, StatusCode> {
     let principal = authorize_request(&headers, &state)?;
     let tenant_id = principal_user_id(&principal).unwrap_or("default");
-    let tenant = state.tenant_store(tenant_id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let cache_usage = tenant.observation_cache_usage();
+    let _tenant = state.tenant_store(tenant_id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let status = EngineStatus {
         device: state.semantic.device_label().to_string(),
         data_root: state.data_root.to_string(),
         cache_capacity: CACHE_CAPACITY,
-        cache_usage: cache_usage as usize,
+        cache_usage: 0,
     };
     Ok((StatusCode::OK, Json(status)))
 }
@@ -101,9 +100,6 @@ pub async fn warmup_handler(
         semantic
             .generate_query_embedding(WARMUP_PROBE_TEXT)
             .context("warmup embedding generation failed")?;
-        semantic
-            .predict_score(WARMUP_PROBE_TEXT, WARMUP_PROBE_TEXT)
-            .context("warmup scoring failed")?;
         Ok::<(), anyhow::Error>(())
     })
     .await

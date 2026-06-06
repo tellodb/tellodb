@@ -1,11 +1,3 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum GraphDirection {
-    #[default]
-    Outbound,
-    Inbound,
-    Both,
-}
-
 /// Canonical set of typed edge relationships used across all tables.
 /// String representation is lowercase_snake_case stored in SQLite.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

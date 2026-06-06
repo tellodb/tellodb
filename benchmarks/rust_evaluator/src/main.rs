@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_ENGINE_URL: &str = "http://127.0.0.1:3000";
@@ -226,17 +227,37 @@ struct Cli {
     #[arg(long, global = true, value_enum, default_value_t = ReaderMode::Con)]
     reader_mode: ReaderMode,
 
+    /// Cap on the rendered Con-mode context (in chars, ~4 chars/token). 0 = no cap.
+    /// Only applies when --reader-mode=con. Useful to keep a single answer call
+    /// from blowing past the model's context window.
+    #[arg(long, global = true, default_value_t = 0)]
+    con_context_cap_chars: usize,
+
     #[arg(long, global = true, default_value_t = 3)]
     max_chunks_per_session: usize,
 
     #[arg(long, global = true)]
     reset_first: bool,
 
+    /// Skip the reset + ingest phase and query the engine as-is.
+    /// Use this when you have already ingested the dataset in a prior run
+    /// and only want to re-run the query / answer / judge pipeline without
+    /// waiting for re-ingest. Mutually exclusive with --reset-first (skip
+    /// takes precedence if both are supplied by mistake).
+    #[arg(long, global = true)]
+    skip_ingest: bool,
+
     #[arg(long, global = true)]
     dump_candidates_jsonl: Option<String>,
 
     #[arg(long, global = true)]
     dump_gold_ranks_jsonl: Option<String>,
+
+    /// Number of questions to process in parallel for the LLM benchmark.
+    /// Each worker runs query → answer → judge concurrently. The engine
+    /// rate limit caps useful parallelism at ~16.
+    #[arg(long, global = true, default_value_t = 16)]
+    llm_concurrency: usize,
 }
 
 #[derive(Subcommand, Debug)]
@@ -413,13 +434,17 @@ struct EvalConfig {
     enable_semantic_dedup: bool,
     enable_consolidation: bool,
     reader_mode: ReaderMode,
+    con_context_cap_chars: usize,
     max_chunks_per_session: usize,
     reset_first: bool,
+    /// When true, skip reset + ingest and go straight to query/answer/judge.
+    skip_ingest: bool,
     dump_candidates_jsonl: Option<String>,
     dump_gold_ranks_jsonl: Option<String>,
+    llm_concurrency: usize,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct EvalTotals {
     retrieval_correct: usize,
     answer_correct: usize,
@@ -431,14 +456,14 @@ struct EvalTotals {
     latency_samples: LatencySamples,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct CategoryStats {
     evaluated: usize,
     retrieval_correct: usize,
     answer_correct: usize,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct QualityStats {
     retrieval_hit_answer_pass: usize,
     retrieval_hit_answer_fail: usize,
@@ -449,7 +474,7 @@ struct QualityStats {
     context_token_samples: Vec<u128>,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct LatencySamples {
     query_ms: Vec<u128>,
     answer_ms: Vec<u128>,
@@ -457,7 +482,7 @@ struct LatencySamples {
     total_ms: Vec<u128>,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct AggregateTimings {
     ingest_ms: u128,
     query_ms: u128,
@@ -549,10 +574,13 @@ async fn main() -> Result<()> {
         enable_semantic_dedup: cli.enable_semantic_dedup,
         enable_consolidation: cli.enable_consolidation,
         reader_mode: cli.reader_mode,
+        con_context_cap_chars: cli.con_context_cap_chars,
         max_chunks_per_session: cli.max_chunks_per_session,
         reset_first: cli.reset_first,
+        skip_ingest: cli.skip_ingest,
         dump_candidates_jsonl: cli.dump_candidates_jsonl.clone(),
         dump_gold_ranks_jsonl: cli.dump_gold_ranks_jsonl.clone(),
+        llm_concurrency: cli.llm_concurrency,
     };
 
     match cli.mode {
@@ -941,9 +969,14 @@ async fn run_recall(
     println!("Dev fast: {}", config.dev_fast);
     println!("Max chunks per session: {}", config.max_chunks_per_session);
     println!("Reset first: {}", config.reset_first);
+    println!("Skip ingest: {}", config.skip_ingest);
 
-    if config.reset_first {
-        reset_engine(client, config).await?;
+    if config.skip_ingest {
+        println!("[skip-ingest] Skipping reset and ingest — reusing existing engine state.");
+    } else {
+        if config.reset_first {
+            reset_engine(client, config).await?;
+        }
     }
 
     let mut candidate_dump_writer = if let Some(path) = config.dump_candidates_jsonl.as_deref() {
@@ -982,10 +1015,9 @@ async fn run_recall(
 
         let total_start = Instant::now();
 
-        let ingest_ms = if active_entity_id.as_deref() != Some(entity_id.as_str()) {
-            if config.dataset_kind == DatasetKind::Locomo && active_entity_id.is_some() {
-                reset_engine(client, config).await?;
-            }
+        let ingest_ms = if config.skip_ingest {
+            0
+        } else if active_entity_id.as_deref() != Some(entity_id.as_str()) {
             let ingest_start = Instant::now();
             ingest_instance(client, config, &entity_id, instance).await?;
             active_entity_id = Some(entity_id.clone());
@@ -1174,26 +1206,32 @@ async fn run_llm(
     println!("Consolidation: {}", config.enable_consolidation);
     println!("Dev fast: {}", config.dev_fast);
     println!("Reset first: {}", config.reset_first);
+    println!("Skip ingest: {}", config.skip_ingest);
+    println!("LLM concurrency: {}", config.llm_concurrency);
 
-    if config.reset_first {
-        reset_engine(client, config).await?;
+    if config.skip_ingest {
+        println!("[skip-ingest] Skipping reset and ingest — reusing existing engine state.");
+    } else {
+        if config.reset_first {
+            reset_engine(client, config).await?;
+        }
     }
 
-    let mut output_writer = if let Some(path) = output_jsonl {
+    let output_writer = if let Some(path) = output_jsonl {
         Some(BufWriter::new(
             File::create(path).with_context(|| format!("Failed to create {path}"))?,
         ))
     } else {
         None
     };
-    let mut candidate_dump_writer = if let Some(path) = config.dump_candidates_jsonl.as_deref() {
+    let candidate_dump_writer = if let Some(path) = config.dump_candidates_jsonl.as_deref() {
         Some(BufWriter::new(
             File::create(path).with_context(|| format!("Failed to create {path}"))?,
         ))
     } else {
         None
     };
-    let mut gold_rank_writer = if let Some(path) = config.dump_gold_ranks_jsonl.as_deref() {
+    let gold_rank_writer = if let Some(path) = config.dump_gold_ranks_jsonl.as_deref() {
         Some(BufWriter::new(
             File::create(path).with_context(|| format!("Failed to create {path}"))?,
         ))
@@ -1201,270 +1239,441 @@ async fn run_llm(
         None
     };
 
-    let mut totals = EvalTotals::default();
+    let totals = EvalTotals::default();
     let max_questions = limit.min(available);
-    let mut active_entity_id: Option<String> = None;
 
-    for (i, instance) in dataset
+    // 1) Group questions by entity, pre-ingest each unique entity once (in parallel).
+    let questions: Vec<(usize, &Instance)> = dataset
         .iter()
         .enumerate()
         .skip(start_index)
         .take(max_questions)
-    {
-        let display_index = i - start_index;
-        let entity_id = benchmark_entity_id(instance, i);
-        let eval_question_id = evaluation_question_id(instance, i);
+        .collect();
+
+    let mut entity_to_question_idx: HashMap<String, usize> = HashMap::new();
+    for (idx, instance) in questions.iter() {
+        let entity_id = benchmark_entity_id(instance, *idx);
+        entity_to_question_idx.entry(entity_id).or_insert(*idx);
+    }
+    let unique_entities: Vec<(String, usize)> = entity_to_question_idx.into_iter().collect();
+    println!(
+        "Pre-ingesting {} unique entity(ies) at concurrency {}...",
+        unique_entities.len(),
+        config.ingest_concurrency
+    );
+    let pre_ingest_start = Instant::now();
+    if config.skip_ingest {
+        println!("[skip-ingest] Skipping pre-ingest of {} entity(ies).", unique_entities.len());
+    } else {
+        let ingest_results: Vec<Result<()>> = futures::stream::iter(unique_entities.iter().cloned())
+            .map(|(entity_id, instance_idx)| async move {
+                let instance = &dataset[instance_idx];
+                ingest_instance(client, config, &entity_id, instance).await
+            })
+            .buffer_unordered(config.ingest_concurrency.max(1))
+            .collect()
+            .await;
+        for r in ingest_results {
+            r.context("Pre-ingest failed")?;
+        }
         println!(
-            "\n--- Question {}/{} [{}] ---",
-            display_index + 1,
-            max_questions,
-            eval_question_id
-        );
-        println!("Q: {}", instance.question);
-
-        if instance.haystack_sessions.is_empty() {
-            println!("Skipping empty haystack");
-            totals.skipped += 1;
-            continue;
-        }
-
-        let total_start = Instant::now();
-
-        let ingest_ms = if active_entity_id.as_deref() != Some(entity_id.as_str()) {
-            if config.dataset_kind == DatasetKind::Locomo && active_entity_id.is_some() {
-                reset_engine(client, config).await?;
-            }
-            let ingest_start = Instant::now();
-            ingest_instance(client, config, &entity_id, instance).await?;
-            active_entity_id = Some(entity_id.clone());
-            ingest_start.elapsed().as_millis()
-        } else {
-            println!("Reusing indexed conversation for entity {}", entity_id);
-            0
-        };
-
-        let query_start = Instant::now();
-        let query = query_engine(client, config, &entity_id, &instance.question).await?;
-        let query_ms = query_start.elapsed().as_millis();
-        let question_type = instance
-            .question_type
-            .as_deref()
-            .unwrap_or("single-session-user");
-
-        let pack_start = Instant::now();
-        let retrieved_sessions = extract_top_sessions(&entity_id, &query.results, config.top_k);
-        let retrieval_hit = instance
-            .answer_session_ids
-            .iter()
-            .any(|ans| retrieved_sessions.contains(ans));
-        if let Some(writer) = candidate_dump_writer.as_mut() {
-            write_candidate_dump(
-                writer,
-                &eval_question_id,
-                instance,
-                question_type,
-                &retrieved_sessions,
-                &query.results,
-                config.top_k * 8,
-            )?;
-        }
-        if let Some(writer) = gold_rank_writer.as_mut() {
-            write_gold_rank_dump(
-                writer,
-                &eval_question_id,
-                instance,
-                question_type,
-                &retrieved_sessions,
-                &query.results,
-            )?;
-        }
-        let packed_sessions = pack_top_sessions(
-            instance,
-            &query.results,
-            config.top_k,
-            config.max_chunks_per_session,
-        );
-        let pack_ms = pack_start.elapsed().as_millis();
-
-        totals.evaluated += 1;
-        if retrieval_hit {
-            totals.retrieval_correct += 1;
-        }
-
-        if packed_sessions.is_empty() {
-            println!("No packed session context retrieved");
-            continue;
-        }
-
-        let answer_start = Instant::now();
-        let prediction = generate_answer(
-            client,
-            config.reader_mode,
-            answer_model,
-            instance,
-            &packed_sessions,
-            use_groq,
-        )
-        .await
-        .with_context(|| format!("Failed to answer question {}", eval_question_id))?;
-        let answer_ms = answer_start.elapsed().as_millis();
-
-        if let Some(writer) = output_writer.as_mut() {
-            writeln!(
-                writer,
-                "{}",
-                json!({
-                    "question_id": eval_question_id,
-                    "hypothesis": prediction.clone(),
-                })
-            )?;
-            writer.flush()?;
-        }
-
-        let ground_truth = ground_truth(instance);
-        // Strip reasoning preamble for judging so the judge sees a clean answer.
-        // The raw prediction (with reasoning) is already saved to outputs.jsonl above.
-        let prediction_for_judge = strip_model_reasoning(&prediction);
-        let judge_start = Instant::now();
-        let judge_prompt = get_anscheck_prompt(
-            question_type,
-            &instance.question,
-            &ground_truth,
-            &prediction_for_judge,
-            eval_question_id.ends_with("_abs"),
-        );
-        let verdict = call_answer_model(
-            client,
-            &judge_prompt,
-            judge_model,
-            4096,
-            "none",
-            use_groq_judge,
-        )
-        .await
-        .with_context(|| format!("Failed to judge question {}", eval_question_id))?;
-        let judge_ms = judge_start.elapsed().as_millis();
-
-        let answer_correct = parse_judge_verdict(&verdict);
-        if answer_correct {
-            totals.answer_correct += 1;
-        }
-        update_category_stats(
-            &mut totals,
-            config.dataset_kind,
-            question_type,
-            retrieval_hit,
-            answer_correct,
-        );
-
-        let total_ms = total_start.elapsed().as_millis();
-        totals.timings.ingest_ms += ingest_ms;
-        totals.timings.query_ms += query_ms;
-        totals.timings.pack_ms += pack_ms;
-        totals.timings.answer_ms += answer_ms;
-        totals.timings.judge_ms += judge_ms;
-        totals.timings.total_ms += total_ms;
-        totals.timings.inner_embed_ms += query.timings.embed_ms as u128;
-        totals.timings.inner_route_ms += query.timings.route_ms as u128;
-        totals.timings.inner_ann_ms += query.timings.ann_ms as u128;
-        totals.timings.inner_rerank_ms += query.timings.rerank_ms as u128;
-        totals.timings.inner_fts_ms += query.timings.fts_ms as u128;
-        totals.timings.inner_card_ms += query.timings.card_ms as u128;
-        totals.timings.inner_fuse_ms += query.timings.fuse_ms as u128;
-        totals.timings.inner_hydrate_ms += query.timings.hydrate_ms as u128;
-        totals.timings.inner_preference_ms += query.timings.preference_ms as u128;
-        totals.timings.inner_graph_ms += query.timings.graph_ms as u128;
-        totals.timings.inner_session_ms += query.timings.session_ms as u128;
-        totals.timings.inner_planning_ms += query.timings.planning_ms as u128;
-        totals.timings.inner_hydrate_obs_ms += query.timings.hydrate_obs_ms as u128;
-        totals.timings.inner_trace_ms += query.timings.trace_ms as u128;
-        totals.timings.inner_query_total_ms += query.timings.total_ms as u128;
-        add_query_diagnostics(&mut totals.timings, query.timings);
-
-        let retrieval_symbol = if retrieval_hit {
-            "retrieval=pass"
-        } else {
-            "retrieval=fail"
-        };
-        let answer_symbol = if answer_correct {
-            "answer=pass"
-        } else {
-            "answer=fail"
-        };
-        let context_tokens = packed_sessions
-            .iter()
-            .flat_map(|s| s.chunks.iter())
-            .map(|c| c.textual_content.split_whitespace().count())
-            .sum::<usize>();
-        record_llm_diagnostics(
-            &mut totals,
-            retrieval_hit,
-            answer_correct,
-            &prediction,
-            context_tokens,
-            query_ms,
-            answer_ms,
-            judge_ms,
-            total_ms,
-        );
-
-        println!("{retrieval_symbol} | {answer_symbol}");
-        println!("Predicted: {}", truncate_chars(&prediction_for_judge, 160));
-        println!("Ground truth: {}", truncate_chars(&ground_truth, 160));
-        println!(
-            "timings: ingest={}ms | query={}ms (plan={} route={} embed={} ann={} rerank={} fts={} card={} pref={} graph={} session={} fuse={} hydrate={} hyd_obs={} trace={} visible={} other={} total={}) | pack={}ms | answer={}ms | judge={}ms",
-            ingest_ms,
-            query_ms,
-            query.timings.planning_ms,
-            query.timings.route_ms,
-            query.timings.embed_ms,
-            query.timings.ann_ms,
-            query.timings.rerank_ms,
-            query.timings.fts_ms,
-            query.timings.card_ms,
-            query.timings.preference_ms,
-            query.timings.graph_ms,
-            query.timings.session_ms,
-            query.timings.fuse_ms,
-            query.timings.hydrate_ms,
-            query.timings.hydrate_obs_ms,
-            query.timings.trace_ms,
-            query.timings.visible_stage_ms(),
-            query.timings.other_ms(),
-            query.timings.total_ms,
-            pack_ms,
-            answer_ms,
-            judge_ms,
-        );
-        println!(
-            "routing: routed_sessions={} cards={} events={} shadows={} facets={} scenes={} scoped_ann_attempts={} scoped_primary_hits={}",
-            query.timings.routed_sessions,
-            query.timings.memory_card_hits,
-            query.timings.temporal_event_hits,
-            query.timings.shadow_question_hits,
-            query.timings.facet_posting_hits,
-            query.timings.mem_scene_hits,
-            query.timings.scoped_ann_attempts,
-            query.timings.scoped_primary_hits,
-        );
-
-        let recall_pct = totals.retrieval_correct as f64 / totals.evaluated as f64 * 100.0;
-        let accuracy_pct = totals.answer_correct as f64 / totals.evaluated as f64 * 100.0;
-        println!(
-            "📊 STATUS: [ {}/{} ] | Recall: {:.1}% | Accuracy: {:.1}%",
-            i + 1,
-            max_questions,
-            recall_pct,
-            accuracy_pct
-        );
-        println!(
-            "📈 MemScore: {:.1}% / {:.1}% / {}ms / {}tok",
-            recall_pct, accuracy_pct, query_ms, context_tokens,
+            "Pre-ingest complete in {}ms",
+            pre_ingest_start.elapsed().as_millis()
         );
     }
 
+    // 2) Wrap writers and totals in shared state for parallel question processing.
+    let output_writer = Arc::new(std::sync::Mutex::new(output_writer));
+    let candidate_dump_writer = Arc::new(std::sync::Mutex::new(candidate_dump_writer));
+    let gold_rank_writer = Arc::new(std::sync::Mutex::new(gold_rank_writer));
+    let totals = Arc::new(std::sync::Mutex::new(totals));
+    let config = Arc::new(config.clone());
+    let client = client.clone();
+
+    // 3) Process questions in parallel.
+    let llm_concurrency = config.llm_concurrency.max(1);
+    println!(
+        "Processing {} question(s) at LLM concurrency {}...",
+        max_questions, llm_concurrency
+    );
+    let process_start = Instant::now();
+    let _results: Vec<Option<QuestionResult>> = futures::stream::iter(questions.iter().cloned())
+        .map(|(i, instance)| {
+            let client = client.clone();
+            let config = config.clone();
+            let totals = totals.clone();
+            let output_writer = output_writer.clone();
+            let candidate_dump_writer = candidate_dump_writer.clone();
+            let gold_rank_writer = gold_rank_writer.clone();
+            async move {
+                let entity_id = benchmark_entity_id(instance, i);
+                let eval_question_id = evaluation_question_id(instance, i);
+                match process_question_llm(
+                    &client,
+                    &config,
+                    instance,
+                    &entity_id,
+                    i,
+                    &eval_question_id,
+                    max_questions,
+                    answer_model,
+                    judge_model,
+                    use_groq,
+                    use_groq_judge,
+                    &totals,
+                    &output_writer,
+                    &candidate_dump_writer,
+                    &gold_rank_writer,
+                )
+                .await
+                {
+                    Ok(r) => Some(r),
+                    Err(e) => {
+                        eprintln!(
+                            "[{}] process_question_llm error: {:#}",
+                            eval_question_id, e
+                        );
+                        None
+                    }
+                }
+            }
+        })
+        .buffer_unordered(llm_concurrency)
+        .collect()
+        .await;
+    let _elapsed = process_start.elapsed();
+
+    // 4) Restore totals from the shared state.
+    let totals = totals
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_else(|e| e.into_inner().clone());
+
     print_llm_summary(&totals, config.top_k, config.dataset_kind);
     Ok(())
+}
+
+#[allow(dead_code)]
+struct QuestionResult {
+    question_id: String,
+    retrieval_hit: bool,
+    answer_correct: bool,
+    ingest_ms: u128,
+    query_ms: u128,
+    pack_ms: u128,
+    answer_ms: u128,
+    judge_ms: u128,
+    total_ms: u128,
+    prediction: String,
+    ground_truth: String,
+    prediction_for_judge: String,
+    context_tokens: usize,
+    query_timings: QueryTimings,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_question_llm(
+    client: &Client,
+    config: &EvalConfig,
+    instance: &Instance,
+    entity_id: &str,
+    i: usize,
+    eval_question_id: &str,
+    max_questions: usize,
+    answer_model: &str,
+    judge_model: &str,
+    use_groq: bool,
+    use_groq_judge: bool,
+    totals: &Arc<std::sync::Mutex<EvalTotals>>,
+    output_writer: &Arc<std::sync::Mutex<Option<BufWriter<File>>>>,
+    candidate_dump_writer: &Arc<std::sync::Mutex<Option<BufWriter<File>>>>,
+    gold_rank_writer: &Arc<std::sync::Mutex<Option<BufWriter<File>>>>,
+) -> Result<QuestionResult> {
+    let display_index = i;
+    println!(
+        "\n--- Question {}/{} [{}] ---",
+        display_index + 1,
+        max_questions,
+        eval_question_id
+    );
+    println!("Q: {}", instance.question);
+
+    if instance.haystack_sessions.is_empty() {
+        println!("Skipping empty haystack");
+        if let Ok(mut g) = totals.lock() {
+            g.skipped += 1;
+        }
+        anyhow::bail!("empty haystack");
+    }
+
+    let total_start = Instant::now();
+    println!("Reusing indexed conversation for entity {}", entity_id);
+    let ingest_ms: u128 = 0;
+
+    let query_start = Instant::now();
+    let query = query_engine(client, config, entity_id, &instance.question).await?;
+    let query_ms = query_start.elapsed().as_millis();
+    let question_type = instance
+        .question_type
+        .as_deref()
+        .unwrap_or("single-session-user");
+
+    let pack_start = Instant::now();
+    let retrieved_sessions = extract_top_sessions(entity_id, &query.results, config.top_k);
+    let retrieval_hit = instance
+        .answer_session_ids
+        .iter()
+        .any(|ans| retrieved_sessions.contains(ans));
+    {
+        if let Ok(mut g) = candidate_dump_writer.lock() {
+            if let Some(writer) = g.as_mut() {
+                write_candidate_dump(
+                    writer,
+                    eval_question_id,
+                    instance,
+                    question_type,
+                    &retrieved_sessions,
+                    &query.results,
+                    config.top_k * 8,
+                )?;
+            }
+        }
+        if let Ok(mut g) = gold_rank_writer.lock() {
+            if let Some(writer) = g.as_mut() {
+                write_gold_rank_dump(
+                    writer,
+                    eval_question_id,
+                    instance,
+                    question_type,
+                    &retrieved_sessions,
+                    &query.results,
+                )?;
+            }
+        }
+    }
+    let packed_sessions = pack_top_sessions(
+        instance,
+        &query.results,
+        config.top_k,
+        config.max_chunks_per_session,
+    );
+    let pack_ms = pack_start.elapsed().as_millis();
+
+    {
+        if let Ok(mut g) = totals.lock() {
+            g.evaluated += 1;
+            if retrieval_hit {
+                g.retrieval_correct += 1;
+            }
+        }
+    }
+
+    if packed_sessions.is_empty() {
+        println!("No packed session context retrieved");
+        anyhow::bail!("no packed context");
+    }
+
+    let answer_start = Instant::now();
+    let prediction = generate_answer(
+        client,
+        config.reader_mode,
+        answer_model,
+        instance,
+        &packed_sessions,
+        use_groq,
+        config.con_context_cap_chars,
+    )
+    .await
+    .with_context(|| format!("Failed to answer question {}", eval_question_id))?;
+    let answer_ms = answer_start.elapsed().as_millis();
+
+    {
+        if let Ok(mut g) = output_writer.lock() {
+            if let Some(writer) = g.as_mut() {
+                writeln!(
+                    writer,
+                    "{}",
+                    json!({
+                        "question_id": eval_question_id,
+                        "hypothesis": prediction.clone(),
+                    })
+                )?;
+                writer.flush()?;
+            }
+        }
+    }
+
+    let ground_truth = ground_truth(instance);
+    let prediction_for_judge = strip_model_reasoning(&prediction);
+    let judge_start = Instant::now();
+    let judge_prompt = get_anscheck_prompt(
+        question_type,
+        &instance.question,
+        &ground_truth,
+        &prediction_for_judge,
+        eval_question_id.ends_with("_abs"),
+    );
+    let verdict = call_answer_model(
+        client,
+        &judge_prompt,
+        judge_model,
+        4096,
+        "none",
+        use_groq_judge,
+    )
+    .await
+    .with_context(|| format!("Failed to judge question {}", eval_question_id))?;
+    let judge_ms = judge_start.elapsed().as_millis();
+
+    let answer_correct = parse_judge_verdict(&verdict);
+    {
+        if let Ok(mut g) = totals.lock() {
+            if answer_correct {
+                g.answer_correct += 1;
+            }
+            update_category_stats(
+                &mut g,
+                config.dataset_kind,
+                question_type,
+                retrieval_hit,
+                answer_correct,
+            );
+        }
+    }
+
+    let total_ms = total_start.elapsed().as_millis();
+    {
+        if let Ok(mut g) = totals.lock() {
+            g.timings.ingest_ms += ingest_ms;
+            g.timings.query_ms += query_ms;
+            g.timings.pack_ms += pack_ms;
+            g.timings.answer_ms += answer_ms;
+            g.timings.judge_ms += judge_ms;
+            g.timings.total_ms += total_ms;
+            g.timings.inner_embed_ms += query.timings.embed_ms as u128;
+            g.timings.inner_route_ms += query.timings.route_ms as u128;
+            g.timings.inner_ann_ms += query.timings.ann_ms as u128;
+            g.timings.inner_rerank_ms += query.timings.rerank_ms as u128;
+            g.timings.inner_fts_ms += query.timings.fts_ms as u128;
+            g.timings.inner_card_ms += query.timings.card_ms as u128;
+            g.timings.inner_fuse_ms += query.timings.fuse_ms as u128;
+            g.timings.inner_hydrate_ms += query.timings.hydrate_ms as u128;
+            g.timings.inner_preference_ms += query.timings.preference_ms as u128;
+            g.timings.inner_graph_ms += query.timings.graph_ms as u128;
+            g.timings.inner_session_ms += query.timings.session_ms as u128;
+            g.timings.inner_planning_ms += query.timings.planning_ms as u128;
+            g.timings.inner_hydrate_obs_ms += query.timings.hydrate_obs_ms as u128;
+            g.timings.inner_trace_ms += query.timings.trace_ms as u128;
+            g.timings.inner_query_total_ms += query.timings.total_ms as u128;
+            add_query_diagnostics(&mut g.timings, query.timings.clone());
+        }
+    }
+
+    let retrieval_symbol = if retrieval_hit {
+        "retrieval=pass"
+    } else {
+        "retrieval=fail"
+    };
+    let answer_symbol = if answer_correct {
+        "answer=pass"
+    } else {
+        "answer=fail"
+    };
+    let context_tokens = packed_sessions
+        .iter()
+        .flat_map(|s| s.chunks.iter())
+        .map(|c| c.textual_content.split_whitespace().count())
+        .sum::<usize>();
+    {
+        if let Ok(mut g) = totals.lock() {
+            record_llm_diagnostics(
+                &mut g,
+                retrieval_hit,
+                answer_correct,
+                &prediction,
+                context_tokens,
+                query_ms,
+                answer_ms,
+                judge_ms,
+                total_ms,
+            );
+        }
+    }
+
+    println!("{retrieval_symbol} | {answer_symbol}");
+    println!("Predicted: {}", truncate_chars(&prediction_for_judge, 160));
+    println!("Ground truth: {}", truncate_chars(&ground_truth, 160));
+    println!(
+        "timings: ingest={}ms | query={}ms (plan={} route={} embed={} ann={} rerank={} fts={} card={} pref={} graph={} session={} fuse={} hydrate={} hyd_obs={} trace={} visible={} other={} total={}) | pack={}ms | answer={}ms | judge={}ms",
+        ingest_ms,
+        query_ms,
+        query.timings.planning_ms,
+        query.timings.route_ms,
+        query.timings.embed_ms,
+        query.timings.ann_ms,
+        query.timings.rerank_ms,
+        query.timings.fts_ms,
+        query.timings.card_ms,
+        query.timings.preference_ms,
+        query.timings.graph_ms,
+        query.timings.session_ms,
+        query.timings.fuse_ms,
+        query.timings.hydrate_ms,
+        query.timings.hydrate_obs_ms,
+        query.timings.trace_ms,
+        query.timings.visible_stage_ms(),
+        query.timings.other_ms(),
+        query.timings.total_ms,
+        pack_ms,
+        answer_ms,
+        judge_ms,
+    );
+    println!(
+        "routing: routed_sessions={} cards={} events={} shadows={} facets={} scenes={} scoped_ann_attempts={} scoped_primary_hits={}",
+        query.timings.routed_sessions,
+        query.timings.memory_card_hits,
+        query.timings.temporal_event_hits,
+        query.timings.shadow_question_hits,
+        query.timings.facet_posting_hits,
+        query.timings.mem_scene_hits,
+        query.timings.scoped_ann_attempts,
+        query.timings.scoped_primary_hits,
+    );
+
+    let (recall_pct, accuracy_pct) = {
+        let g = totals.lock().expect("totals poisoned");
+        let r = g.retrieval_correct as f64 / g.evaluated.max(1) as f64 * 100.0;
+        let a = g.answer_correct as f64 / g.evaluated.max(1) as f64 * 100.0;
+        (r, a)
+    };
+    println!(
+        "📊 STATUS: [ {}/{} ] | Recall: {:.1}% | Accuracy: {:.1}%",
+        display_index + 1,
+        max_questions,
+        recall_pct,
+        accuracy_pct
+    );
+    println!(
+        "📈 MemScore: {:.1}% / {:.1}% / {}ms / {}tok",
+        recall_pct, accuracy_pct, query_ms, context_tokens,
+    );
+
+    Ok(QuestionResult {
+        question_id: eval_question_id.to_string(),
+        retrieval_hit,
+        answer_correct,
+        ingest_ms,
+        query_ms,
+        pack_ms,
+        answer_ms,
+        judge_ms,
+        total_ms,
+        prediction,
+        ground_truth,
+        prediction_for_judge,
+        context_tokens,
+        query_timings: query.timings,
+    })
 }
 
 fn with_engine_auth(
@@ -2331,6 +2540,7 @@ async fn generate_answer(
     instance: &Instance,
     packed_sessions: &[PackedSession],
     use_groq: bool,
+    con_context_cap_chars: usize,
 ) -> Result<String> {
     let question_date = instance.question_date.as_deref().unwrap_or("unknown");
     let answer_rules = answer_rules_for_instance(instance);
@@ -2352,7 +2562,12 @@ async fn generate_answer(
             (context, answer)
         }
         ReaderMode::Con => {
-            let context = render_session_context(packed_sessions);
+            let raw_context = render_session_context(packed_sessions);
+            let context = if con_context_cap_chars > 0 {
+                truncate_chars(&raw_context, con_context_cap_chars)
+            } else {
+                raw_context
+            };
             let prompt = CON_ANSWER_PROMPT
                 .replace("{answer_rules}", &answer_rules)
                 .replace("{focus_rules}", focus_rules)
@@ -3348,7 +3563,15 @@ fn is_retryable_openrouter_status(status: reqwest::StatusCode) -> bool {
 }
 
 fn openrouter_backoff(attempt: usize) -> Duration {
-    Duration::from_secs((attempt as u64).saturating_mul(2))
+    // Exponential backoff with full jitter. attempt=0 -> 1s, 1 -> 2s, 2 -> 4s, 3 -> 8s.
+    // Capped at 30s to avoid pathological waits on persistent failures.
+    let base_secs = 1u64.checked_shl(attempt.min(5) as u32).unwrap_or(30);
+    let capped = base_secs.min(30);
+    let jitter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.subsec_nanos() as u64) % capped.max(1))
+        .unwrap_or(0);
+    Duration::from_secs(jitter)
 }
 
 fn is_minimax_m2_model(model: &str) -> bool {

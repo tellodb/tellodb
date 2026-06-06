@@ -20,6 +20,8 @@ INGEST_CONCURRENCY="${INGEST_CONCURRENCY:-1}"
 TOP_K="${TOP_K:-8}"
 MAX_CHUNKS_PER_SESSION="${MAX_CHUNKS_PER_SESSION:-4}"
 READER_MODE="${READER_MODE:-con-separate}"
+LIMIT="${LIMIT:-999999}"
+SKIP_INGEST="${SKIP_INGEST:-0}"
 TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 OUTPUT_JSONL="$OUTPUT_DIR/longmemeval_${TIMESTAMP}.jsonl"
 
@@ -90,16 +92,23 @@ fi
 
 mkdir -p "$OUTPUT_DIR"
 
+SKIP_INGEST_FLAG=""
+if [[ "${SKIP_INGEST}" == "1" ]]; then
+  SKIP_INGEST_FLAG="--skip-ingest"
+fi
+
 exec cargo run --release --manifest-path "$SCRIPT_DIR/rust_evaluator/Cargo.toml" -- \
   --dataset-kind longmemeval \
   --dataset "$DATASET_PATH" \
   --engine-url "$ENGINE_URL" \
   --engine-api-key "$ENGINE_API_KEY" \
   --reset-first \
+  --limit "$LIMIT" \
   --ingest-concurrency "$INGEST_CONCURRENCY" \
   --top-k "$TOP_K" \
   --max-chunks-per-session "$MAX_CHUNKS_PER_SESSION" \
   --reader-mode "$READER_MODE" \
+  ${SKIP_INGEST_FLAG:+"$SKIP_INGEST_FLAG"} \
   llm \
   --openrouter-model "$ANSWER_MODEL" \
   --openrouter-judge-model "$JUDGE_MODEL" \

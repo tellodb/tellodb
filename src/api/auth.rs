@@ -2,8 +2,11 @@ use axum::http::{
     header::{AUTHORIZATION, CONTENT_TYPE},
     HeaderMap, HeaderName, HeaderValue, Method, StatusCode,
 };
+use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
+use std::time::Instant;
 use tower_http::cors::CorsLayer;
 
 use crate::api::{EngineState, PlatformWriteOp};
@@ -188,6 +191,10 @@ pub fn authorize_request(
             if auth.cluster_id.is_none() {
                 return Err(StatusCode::FORBIDDEN);
             }
+            if !is_valid_user_id(&auth.user_id) {
+                tracing::warn!("API key returned malformed user_id; rejecting");
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
             Ok(RequestPrincipal::UserApiKey(auth))
         }
         Ok(None) => Err(StatusCode::UNAUTHORIZED),
@@ -195,6 +202,98 @@ pub fn authorize_request(
             tracing::warn!("API key auth lookup failed: {:?}", err);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
+    }
+}
+
+/// Defense in depth: server-issued user_ids always start with `usr_` and contain
+/// only `[A-Za-z0-9_]`. Reject anything that does not, so a bug or future
+/// migration that lets an attacker-controlled value flow into SQL still fails.
+pub fn is_valid_user_id(user_id: &str) -> bool {
+    let len = user_id.len();
+    if len < 8 || len > 128 {
+        return false;
+    }
+    if !user_id.starts_with("usr_") {
+        return false;
+    }
+    user_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+// ── Rate limiting ──
+//
+// Per-key token bucket. Each API key (and the global API key) gets a bucket
+// sized at 2x the steady-state RPS with a burst of 8x. The bucket is refilled
+// lazily on every check. Buckets live in process memory; on restart, every
+// key gets a fresh budget. This is intentional: a single-instance engine
+// with in-process state can only enforce in-process quotas.
+
+const RPS_PER_KEY: f64 = 20.0;
+const BURST_PER_KEY: f64 = 80.0;
+
+struct TokenBucket {
+    tokens: f64,
+    last_refill: Instant,
+}
+
+impl TokenBucket {
+    fn new(now: Instant) -> Self {
+        Self { tokens: BURST_PER_KEY, last_refill: now }
+    }
+
+    /// Returns true if the request fits in the current budget.
+    fn try_consume(&mut self, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.last_refill).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * RPS_PER_KEY).min(BURST_PER_KEY);
+        self.last_refill = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+pub struct RateLimiter {
+    buckets: Mutex<HashMap<String, TokenBucket>>,
+}
+
+impl RateLimiter {
+    pub fn new() -> Self {
+        Self { buckets: Mutex::new(HashMap::new()) }
+    }
+
+    /// Returns true if the request is allowed. `key` is the API key string
+    /// (or a synthetic "__global__" for the global key). Buckets for unknown
+    /// keys are created on first use.
+    pub fn allow(&self, key: &str) -> bool {
+        let now = Instant::now();
+        let mut guard = self.buckets.lock();
+        let bucket = guard.entry(key.to_string()).or_insert_with(|| TokenBucket::new(now));
+        bucket.try_consume(now)
+    }
+}
+
+impl Default for RateLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub fn check_rate_limit(state: &EngineState, headers: &HeaderMap) -> Result<(), StatusCode> {
+    // Prefer the API key string for per-key buckets. Fall back to peer IP.
+    let key = if let Some(provided) = request_api_key(headers) {
+        provided.to_string()
+    } else if let Some(addr) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+        format!("ip:{}", addr.split(',').next().unwrap_or("").trim())
+    } else {
+        "__anonymous__".to_string()
+    };
+    if state.rate_limiter.allow(&key) {
+        Ok(())
+    } else {
+        tracing::warn!(key = %&key[..key.len().min(20)], "rate limit exceeded");
+        Err(StatusCode::TOO_MANY_REQUESTS)
     }
 }
 

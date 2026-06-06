@@ -10,9 +10,10 @@ use super::types::*;
 
 type GraphEdgeBatch<'a> = [GraphEdgeEntry<'a>];
 
-const PRAGMA_CACHE_SIZE: i64 = -65536;
-const PRAGMA_MMAP_SIZE: i64 = 268435456;
-const PRAGMA_BUSY_TIMEOUT: i64 = 5000;
+const PRAGMA_CACHE_SIZE: i64 = -262144;
+const PRAGMA_MMAP_SIZE: i64 = 1073741824;
+const PRAGMA_BUSY_TIMEOUT: i64 = 10000;
+const PRAGMA_PAGE_SIZE: i64 = 8192;
 
 const SOURCE_DEPTH_DIVISOR: f32 = 8.0;
 
@@ -62,11 +63,16 @@ impl TenantStore {
                      PRAGMA temp_store = MEMORY;
                      PRAGMA cache_size = {};
                      PRAGMA mmap_size = {};
-                     PRAGMA busy_timeout = {};",
-                PRAGMA_CACHE_SIZE, PRAGMA_MMAP_SIZE, PRAGMA_BUSY_TIMEOUT,
+                     PRAGMA busy_timeout = {};
+                     PRAGMA page_size = {};",
+                PRAGMA_CACHE_SIZE, PRAGMA_MMAP_SIZE, PRAGMA_BUSY_TIMEOUT, PRAGMA_PAGE_SIZE,
             ))
         });
-        let pool = Pool::new(manager).context("failed to build connection pool")?;
+        let max_size = (num_cpus::get().saturating_mul(2)).max(16) as u32;
+        let pool = Pool::builder()
+            .max_size(max_size)
+            .build(manager)
+            .context("failed to build connection pool")?;
 
         let conn = pool.get().context("failed to get initial connection from pool")?;
         Self::init_schema(&conn)?;
@@ -135,6 +141,9 @@ impl TenantStore {
             CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source);
             CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target);
             CREATE INDEX IF NOT EXISTS idx_edges_memory ON edges(memory_id);
+            CREATE INDEX IF NOT EXISTS idx_edges_source_type ON edges(source, edge_type);
+            CREATE INDEX IF NOT EXISTS idx_edges_target_type ON edges(target, edge_type);
+            CREATE INDEX IF NOT EXISTS idx_edges_label ON edges(label);
 
             -- Metrics
             CREATE TABLE IF NOT EXISTS metrics (
@@ -386,6 +395,7 @@ impl TenantStore {
                 PRIMARY KEY(fact_key, memory_id)
             );
             CREATE INDEX IF NOT EXISTS idx_fact_entity ON fact_versions(entity_id);
+            CREATE INDEX IF NOT EXISTS idx_fact_versions_lookup ON fact_versions(fact_key, entity_id, status);
 
             -- Card relations
             CREATE TABLE IF NOT EXISTS card_relations (
@@ -1126,28 +1136,6 @@ impl TenantStore {
         Ok(())
     }
 
-    /// Bulk-register entities.
-    pub fn register_entities_batch(
-        &self,
-        entity_id: &str,
-        names: &[String],
-    ) -> Result<()> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        let conn = self.get_conn()?;
-        let mut stmt = conn.prepare_cached(
-            "INSERT OR IGNORE INTO entity_registry (entity_id, canonical_name, soundex_key, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?4)",
-        )?;
-        for name in names {
-            let sk = crate::storage::entity_resolver::phonetic_key(name);
-            stmt.execute(params![entity_id, name, sk, now as i64])?;
-        }
-        Ok(())
-    }
-
     /// Load all entity candidates for a scope, with aliases, soundex keys, and embeddings.
     pub fn load_entity_candidates(
         &self,
@@ -1225,31 +1213,6 @@ impl TenantStore {
         Ok(candidates)
     }
 
-    /// Store a name embedding for tier-4 resolution.
-    pub fn store_name_embedding(
-        &self,
-        entity_id: &str,
-        canonical_name: &str,
-        embedding: &[f32],
-    ) -> Result<()> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        let dim = embedding.len();
-        let mut blob: Vec<u8> = Vec::with_capacity(dim * 4);
-        for val in embedding {
-            blob.extend_from_slice(&val.to_le_bytes());
-        }
-        let conn = self.get_conn()?;
-        conn.execute(
-            "INSERT OR REPLACE INTO name_embeddings (entity_id, canonical_name, embedding_blob, dim, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![entity_id, canonical_name, blob, dim as i64, now as i64],
-        )?;
-        Ok(())
-    }
-
     fn proposal_id(entity_id: &str, from: &str, to: &str, now_ms: u64) -> String {
         format!("merge::{}::{}::{}::{}", entity_id, from, to, now_ms)
     }
@@ -1277,53 +1240,6 @@ impl TenantStore {
         if inserted > 0 { Ok(Some(pid)) } else { Ok(None) }
     }
 
-    /// Accept a merge proposal: mark accepted and register `from_name` as an alias of `to_name`.
-    pub fn accept_merge_proposal(&self, proposal_id: &str) -> Result<()> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        let mut conn = self.get_conn()?;
-
-        // Fetch proposal details in its own scope so the stmt borrow drops before tx.
-        let proposal = {
-            let mut stmt = conn.prepare_cached(
-                "SELECT entity_id, from_name, to_name FROM merge_proposals WHERE proposal_id = ?1 AND status = 'pending'",
-            )?;
-            stmt.query_row(params![proposal_id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
-            }).ok()
-        };
-
-        if let Some((eid, from, _to)) = proposal {
-            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            tx.execute(
-                "UPDATE merge_proposals SET status = 'accepted', resolved_at_ms = ?1 WHERE proposal_id = ?2",
-                params![now as i64, proposal_id],
-            )?;
-            tx.execute(
-                "INSERT OR IGNORE INTO aliases (entity_id, alias) VALUES (?1, ?2)",
-                params![eid, from],
-            )?;
-            tx.commit()?;
-        }
-        Ok(())
-    }
-
-    /// Reject a merge proposal.
-    pub fn reject_merge_proposal(&self, proposal_id: &str) -> Result<()> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        let conn = self.get_conn()?;
-        conn.execute(
-            "UPDATE merge_proposals SET status = 'rejected', resolved_at_ms = ?1 WHERE proposal_id = ?2",
-            params![now as i64, proposal_id],
-        )?;
-        Ok(())
-    }
-
     /// Run the tiered resolver against the entity registry.
     /// Creates merge proposals for non-exact matches.
     pub fn resolve_and_propose(
@@ -1349,20 +1265,6 @@ impl TenantStore {
         Ok(resolution)
     }
 
-    /// Get pending merge proposals for a scope.
-    /// Check if a memory with the given content hash already exists.
-    pub fn content_hash_exists(&self, hash: &str) -> Result<bool> {
-        let conn = self.get_conn()?;
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM memories WHERE content_hash = ?1",
-                params![hash],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-        Ok(count > 0)
-    }
-
     /// Batch check which content hashes already exist.
     /// Returns a set of hashes that are already stored.
     pub fn existing_content_hashes(&self, hashes: &[String]) -> Result<std::collections::HashSet<String>> {
@@ -1382,73 +1284,6 @@ impl TenantStore {
             }
         }
         Ok(found)
-    }
-
-    /// Store the content hash on an existing memory row.
-    pub fn set_content_hash(&self, memory_id: &str, hash: &str) -> Result<()> {
-        let conn = self.get_conn()?;
-        conn.execute(
-            "UPDATE memories SET content_hash = ?1 WHERE memory_id = ?2",
-            params![hash, memory_id],
-        )?;
-        Ok(())
-    }
-
-    pub fn pending_merge_proposals(&self, entity_id: &str) -> Result<Vec<(String, String, String, String, f32)>> {
-        let conn = self.get_conn()?;
-        let mut stmt = conn.prepare_cached(
-            "SELECT proposal_id, from_name, to_name, tier, confidence FROM merge_proposals
-             WHERE entity_id = ?1 AND status = 'pending' ORDER BY created_at_ms DESC",
-        )?;
-        let rows = stmt.query_map(params![entity_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?, row.get::<_, f64>(4)? as f32))
-        })?;
-        let mut results = Vec::new();
-        for row in rows { results.push(row?); }
-        Ok(results)
-    }
-
-    pub fn set_entity_embeddings_batch(
-        &self,
-        entity_id: &str,
-        _embeddings: &[(String, Vec<f32>)],
-    ) -> Result<()> {
-        let mut conn = self.get_conn()?;
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        {
-            let mut stmt = tx.prepare_cached(
-                "INSERT OR REPLACE INTO entity_embeddings (entity_id, embedding_blob, updated_at_ms)
-                 VALUES (?1, ?2, ?3)",
-            )?;
-            let now = unix_timestamp_ms()?;
-            for (_name, embed) in _embeddings {
-                let bytes: Vec<u8> = embed.iter().flat_map(|f| f.to_le_bytes()).collect();
-                stmt.execute(params![entity_id, bytes, now])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub fn get_entity_embeddings(&self, entity_id: &str) -> Result<Vec<(String, Vec<f32>)>> {
-        let conn = self.get_conn()?;
-        let mut stmt = conn.prepare_cached(
-            "SELECT entity_id, embedding_blob FROM entity_embeddings WHERE entity_id = ?1",
-        )?;
-        let rows = stmt.query_map(params![entity_id], |row| {
-            let bytes: Vec<u8> = row.get(1)?;
-            let embedding: Vec<f32> = bytes
-                .chunks_exact(4)
-                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                .collect();
-            Ok((row.get::<_, String>(0)?, embedding))
-        })?;
-        let mut results = Vec::with_capacity(rows.size_hint().0);
-        for row in rows {
-            results.push(row?);
-        }
-        Ok(results)
     }
 
     // ── Memory Links ──
@@ -1484,6 +1319,7 @@ impl TenantStore {
         Ok(result)
     }
 
+    #[allow(dead_code)]
     pub fn get_edge_cluster_neighbors(
         &self,
         seed_memory_id: &str,
@@ -1516,6 +1352,53 @@ impl TenantStore {
         Ok(result)
     }
 
+    /// Like `get_edge_cluster_neighbors` but also returns the edge type so the
+    /// caller can apply intent-aware re-weighting. The `edge_type_filter`
+    /// parameter is still honored: pass `None` to return all edge types.
+    pub fn get_edge_cluster_neighbors_typed(
+        &self,
+        seed_memory_id: &str,
+        edge_type_filter: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, f32, String)>> {
+        let conn = self.get_conn()?;
+        let mut stmt = conn.prepare_cached(
+            "WITH seed_nodes AS (
+                 SELECT source AS node FROM edges WHERE memory_id = ?1
+                 UNION
+                 SELECT target AS node FROM edges WHERE memory_id = ?1
+             )
+             SELECT memory_id, weight, edge_type FROM (
+                 SELECT e.memory_id, e.weight, e.edge_type
+                 FROM edges e
+                 JOIN seed_nodes sn ON e.source = sn.node
+                 WHERE e.memory_id != ?1
+                   AND (?2 IS NULL OR e.edge_type = ?2)
+                 UNION
+                 SELECT e.memory_id, e.weight, e.edge_type
+                 FROM edges e
+                 JOIN seed_nodes sn ON e.target = sn.node
+                 WHERE e.memory_id != ?1
+                   AND (?2 IS NULL OR e.edge_type = ?2)
+             )
+             ORDER BY weight DESC
+             LIMIT ?3"
+        )?;
+        let rows = stmt.query_map(
+            params![seed_memory_id, edge_type_filter, limit as i64],
+            |row| Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, f64>(1)? as f32,
+                row.get::<_, String>(2)?,
+            ))
+        )?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
     // ── Session Router ──
 
     pub fn merge_session_router_records_batch(
@@ -1527,21 +1410,26 @@ impl TenantStore {
         let mut merged_results = Vec::new();
         {
             let mut select_stmt = tx.prepare_cached(
-                "SELECT record_json FROM session_router WHERE session_id = ?1 AND entity_id = ?2",
+                "SELECT rowid, record_json FROM session_router WHERE session_id = ?1 AND entity_id = ?2",
             )?;
             let mut upsert_stmt = tx.prepare_cached(
-                "INSERT OR REPLACE INTO session_router (session_id, entity_id, record_json, router_text, created_at_ms, updated_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO session_router (session_id, entity_id, record_json, router_text, created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(session_id, entity_id) DO UPDATE SET
+                    record_json = excluded.record_json,
+                    router_text = excluded.router_text,
+                    updated_at_ms = excluded.updated_at_ms
+                 RETURNING rowid"
             )?;
             let mut fts = tx.prepare_cached(
-                "INSERT OR REPLACE INTO fts_session_router (session_id, entity_id, router_text) VALUES (?1, ?2, ?3)"
+                "INSERT OR REPLACE INTO fts_session_router (rowid, session_id, entity_id, router_text) VALUES (?1, ?2, ?3, ?4)"
             )?;
             let now = unix_timestamp_ms()? as u64;
             for record in updates {
                 // Fetch existing record if any and merge
                 let merged = match select_stmt
                     .query_row(params![record.session_id, record.entity_id], |row| {
-                        row.get::<_, String>(0)
+                        row.get::<_, String>(1)
                     }) {
                     Ok(existing_json) => {
                         if let Ok(existing) =
@@ -1555,15 +1443,21 @@ impl TenantStore {
                     Err(_) => record.clone(),
                 };
                 let json = serde_json::to_string(&merged)?;
-                upsert_stmt.execute(params![
+                let rowid: i64 = upsert_stmt.query_row(params![
                     merged.session_id,
                     merged.entity_id,
                     json,
                     &merged.router_text,
                     merged.created_at_ms.min(now),
                     now,
+                ], |row| row.get(0))?;
+                
+                fts.execute(params![
+                    rowid,
+                    &merged.session_id,
+                    &merged.entity_id,
+                    &merged.router_text
                 ])?;
-                fts.execute(params![&merged.session_id, &merged.entity_id, &merged.router_text])?;
                 merged_results.push(merged);
             }
         }
@@ -1603,7 +1497,7 @@ impl TenantStore {
             )
         } else {
             let fts_query =
-                terms.iter().map(|t| format!("\"{}\"", t)).collect::<Vec<_>>().join(" AND ");
+                terms.iter().map(|t| format!("\"{}\"", t)).collect::<Vec<_>>().join(" OR ");
             let mut stmt = conn.prepare_cached(
                 "SELECT sr.record_json
                  FROM fts_session_router fsr
@@ -1661,8 +1555,24 @@ impl TenantStore {
                     .filter(|part| part.len() >= FOCUS_MATCH_MIN_LEN)
                     .any(|part| record.session_focus.to_ascii_lowercase().contains(part));
 
-            if lexical_hits == 0 && temporal_hits == 0 && entity_hits == 0 && !exact_focus_hit {
-                continue;
+            if lexical_hits == 0
+                && temporal_hits == 0
+                && entity_hits == 0
+                && !exact_focus_hit
+            {
+                // Last-ditch accept: if the router_text has ANY of the raw query
+                // terms (not just the classified lexical/temporal/entity terms),
+                // keep the row. The classified term lists are often empty for
+                // short or open-vocabulary questions.
+                let lower_terms: Vec<&str> = query_lower
+                    .split_whitespace()
+                    .filter(|t| t.len() > SEARCH_MIN_TERM_LEN)
+                    .collect();
+                let has_raw_term = !lower_terms.is_empty()
+                    && lower_terms.iter().any(|t| lower.contains(t));
+                if !has_raw_term {
+                    continue;
+                }
             }
 
             let lexical_coverage = if lexical_terms.is_empty() {
@@ -1734,33 +1644,69 @@ impl TenantStore {
         if subject_entities.is_empty() {
             return Ok(Vec::new());
         }
-        let like_clauses: Vec<String> =
-            subject_entities.iter().map(|_| "router_text LIKE ?".to_string()).collect();
-        let sql = format!(
-            "SELECT session_id FROM session_router WHERE entity_id = ?1 AND ({})",
-            like_clauses.join(" OR ")
-        );
+        // Use FTS5 OR-query so we tokenize properly and the planner can use the
+        // fts_session_router index. Fall back to LIKE if all terms are too short
+        // for FTS5 (less than SEARCH_MIN_TERM_LEN).
         let conn = self.get_conn()?;
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> =
-            vec![Box::new(entity_id.to_string())];
-        for e in subject_entities {
-            params.push(Box::new(format!("%{}%", e.to_ascii_lowercase())));
+        let fts_terms: Vec<String> = subject_entities
+            .iter()
+            .filter(|e| e.len() > SEARCH_MIN_TERM_LEN)
+            .map(|e| format!("\"{}\"", e.to_ascii_lowercase()))
+            .collect();
+
+        let mut session_to_hits: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+
+        if !fts_terms.is_empty() {
+            let fts_query = fts_terms.join(" OR ");
+            let mut stmt = conn.prepare_cached(
+                "SELECT sr.session_id, fsr.fts_session_router
+                 FROM fts_session_router fsr
+                 JOIN session_router sr
+                   ON sr.session_id = fsr.session_id AND sr.entity_id = fsr.entity_id
+                 WHERE fsr.fts_session_router MATCH ?1 AND fsr.entity_id = ?2
+                 ORDER BY rank LIMIT ?3",
+            )?;
+            let rows = stmt.query_map(
+                params![fts_query, entity_id, (subject_entities.len().saturating_mul(8)) as i64],
+                |row| Ok(row.get::<_, String>(0)?),
+            )?;
+            for row in rows.flatten() {
+                *session_to_hits.entry(row).or_insert(0) += 1;
+            }
         }
-        let pref: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-        let rows = stmt.query_map(pref.as_slice(), |row| {
-            Ok(SessionRouterSearchHit {
-                session_id: row.get::<_, String>(0)?,
-                score: 1.0,
+
+        // Backstop: LIKE-based scan in case FTS5 missed something due to token
+        // boundaries. Cheap because session_router is one row per session.
+        for entity in subject_entities {
+            if entity.len() < 3 {
+                continue;
+            }
+            let needle = entity.to_ascii_lowercase();
+            let mut stmt = conn.prepare_cached(
+                "SELECT session_id FROM session_router
+                 WHERE entity_id = ?1 AND LOWER(router_text) LIKE ?2",
+            )?;
+            let rows = stmt.query_map(
+                params![entity_id, format!("%{}%", needle)],
+                |row| Ok(row.get::<_, String>(0)?),
+            )?;
+            for row in rows.flatten() {
+                *session_to_hits.entry(row).or_insert(0) += 1;
+            }
+        }
+
+        let mut results: Vec<SessionRouterSearchHit> = session_to_hits
+            .into_iter()
+            .map(|(session_id, hits)| SessionRouterSearchHit {
+                score: hits as f32,
                 lexical_hits: 0,
                 temporal_hits: 0,
-                entity_hits: 1,
+                entity_hits: hits,
+                session_id,
             })
-        })?;
-        let mut results = Vec::with_capacity(rows.size_hint().0);
-        for row in rows {
-            results.push(row?);
-        }
+            .collect();
+        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
         Ok(results)
     }
 
@@ -1808,7 +1754,7 @@ impl TenantStore {
     pub fn register_fact_versions_batch(
         &self,
         entity_id: &str,
-        registrations: &[(String, u64, String, String, String, String)],
+        registrations: &[(&str, u64, &str, &str, &str, &str)],
     ) -> Result<Vec<FactVersionStatus>> {
         let mut conn = self.get_conn()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -1959,6 +1905,35 @@ impl TenantStore {
             "DELETE FROM memory_links WHERE source_memory_id = ?1 OR target_memory_id = ?1",
             params![memory_id],
         )?;
+        // Cascade chunks: if this memory was a parent that was chunked, the
+        // child chunks have card_id = "{parent}::ct{N}" and source_memory_id
+        // = parent. Clean them up.
+        let chunk_pattern = format!("{}::ct%", memory_id);
+        
+        let mut chunk_rowids: Vec<i64> = Vec::new();
+        {
+            let mut stmt = tx.prepare("SELECT rowid FROM memories WHERE source_memory_id = ?1 OR memory_id LIKE ?2")?;
+            let mut rows = stmt.query(params![memory_id, chunk_pattern])?;
+            while let Some(row) = rows.next()? {
+                chunk_rowids.push(row.get(0)?);
+            }
+        }
+        
+        let _chunk_rows = tx.execute(
+            "DELETE FROM memory_cards WHERE source_memory_id = ?1 OR card_id LIKE ?2",
+            params![memory_id, chunk_pattern],
+        )?;
+        
+        if !chunk_rowids.is_empty() {
+            let placeholders: Vec<String> = chunk_rowids.iter().map(|_| "?".to_string()).collect();
+            let sql = format!("DELETE FROM fts_memories WHERE rowid IN ({})", placeholders.join(","));
+            let params: Vec<&dyn rusqlite::types::ToSql> = chunk_rowids.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+            tx.execute(&sql, params.as_slice())?;
+            
+            let sql2 = format!("DELETE FROM memories WHERE rowid IN ({})", placeholders.join(","));
+            tx.execute(&sql2, params.as_slice())?;
+        }
+
 
         tx.commit()?;
 
@@ -2302,15 +2277,25 @@ impl TenantStore {
         entity_id: Option<&str>,
     ) -> Result<Vec<(String, f32)>> {
         let conn = self.get_conn()?;
-        // Sanitize FTS query: escape special chars, wrap terms
-        let fts_query = query
+        
+        let cleaned = query.replace(|c: char| !c.is_alphanumeric() && c != ' ', " ");
+        let mut terms: Vec<String> = cleaned
             .split_whitespace()
             .filter(|t| t.len() > FTS_MIN_TERM_LEN)
-            .map(|t| {
-                format!("\"{}\"", t)
-            })
-            .collect::<Vec<_>>()
-            .join(" OR ");
+            .map(|t| t.to_lowercase())
+            .filter(|t| !crate::api::utils::is_low_signal_keyword(t))
+            .map(|t| format!("\"{}\"", t))
+            .collect();
+
+        if terms.is_empty() {
+            terms = query
+                .split_whitespace()
+                .filter(|t| t.len() > FTS_MIN_TERM_LEN)
+                .map(|t| format!("\"{}\"", t))
+                .collect();
+        }
+
+        let fts_query = terms.join(" OR ");
 
         if fts_query.is_empty() {
             return Ok(Vec::new());
@@ -2406,7 +2391,7 @@ impl TenantStore {
     /// Insert a single typed edge using owned strings (no lifetime issues).
     pub fn graph_insert_edge(
         &self,
-        entity_scope: &str,
+        _entity_scope: &str,
         memory_id: &str,
         subject: &str,
         predicate: &str,   // becomes edge_type
@@ -2551,10 +2536,6 @@ impl TenantStore {
         Ok(())
     }
 
-    pub fn observation_cache_usage(&self) -> u64 {
-        0
-    }
-
     pub fn db_stats(&self) -> Result<super::types::CoreClusterStats> {
         let conn = self.get_conn()?;
 
@@ -2623,16 +2604,7 @@ impl TenantStore {
         })
     }
 
-    // ── Search Memory Cards (FTS) for query handler ──
-
-    pub fn search_memory_cards_fts(
-        &self,
-        _entity_id: &str,
-        query: &str,
-        limit: usize,
-    ) -> Result<Vec<(String, f32)>> {
-        self.fts_search(query, limit, None)
-    }
+    // ── Get memory cards batch ──
 
     pub fn get_memory_cards_batch(
         &self,
@@ -2736,46 +2708,6 @@ impl TenantStore {
         Ok(results)
     }
 
-    pub fn set_disambiguation_vectors_batch(
-        &self,
-        entity_id: &str,
-        batch: &[(String, Vec<f32>)],
-    ) -> Result<()> {
-        let mut conn = self.get_conn()?;
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        {
-            let mut stmt = tx.prepare_cached(
-                "INSERT OR REPLACE INTO disambiguation_vectors (entity_id, memory_id, vector_blob) VALUES (?1, ?2, ?3)"
-            )?;
-            for (memory_id, vector) in batch {
-                let blob = vec_f32_to_bytes(vector);
-                stmt.execute(params![entity_id, memory_id, blob])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub fn set_negative_centroids_batch(
-        &self,
-        entity_id: &str,
-        batch: &[(String, Vec<f32>)],
-    ) -> Result<()> {
-        let mut conn = self.get_conn()?;
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        {
-            let mut stmt = tx.prepare_cached(
-                "INSERT OR REPLACE INTO negative_centroids (entity_id, memory_id, centroid_blob) VALUES (?1, ?2, ?3)"
-            )?;
-            for (memory_id, vector) in batch {
-                let blob = vec_f32_to_bytes(vector);
-                stmt.execute(params![entity_id, memory_id, blob])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
     pub fn invalidated_set(&self) -> Result<std::collections::HashSet<String>> {
         let conn = self.get_conn()?;
         let mut stmt =
@@ -2802,101 +2734,8 @@ impl TenantStore {
         }
         Ok(set)
     }
-
-    pub fn append_query_trace(&self, _trace: &QueryTrace) -> Result<()> {
-        Ok(())
-    }
-
-    pub fn get_mem_scene(&self, _scene_id: &str) -> Result<Option<MemSceneRecord>> {
-        Ok(None)
-    }
-
-    pub fn set_mem_scene(&self, _scene: &MemSceneRecord) -> Result<()> {
-        Ok(())
-    }
-
-    pub fn search_temporal_events(
-        &self,
-        entity_id: &str,
-        query: &str,
-        _temporal_terms: &[String],
-        _subject_entities: &[String],
-        limit: usize,
-    ) -> Result<Vec<TemporalEventSearchHit>> {
-        let conn = self.get_conn()?;
-        let query_lower = query.to_ascii_lowercase();
-        let terms: Vec<&str> =
-            query_lower.split_whitespace().filter(|t| t.len() > SEARCH_MIN_TERM_LEN).collect();
-        if terms.is_empty() {
-            return Ok(Vec::new());
-        }
-        let fts_query =
-            terms.iter().map(|t| format!("\"{}\"", t)).collect::<Vec<_>>().join(" AND ");
-        let mut stmt = conn.prepare_cached(
-            "SELECT f.event_id, e.source_memory_id, f.source_session_id, bm25(fts_temporal_events)
-             FROM fts_temporal_events f
-             JOIN temporal_events e ON e.event_id = f.event_id
-             WHERE f.fts_temporal_events MATCH ?1 AND f.entity_id = ?2
-             ORDER BY rank LIMIT ?3",
-        )?;
-        let rows = stmt.query_map(params![fts_query, entity_id, limit as i64], |row| {
-            Ok(TemporalEventSearchHit {
-                event_id: row.get(0)?,
-                source_memory_id: row.get(1)?,
-                source_session_id: row.get(2)?,
-                score: row.get::<_, f64>(3)? as f32,
-                lexical_hits: 0,
-                temporal_hits: 0,
-                entity_hits: 0,
-            })
-        })?;
-        let mut results = Vec::with_capacity(rows.size_hint().0);
-        for row in rows {
-            results.push(row?);
-        }
-        Ok(results)
-    }
-
-    pub fn search_shadow_questions(
-        &self,
-        entity_id: &str,
-        query: &str,
-        _subject_entities: &[String],
-        limit: usize,
-    ) -> Result<Vec<ShadowQuestionSearchHit>> {
-        let conn = self.get_conn()?;
-        let query_lower = query.to_ascii_lowercase();
-        let terms: Vec<&str> =
-            query_lower.split_whitespace().filter(|t| t.len() > SEARCH_MIN_TERM_LEN).collect();
-        if terms.is_empty() {
-            return Ok(Vec::new());
-        }
-        let fts_query =
-            terms.iter().map(|t| format!("\"{}\"", t)).collect::<Vec<_>>().join(" AND ");
-        let mut stmt = conn.prepare_cached(
-            "SELECT f.shadow_id, e.source_memory_id, f.source_session_id, bm25(fts_shadow_questions)
-             FROM fts_shadow_questions f
-             JOIN shadow_questions e ON e.shadow_id = f.shadow_id
-             WHERE f.fts_shadow_questions MATCH ?1 AND f.entity_id = ?2
-             ORDER BY rank LIMIT ?3"
-        )?;
-        let rows = stmt.query_map(params![fts_query, entity_id, limit as i64], |row| {
-            Ok(ShadowQuestionSearchHit {
-                shadow_id: row.get(0)?,
-                source_memory_id: row.get(1)?,
-                source_session_id: row.get(2)?,
-                score: row.get::<_, f64>(3)? as f32,
-                lexical_hits: 0,
-                entity_hits: 0,
-            })
-        })?;
-        let mut results = Vec::with_capacity(rows.size_hint().0);
-        for row in rows {
-            results.push(row?);
-        }
-        Ok(results)
-    }
 }
+
 
 fn dedupe_append<T: Clone + PartialEq + Eq + std::hash::Hash>(base: &[T], extra: &[T]) -> Vec<T> {
     let mut seen: std::collections::HashSet<&T> = base.iter().collect();
@@ -3004,11 +2843,57 @@ impl TenantStore {
         }
         Ok(results)
     }
+
+    pub fn expire_records(&self, now_ms: u64) -> Result<usize> {
+        let mut conn = self.get_conn()?;
+        let mut updates = Vec::new();
+        {
+            let mut stmt = conn.prepare_cached(
+                "SELECT card_id, lifecycle FROM memory_cards WHERE expires_at IS NOT NULL AND expires_at <= ?1"
+            )?;
+            let rows = stmt.query_map(params![now_ms as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+
+            for row in rows {
+                let (card_id, lifecycle_json) = row?;
+                if let Ok(mut lifecycle) = serde_json::from_str::<crate::lifecycle::LifecycleMetadata>(&lifecycle_json) {
+                    if lifecycle.lifecycle_state != crate::lifecycle::LifecycleState::Expired
+                        && matches!(
+                            lifecycle.retention_class,
+                            crate::lifecycle::RetentionClass::Ephemeral | crate::lifecycle::RetentionClass::Working
+                        )
+                    {
+                        lifecycle.lifecycle_state = crate::lifecycle::LifecycleState::Expired;
+                        if let Ok(updated_json) = serde_json::to_string(&lifecycle) {
+                            updates.push((card_id, updated_json));
+                        }
+                    }
+                }
+            }
+        }
+
+        let count = updates.len();
+        if count > 0 {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            {
+                let mut update_stmt = tx.prepare_cached(
+                    "UPDATE memory_cards SET lifecycle = ?1, updated_at_ms = ?2 WHERE card_id = ?3"
+                )?;
+                for (card_id, updated_json) in updates {
+                    update_stmt.execute(params![updated_json, now_ms as i64, card_id])?;
+                }
+            }
+            tx.commit()?;
+        }
+        Ok(count)
+    }
 }
 
 // Re-import needed for artifact versions
 use serde::{Deserialize, Serialize};
 
+#[allow(dead_code)]
 fn vec_f32_to_bytes(v: &[f32]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(v.len() * 4);
     for &x in v {
@@ -3149,5 +3034,99 @@ mod tests {
         assert_eq!(neighbors.len(), 1);
         assert_eq!(neighbors[0].0, "mem-2");
         assert!((neighbors[0].1 - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_bitemporal_preference_supersession() {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("tenant.db");
+        let store = TenantStore::new(&db_path).unwrap();
+
+        let registrations1 = vec![
+            ("pref_key_1".to_string(), 100, "mem-pref-1".to_string(), "Caroline".to_string(), "prefers".to_string(), "counseling".to_string())
+        ];
+        let statuses1 = store.register_fact_versions_batch("Caroline", &registrations1).unwrap();
+        assert_eq!(statuses1.len(), 1);
+
+        let registrations2 = vec![
+            ("pref_key_1".to_string(), 200, "mem-pref-2".to_string(), "Caroline".to_string(), "prefers".to_string(), "coaching".to_string())
+        ];
+        let statuses2 = store.register_fact_versions_batch("Caroline", &registrations2).unwrap();
+        assert_eq!(statuses2.len(), 1);
+
+        let stale_at_250 = store.invalidated_set_at_time(250).unwrap();
+        assert!(stale_at_250.contains("mem-pref-1"));
+        assert!(!stale_at_250.contains("mem-pref-2"));
+    }
+
+    #[test]
+    fn test_lifecycle_expiration_sweeper() {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("tenant.db");
+        let store = TenantStore::new(&db_path).unwrap();
+
+        // Create an ephemeral memory card expiring at timestamp 1000
+        let mut lifecycle = crate::lifecycle::evaluate_lifecycle(
+            "ephemeral test memory",
+            MemoryKind::Conversational,
+            100,
+            None,
+            true,
+        );
+        lifecycle.expires_at_ms = Some(1000);
+        assert_eq!(lifecycle.retention_class, crate::lifecycle::RetentionClass::Ephemeral);
+
+        let card = MemoryCard {
+            card_id: "card-123".to_string(),
+            entity_id: "user-123".to_string(),
+            user_id: "user-123".to_string(),
+            source_memory_id: "mem-123".to_string(),
+            source_session_id: "session-123".to_string(),
+            subject: "subject".to_string(),
+            predicate: "predicate".to_string(),
+            object: "object".to_string(),
+            memory_text: "text".to_string(),
+            card_type: "Fact".to_string(),
+            confidence: 0.9,
+            is_latest: true,
+            is_static: false,
+            is_inference: true,
+            expires_at: Some(1000),
+            root_card_id: None,
+            parent_card_id: None,
+            lifecycle: Some(lifecycle),
+            source_turn_index: 0,
+            document_time: 100,
+            conversation_time: 100,
+            event_time: None,
+            created_at_ms: 100,
+            updated_at_ms: 100,
+        };
+
+        store.ingest_cards(&[card.clone()]).unwrap();
+
+        // Sweep at time 500 (card has not expired)
+        let swept = store.expire_records(500).unwrap();
+        assert_eq!(swept, 0);
+
+        let card_loaded = store.get_memory_card("card-123").unwrap().unwrap();
+        assert_ne!(
+            card_loaded.lifecycle.unwrap().lifecycle_state,
+            crate::lifecycle::LifecycleState::Expired
+        );
+
+        // Sweep at time 1500 (card has expired)
+        let swept = store.expire_records(1500).unwrap();
+        assert_eq!(swept, 1);
+
+        let card_loaded_after = store.get_memory_card("card-123").unwrap().unwrap();
+        assert_eq!(
+            card_loaded_after.lifecycle.unwrap().lifecycle_state,
+            crate::lifecycle::LifecycleState::Expired
+        );
+
+        // Sweep again (already marked Expired, should not be returned again)
+        let swept = store.expire_records(1500).unwrap();
+        assert_eq!(swept, 0);
     }
 }

@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_imports)]
 use axum::{
     extract::{Json, State},
     http::{HeaderMap, HeaderValue, StatusCode},
@@ -6,7 +7,6 @@ use axum::{
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-
 use crate::api::auth::{
     authorize_request, principal_namespace_prefix, principal_user_id, record_usage_for_principal,
     scope_entity_id,
@@ -19,17 +19,18 @@ use crate::api::types::{
     QueryResult,
 };
 use crate::api::utils::{
-    apply_decay_with_policy, clip_profile_to_budget, cosine_similarity, elapsed_ms_and_us,
+    apply_decay_with_policy, clip_profile_to_budget, elapsed_ms_and_us,
     env_bool, extract_named_phrases, insert_f32_header, insert_stage_timing_headers,
     insert_u64_header, parse_temporal_window, scoped_semantic_min_hits, scoped_semantic_start,
     scoped_semantic_step, scoped_semantic_top, session_id_from_memory_id,
     should_apply_neural_rerank, temporal_recency_scoring_enabled, turn_index_from_memory_id,
     SEMANTIC_TOP_DEFAULT,
 };
+use crate::ml::cosine_similarity;
 use crate::api::{EngineState, PlatformWriteOp};
 use crate::retrieval::ScoringWeights;
 use crate::metrics;
-use crate::storage::{AgentObservation, MemoryCard, MemoryCardSearchInput, MemoryKind, QueryTrace, SessionCandidateTrace, TenantStore};
+use crate::storage::{AgentObservation, MemoryCard, MemoryCardSearchInput, MemoryKind, TenantStore};
 
 #[derive(Default)]
 pub struct QueryDiagnostics {
@@ -1054,6 +1055,21 @@ fn collect_edge_cluster_scores(
     max_depth: usize,
     edge_type_filter: Option<&str>,
 ) -> HashMap<String, f32> {
+    collect_edge_cluster_scores_with_intent(tenant, seed_memory_id, max_depth, edge_type_filter, None)
+}
+
+/// Like `collect_edge_cluster_scores` but applies an intent-aware multiplier
+/// on edge weights. For Inference/Recommendation we boost causal
+/// (caused_by, leads_to) and preference (prefers) edges 1.5x. For
+/// FactVerification we boost Updates/Supports edges 1.5x. Other intents get
+/// flat 1.0 weighting.
+fn collect_edge_cluster_scores_with_intent(
+    tenant: &TenantStore,
+    seed_memory_id: &str,
+    max_depth: usize,
+    edge_type_filter: Option<&str>,
+    intent: Option<crate::api::plan::types::QueryIntent>,
+) -> HashMap<String, f32> {
     let mut accumulated = HashMap::new();
     let mut visited = HashSet::new();
     let mut frontier = vec![(seed_memory_id.to_string(), 0usize, 1.0f32)];
@@ -1066,17 +1082,44 @@ fn collect_edge_cluster_scores(
         if !visited.insert(visit_key) {
             continue;
         }
-        let Ok(linked_edges) = tenant.get_edge_cluster_neighbors(&current_mid, edge_type_filter, 50) else {
+        let Ok(linked_edges) = tenant.get_edge_cluster_neighbors_typed(&current_mid, edge_type_filter, 50) else {
             continue;
         };
-        for (linked_mid, weight) in linked_edges {
-            let contribution = path_weight * weight;
+        for (linked_mid, weight, edge_type) in linked_edges {
+            let intent_mult = intent_weight_for_edge(edge_type.as_str(), intent);
+            let contribution = path_weight * weight * intent_mult;
             *accumulated.entry(linked_mid.clone()).or_insert(0.0) += contribution;
             frontier.push((linked_mid, depth + 1, path_weight * 0.6));
         }
     }
 
     accumulated
+}
+
+/// Returns 1.5 for edges that align with the query intent, 1.0 otherwise.
+fn intent_weight_for_edge(
+    edge_type: &str,
+    intent: Option<crate::api::plan::types::QueryIntent>,
+) -> f32 {
+    use crate::api::plan::types::QueryIntent;
+    let et = edge_type.to_ascii_lowercase();
+    match intent {
+        Some(QueryIntent::Inference) | Some(QueryIntent::Recommendation) => {
+            if et == "caused_by" || et == "leads_to" || et == "prefers" {
+                1.5
+            } else {
+                1.0
+            }
+        }
+        Some(QueryIntent::PeripheralMention) => {
+            if et == "updates" || et == "supports" || et == "contradicts" {
+                1.5
+            } else {
+                1.0
+            }
+        }
+        _ => 1.0,
+    }
 }
 
 fn parse_graph_direction_str(direction: Option<&str>) -> &'static str {
@@ -1087,14 +1130,14 @@ fn parse_graph_direction_str(direction: Option<&str>) -> &'static str {
     }
 }
 
-fn scoped_graph_user_id(
+fn scoped_graph_node_id(
     principal: &crate::api::auth::RequestPrincipal,
     requested: Option<String>,
 ) -> Result<String, StatusCode> {
     let ns_prefix = principal_namespace_prefix(principal);
-    let user_id = match requested {
-        Some(user_id) if !user_id.trim().is_empty() => {
-            scope_entity_id(user_id.trim(), ns_prefix.as_deref())
+    let node_id = match requested {
+        Some(id) if !id.trim().is_empty() => {
+            scope_entity_id(id.trim(), ns_prefix.as_deref())
         }
         None => ns_prefix
             .as_deref()
@@ -1102,7 +1145,7 @@ fn scoped_graph_user_id(
             .ok_or(StatusCode::BAD_REQUEST)?,
         _ => return Err(StatusCode::BAD_REQUEST),
     };
-    Ok(user_id)
+    Ok(node_id)
 }
 
 pub async fn graph_query_handler(
@@ -1111,15 +1154,22 @@ pub async fn graph_query_handler(
     Json(payload): Json<GraphQueryPayload>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let principal = authorize_request(&headers, &state)?;
-    let user_id = scoped_graph_user_id(&principal, payload.user_id)?;
+    // If subject is provided, scope it. If not, fallback to scoping the requested user_id.
+    let subject = if !payload.subject.trim().is_empty() {
+        let ns_prefix = principal_namespace_prefix(&principal);
+        scope_entity_id(payload.subject.trim(), ns_prefix.as_deref())
+    } else {
+        scoped_graph_node_id(&principal, payload.user_id)?
+    };
+
     let tenant_id = crate::api::auth::principal_user_id(&principal).unwrap_or("default");
     let tenant = state.tenant_store(tenant_id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let tenant_clone = tenant.clone();
     let results = tokio::task::spawn_blocking(move || {
         tenant_clone.graph_query_edges(
-            &user_id,
+            &subject,
             payload.edge_type.as_deref(),
-            "Both",
+            parse_graph_direction_str(payload.direction.as_deref()),
             payload.limit.unwrap_or(50).min(500),
         )
     })
@@ -1136,14 +1186,22 @@ pub async fn graph_walk_handler(
     Json(payload): Json<GraphWalkPayload>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let principal = authorize_request(&headers, &state)?;
-    let user_id = scoped_graph_user_id(&principal, payload.user_id)?;
+    let node = if !payload.node.trim().is_empty() {
+        let ns_prefix = principal_namespace_prefix(&principal);
+        scope_entity_id(payload.node.trim(), ns_prefix.as_deref())
+    } else {
+        scoped_graph_node_id(&principal, payload.user_id)?
+    };
+
     let tenant_id = crate::api::auth::principal_user_id(&principal).unwrap_or("default");
     let tenant = state.tenant_store(tenant_id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let tenant_clone = tenant.clone();
     let results = tokio::task::spawn_blocking(move || {
+        // TODO: actually implement depth/breadth walk. For now, pass first edge_type.
+        let edge_type = payload.edge_types.as_ref().and_then(|et| et.first().map(|s| s.as_str()));
         tenant_clone.graph_query_edges(
-            &user_id,
-            None,
+            &node,
+            edge_type,
             parse_graph_direction_str(payload.direction.as_deref()),
             payload.limit.unwrap_or(250).min(2_000),
         )
@@ -1161,14 +1219,22 @@ pub async fn graph_export_handler(
     Json(payload): Json<GraphExportPayload>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let principal = authorize_request(&headers, &state)?;
-    let user_id = scoped_graph_user_id(&principal, payload.user_id)?;
+    let seed = if !payload.seed.trim().is_empty() {
+        let ns_prefix = principal_namespace_prefix(&principal);
+        scope_entity_id(payload.seed.trim(), ns_prefix.as_deref())
+    } else {
+        scoped_graph_node_id(&principal, payload.user_id)?
+    };
+
     let tenant_id = crate::api::auth::principal_user_id(&principal).unwrap_or("default");
     let tenant = state.tenant_store(tenant_id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let tenant_clone = tenant.clone();
     let results = tokio::task::spawn_blocking(move || {
+        // TODO: implement export walk using breadth/depth. For now fallback to query edges.
+        let edge_type = payload.edge_types.as_ref().and_then(|et| et.first().map(|s| s.as_str()));
         tenant_clone.graph_query_edges(
-            &user_id,
-            None,
+            &seed,
+            edge_type,
             parse_graph_direction_str(payload.direction.as_deref()),
             payload.max_nodes.unwrap_or(500).min(5_000),
         )
@@ -1272,7 +1338,7 @@ pub async fn temporal_query_handler(
     Ok((StatusCode::OK, Json(mapped)))
 }
 const NEURAL_TOP: usize = 25;
-const NEURAL_BATCH: usize = 8;
+const NEURAL_BATCH: usize = 32;
 
 struct QueryPipelineState {
     payload: QueryPayload,
@@ -1555,7 +1621,6 @@ fn plan_phase(s: &mut QueryPipelineState) {
 }
 
 fn route_phase(s: &mut QueryPipelineState) {
-    let mut session_votes: HashMap<String, usize> = HashMap::new();
     let route_probe_queries = if s.budget.route_probe_query_limit == 0 {
         Vec::new()
     } else if s.plan.coverage_facets.is_empty() {
@@ -1596,33 +1661,98 @@ fn route_phase(s: &mut QueryPipelineState) {
         }
     });
 
+    // Lanes for RRF fusion. Each lane is independently ranked.
+    let mut lanes: Vec<Vec<(String, f32)>> = Vec::with_capacity(5);
+
+    // Lane 1: entity-anchored pivot (resolved subjects → sessions). Strongest
+    // signal for multi-hop and cross-entity questions.
+    if !s.plan.subject_entities.is_empty() {
+        let tenant = s.tenant.clone();
+        let eid = s.payload.entity_id.clone();
+        let subjects = s.plan.subject_entities.clone();
+        if let Ok(hits) = tenant.entity_pivot_sessions(
+            eid.as_deref().unwrap_or(""),
+            &subjects,
+        ) {
+            lanes.push(
+                hits.into_iter().map(|h| (h.session_id, h.score)).collect(),
+            );
+        }
+    }
+
+    // Lane 2: FTS session router (router_text OR of query terms).
+    let s_router_lane: Vec<(String, f32)> = s
+        .session_route_scores
+        .iter()
+        .map(|(sid, score)| (sid.clone(), *score))
+        .collect();
+    if !s_router_lane.is_empty() {
+        lanes.push(s_router_lane);
+    }
+
+    // Lane 3: time-window hits.
+    // Already merged into s.session_route_scores via the plan_phase time-window
+    // pass; we re-extract the contribution by snapshot before any further
+    // mutations. For now this lane is implicit in lane 2.
+
+    // Lane 4: FTS probe votes.
+    let mut probe_lane: Vec<(String, f32)> = Vec::new();
     for (probe_idx, route_probe_hits) in route_probe_results {
-        let vote_weight = match probe_idx {
-            0 => 3,
-            1 => 2,
-            _ => 1,
+        let vote_weight: f32 = match probe_idx {
+            0 => 3.0,
+            1 => 2.0,
+            _ => 1.0,
         };
+        let mut seen_in_probe: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         for (memory_id, _) in route_probe_hits.iter().take(s.budget.route_probe_hit_limit) {
             if let Some(session_id) = routed_session_from_memory_id(memory_id) {
-                *session_votes.entry(session_id).or_insert(0) += vote_weight;
+                if seen_in_probe.insert(session_id.clone()) {
+                    probe_lane.push((session_id, vote_weight));
+                }
             }
         }
     }
-    for (session_id, votes) in session_votes {
-        *s.session_route_scores.entry(session_id).or_insert(0.0) +=
-            votes as f32 * s.state.ranking_config.session_boost;
+    if !probe_lane.is_empty() {
+        lanes.push(probe_lane);
     }
-    let mut top_sessions = s.session_route_scores
-        .iter()
-        .map(|(sid, score)| (sid.clone(), *score))
-        .collect::<Vec<_>>();
-    top_sessions.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Lane 5: if we have no entity-anchored hits, fall back to raw FTS probe on
+    // the plain question text. Cheap insurance.
+    if lanes.is_empty() {
+        let tenant = s.tenant.clone();
+        let q = s.query_text.clone();
+        let eid = s.payload.entity_id.clone();
+        if let Ok(hits) = tenant.search_session_router(
+            eid.as_deref().unwrap_or(""),
+            &q,
+            &[],
+            &[],
+            &s.plan.subject_entities,
+            24,
+        ) {
+            let lane: Vec<(String, f32)> = hits
+                .into_iter()
+                .map(|h| (h.session_id, h.score))
+                .collect();
+            if !lane.is_empty() {
+                lanes.push(lane);
+            }
+        }
+    }
+
+    // Fuse with RRF (c=60, standard constant).
+    let fused = rrf_fuse(&lanes, 60.0);
+
+    // Also seed the legacy aggregate for downstream diagnostics.
+    s.session_route_scores = fused.iter().cloned().collect();
+
     let route_take = if s.plan.needs_decomposition || s.plan.cross_entity {
         s.budget.route_take_hard
     } else {
         s.budget.route_take_simple
     };
-    s.adaptive_profile.route_sessions = top_sessions
+    s.adaptive_profile.route_sessions = fused
         .into_iter()
         .take(route_take)
         .map(|(session, _)| session)
@@ -1636,6 +1766,35 @@ fn route_phase(s: &mut QueryPipelineState) {
     };
     s.diag.routed_sessions = s.adaptive_profile.route_sessions.len() as u64;
     (s.diag.route_ms, s.diag.route_us) = elapsed_ms_and_us(s.route_start);
+}
+
+/// Reciprocal Rank Fusion (RRF) over multiple independent ranking lanes.
+///
+/// Each lane is a Vec of (item_id, score) where higher score = better. We rank
+/// each lane (ties broken by score, then by appearance order), then aggregate:
+///
+///   S(item) = sum_lane  1 / (c + rank_lane(item))
+///
+/// c=60 is the standard RRF constant (Cormack et al., 2009) that prevents
+/// high-rank items from dominating the sum and gives low-rank items a
+/// reasonable contribution. Items not in a lane contribute 0 from that lane.
+fn rrf_fuse(lanes: &[Vec<(String, f32)>], c: f32) -> Vec<(String, f32)> {
+    let mut scores: HashMap<String, f32> = HashMap::new();
+    for lane in lanes {
+        // Sort the lane by score descending, then take ranks (1-indexed).
+        let mut sorted: Vec<&(String, f32)> = lane.iter().collect();
+        sorted.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for (rank, (item, _score)) in sorted.iter().enumerate() {
+            let r = (rank + 1) as f32;
+            *scores.entry((*item).clone()).or_insert(0.0) += 1.0 / (c + r);
+        }
+    }
+    let mut out: Vec<(String, f32)> = scores.into_iter().collect();
+    out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    out
 }
 
 fn retrieval_phase(s: &mut QueryPipelineState) {
@@ -1654,9 +1813,13 @@ fn retrieval_ann(s: &mut QueryPipelineState) {
         .collect::<Vec<_>>();
     let primary_qembed_clone = s.primary_qembed.clone();
     let mut embeddings = vec![primary_qembed_clone];
-    for q in semantic_queries.iter().skip(1) {
-        if let Ok(emb) = s.state.semantic.generate_query_embedding(q) {
-            embeddings.push(emb);
+    if semantic_queries.len() > 1 {
+        let query_refs: Vec<&str> = semantic_queries.iter().skip(1).map(|q| q.as_str()).collect();
+        let batch_results = s.state.semantic.embed_batch(&query_refs);
+        for emb in batch_results {
+            if !emb.is_empty() {
+                embeddings.push(emb);
+            }
         }
     }
     (s.diag.embed_ms, s.diag.embed_us) = elapsed_ms_and_us(stage_start);
@@ -1817,7 +1980,15 @@ fn retrieval_ann(s: &mut QueryPipelineState) {
                 });
                 handles.push(handle);
             }
-            handles.into_iter().map(|h| h.join().expect("ANN search thread panicked")).collect::<Vec<_>>()
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join().unwrap_or_else(|e| {
+                        tracing::error!("ANN search thread panicked: {:?}", e);
+                        (0, Vec::new(), Vec::new(), Vec::new())
+                    })
+                })
+                .collect::<Vec<_>>()
         })
     };
 
@@ -2133,25 +2304,42 @@ fn fusion_phase(s: &mut QueryPipelineState) {
         .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     let mut graph_scores: HashMap<String, f32> = HashMap::new();
-    for (seed_mid, _) in link_seed_ids.into_iter().take(24) {
-        let cluster_scores = collect_link_cluster_scores(&s.tenant, &seed_mid, 2);
-        for (linked_mid, boost) in cluster_scores {
-            if let Some((ts, _)) = s.tenant
-                .lookup_by_memory_id(&linked_mid)
-                .unwrap_or(None)
-            {
-                *graph_scores.entry(linked_mid.clone()).or_insert(0.0) += boost;
-                let entry = fused_map.entry(linked_mid).or_insert((ts, 0.0));
-                entry.0 = ts;
-            }
+    let seed_top: Vec<String> = link_seed_ids.into_iter().take(24).map(|(mid, _)| mid).collect();
+
+    use rayon::prelude::*;
+    let intent_for_graph = s.plan.intent;
+    let per_seed: Vec<(HashMap<String, f32>, HashMap<String, f32>)> = seed_top
+        .par_iter()
+        .map(|seed_mid| {
+            let tenant = s.tenant.clone();
+            let link = collect_link_cluster_scores(&tenant, seed_mid, 2);
+            let edge = collect_edge_cluster_scores_with_intent(
+                &tenant,
+                seed_mid,
+                2,
+                None,
+                Some(intent_for_graph),
+            );
+            (link, edge)
+        })
+        .collect();
+
+    let mut all_linked: Vec<String> = Vec::with_capacity(per_seed.len() * 8);
+    for (link, edge) in per_seed {
+        for (linked_mid, boost) in link {
+            *graph_scores.entry(linked_mid.clone()).or_insert(0.0) += boost;
+            all_linked.push(linked_mid);
         }
-        let edge_scores = collect_edge_cluster_scores(&s.tenant, &seed_mid, 2, None);
-        for (linked_mid, boost) in edge_scores {
-            if let Some((ts, _)) = s.tenant
-                .lookup_by_memory_id(&linked_mid)
-                .unwrap_or(None)
-            {
-                *graph_scores.entry(linked_mid.clone()).or_insert(0.0) += boost;
+        for (linked_mid, boost) in edge {
+            *graph_scores.entry(linked_mid.clone()).or_insert(0.0) += boost;
+            all_linked.push(linked_mid);
+        }
+    }
+    all_linked.sort();
+    all_linked.dedup();
+    if !all_linked.is_empty() {
+        if let Ok(lookup) = s.tenant.lookup_by_memory_ids_batch(&all_linked) {
+            for (linked_mid, (ts, _)) in lookup {
                 let entry = fused_map.entry(linked_mid).or_insert((ts, 0.0));
                 entry.0 = ts;
             }
@@ -2194,16 +2382,24 @@ fn fusion_phase(s: &mut QueryPipelineState) {
             }
             entity_seeds.truncate(8);
 
+            let mut batched_edges = Vec::new();
             for seed in &entity_seeds {
                 if let Ok(edges) = s.tenant.graph_query_edges(seed, None, "Both", 50) {
-                    for edge in edges {
-                        if !edge.memory_id.is_empty() {
-                            if let Ok(Some((ts, _))) = s.tenant.lookup_by_memory_id(&edge.memory_id) {
-                                let boost = edge.weight * 0.5;
-                                *graph_scores.entry(edge.memory_id.clone()).or_insert(0.0) += boost;
-                                let entry = fused_map.entry(edge.memory_id.clone()).or_insert((ts, 0.0));
-                                entry.0 = ts;
-                            }
+                    batched_edges.extend(edges.into_iter().filter(|e| !e.memory_id.is_empty()));
+                }
+            }
+            if !batched_edges.is_empty() {
+                let mut edge_mids = batched_edges.iter().map(|e| e.memory_id.clone()).collect::<Vec<_>>();
+                edge_mids.sort();
+                edge_mids.dedup();
+                
+                if let Ok(lookup) = s.tenant.lookup_by_memory_ids_batch(&edge_mids) {
+                    for edge in batched_edges {
+                        if let Some(&(ts, _)) = lookup.get(&edge.memory_id) {
+                            let boost = edge.weight * 0.5;
+                            *graph_scores.entry(edge.memory_id.clone()).or_insert(0.0) += boost;
+                            let entry = fused_map.entry(edge.memory_id.clone()).or_insert((ts, 0.0));
+                            entry.0 = ts;
                         }
                     }
                 }
@@ -2233,46 +2429,70 @@ fn score_hydrate(s: &mut QueryPipelineState) {
         .iter()
         .map(|(mid, ts, _)| (*ts, mid.clone()))
         .collect();
-    let obs_start = Instant::now();
-    s.observations = s.tenant
-        .get_observations_batch(&observation_keys)
-        .unwrap_or_default();
-    (s.diag.fetch_obs_ms, s.diag.fetch_obs_us) = elapsed_ms_and_us(obs_start);
-
-    let observation_memory_ids: Vec<String> =
-        s.fused.iter().map(|(mid, _, _)| mid.clone()).collect();
-
-    let cards_start = Instant::now();
-    s.memory_cards = s.tenant
-        .get_memory_cards_batch(&observation_memory_ids)
-        .unwrap_or_default();
-    (s.diag.fetch_cards_ms, s.diag.fetch_cards_us) = elapsed_ms_and_us(cards_start);
-
-    let vectors_start = Instant::now();
-    let entity_for_vec = s.payload.entity_id.as_deref().unwrap_or("default");
-    s.disambiguation_vectors = s.tenant
-        .get_disambiguation_vectors_batch(entity_for_vec)
-        .unwrap_or_default();
-    (s.diag.fetch_vectors_ms, s.diag.fetch_vectors_us) = elapsed_ms_and_us(vectors_start);
-
-    let neg_start = Instant::now();
-    s.negative_centroids = s.tenant
-        .get_negative_centroids_batch(entity_for_vec)
-        .unwrap_or_default();
-    (s.diag.fetch_neg_ms, s.diag.fetch_neg_us) = elapsed_ms_and_us(neg_start);
-
-    let _fact_ids: Vec<String> = s.observations
+    let observation_memory_ids: Vec<String> = observation_keys
         .iter()
-        .filter_map(|(mid, obs)| (obs.kind == MemoryKind::Fact).then_some(mid.clone()))
+        .map(|(_, mid)| mid.clone())
         .collect();
+    let entity_for_vec = s.payload.entity_id.as_deref().unwrap_or("default").to_string();
+    let pit = s.payload.point_in_time_ms;
 
-    let invalid_start = Instant::now();
-    s.invalidated_facts = if let Some(pit) = s.payload.point_in_time_ms {
-        s.tenant.invalidated_set_at_time(pit).unwrap_or_default()
-    } else {
-        s.tenant.invalidated_set().unwrap_or_default()
-    };
-    (s.diag.fetch_invalid_ms, s.diag.fetch_invalid_us) = elapsed_ms_and_us(invalid_start);
+    let obs_start = Instant::now();
+    let handle = tokio::runtime::Handle::current();
+    let (obs_res, cards_res, vectors_res, neg_res, invalid_res) = handle.block_on(async {
+        let tenant = s.tenant.clone();
+        let obs_keys = observation_keys.clone();
+        let obs_task = tokio::task::spawn_blocking(move || {
+            tenant.get_observations_batch(&obs_keys).unwrap_or_default()
+        });
+
+        let tenant2 = s.tenant.clone();
+        let obs_mids = observation_memory_ids.clone();
+        let cards_task = tokio::task::spawn_blocking(move || {
+            tenant2.get_memory_cards_batch(&obs_mids).unwrap_or_default()
+        });
+
+        let tenant3 = s.tenant.clone();
+        let entity = entity_for_vec.clone();
+        let vectors_task = tokio::task::spawn_blocking(move || {
+            tenant3.get_disambiguation_vectors_batch(&entity).unwrap_or_default()
+        });
+
+        let tenant4 = s.tenant.clone();
+        let entity2 = entity_for_vec.clone();
+        let neg_task = tokio::task::spawn_blocking(move || {
+            tenant4.get_negative_centroids_batch(&entity2).unwrap_or_default()
+        });
+
+        let tenant5 = s.tenant.clone();
+        let invalid_task = tokio::task::spawn_blocking(move || {
+            if let Some(pit_ms) = pit {
+                tenant5.invalidated_set_at_time(pit_ms).unwrap_or_default()
+            } else {
+                tenant5.invalidated_set().unwrap_or_default()
+            }
+        });
+
+        tokio::try_join!(obs_task, cards_task, vectors_task, neg_task, invalid_task)
+    }).unwrap_or_default();
+
+    s.observations = obs_res;
+    s.memory_cards = cards_res;
+    s.disambiguation_vectors = vectors_res;
+    s.negative_centroids = neg_res;
+    s.invalidated_facts = invalid_res;
+
+    let total_fetch_ms = obs_start.elapsed().as_millis() as u64;
+    let total_fetch_us = obs_start.elapsed().as_micros() as u64;
+    s.diag.fetch_obs_ms = total_fetch_ms;
+    s.diag.fetch_obs_us = total_fetch_us;
+    s.diag.fetch_cards_ms = total_fetch_ms;
+    s.diag.fetch_cards_us = total_fetch_us;
+    s.diag.fetch_vectors_ms = total_fetch_ms;
+    s.diag.fetch_vectors_us = total_fetch_us;
+    s.diag.fetch_neg_ms = total_fetch_ms;
+    s.diag.fetch_neg_us = total_fetch_us;
+    s.diag.fetch_invalid_ms = total_fetch_ms;
+    s.diag.fetch_invalid_us = total_fetch_us;
 }
 
 fn score_loop(s: &mut QueryPipelineState) -> Vec<EvidenceCard> {
@@ -2293,6 +2513,9 @@ fn score_loop(s: &mut QueryPipelineState) -> Vec<EvidenceCard> {
     let adaptive_profile = &s.adaptive_profile;
     let session_route_scores = &s.session_route_scores;
 
+    let disambiguation_map: std::collections::HashMap<&str, &[f32]> = disambiguation_vectors.iter().map(|(k, v)| (k.as_str(), v.as_slice())).collect();
+    let negative_map: std::collections::HashMap<&str, &[f32]> = negative_centroids.iter().map(|(k, v)| (k.as_str(), v.as_slice())).collect();
+
     for (mid, ts, rrf_score) in &s.fused {
         if is_synthetic_query_memory(mid) {
             continue;
@@ -2300,7 +2523,8 @@ fn score_loop(s: &mut QueryPipelineState) -> Vec<EvidenceCard> {
         let Some(obs) = observations.get(mid) else {
             continue;
         };
-        let is_stale_fact = obs.kind == MemoryKind::Fact && invalidated_facts.contains(mid);
+        let is_stale_fact = (obs.kind == MemoryKind::Fact || obs.kind == MemoryKind::Preference || obs.kind == MemoryKind::Decision)
+            && invalidated_facts.contains(mid);
         let created_at_ms = if obs.created_at_ms > 0 {
             obs.created_at_ms
         } else {
@@ -2316,7 +2540,10 @@ fn score_loop(s: &mut QueryPipelineState) -> Vec<EvidenceCard> {
         let lexical_hits = lexical_hit_count(&scorable, plan);
         let temporal_hits = temporal_hit_count(&scorable, plan);
         let facet_mask = facet_match_mask(&scorable, plan);
-        let base_score = neural_scores.get(mid).copied().unwrap_or(*rrf_score);
+        let mut base_score = neural_scores.get(mid).copied().unwrap_or(*rrf_score);
+        if base_score <= 0.001 && !primary_qembed.is_empty() && obs.embedding.len() == primary_qembed.len() {
+            base_score = cosine_similarity(primary_qembed, &obs.embedding).max(0.0);
+        }
         let lifecycle = memory_cards
             .get(mid)
             .and_then(|card| card.lifecycle.as_ref())
@@ -2356,8 +2583,6 @@ fn score_loop(s: &mut QueryPipelineState) -> Vec<EvidenceCard> {
             fs += entity_coverage_bonus(&scorable, plan);
             fs += numeric_signal_bonus(&obs.textual_content, &scorable.lower, plan_intent);
             fs += ordinal_signal_bonus(obs.kind, &scorable, plan);
-            let disambiguation_map: std::collections::HashMap<&str, &[f32]> = disambiguation_vectors.iter().map(|(k, v)| (k.as_str(), v.as_slice())).collect();
-            let negative_map: std::collections::HashMap<&str, &[f32]> = negative_centroids.iter().map(|(k, v)| (k.as_str(), v.as_slice())).collect();
             if let Some(disambiguation) = disambiguation_map.get(mid.as_str()) {
                 if disambiguation.len() == primary_qembed.len()
                     && !primary_qembed.is_empty()
@@ -2376,7 +2601,7 @@ fn score_loop(s: &mut QueryPipelineState) -> Vec<EvidenceCard> {
                             - cosine_similarity(
                                 primary_qembed,
                                 negative_centroid,
-                            );
+                             );
                     fs += margin * 0.08;
                 }
             }
@@ -2506,73 +2731,6 @@ fn score_build_response(s: &mut QueryPipelineState, mut evidence_cards: Vec<Evid
         .unwrap_or_default();
     (s.diag.hydrate_obs_ms, s.diag.hydrate_obs_us) = elapsed_ms_and_us(hydrate_obs_start);
 
-    let selected_sessions = selected
-        .iter()
-        .map(|card| card.source_session_id.clone())
-        .filter(|sid| !sid.is_empty())
-        .collect::<Vec<_>>();
-    let candidate_sessions = selected
-        .iter()
-        .enumerate()
-        .map(|(rank, card)| {
-            let mut features = HashMap::new();
-            features.insert("rank".to_string(), rank as f32 + 1.0);
-            features.insert("final_score".to_string(), card.final_score);
-            features.insert("semantic_score".to_string(), card.semantic_score);
-            features.insert("bm25_score".to_string(), card.bm25_score);
-            features.insert(
-                "session_router_score".to_string(),
-                card.session_router_score,
-            );
-            features.insert("card_score".to_string(), card.card_score);
-            features.insert("reranker_score".to_string(), card.reranker_score);
-            features.insert("entity_hits".to_string(), card.entity_hits as f32);
-            features.insert("lexical_hits".to_string(), card.lexical_hits as f32);
-            features.insert("temporal_hits".to_string(), card.temporal_hits as f32);
-            features.insert(
-                "facet_hits".to_string(),
-                card.facet_mask.count_ones() as f32,
-            );
-            features.insert("graph_score".to_string(), card.graph_score);
-            features.insert("child_score".to_string(), card.child_score);
-            SessionCandidateTrace {
-                session_id: card.source_session_id.clone(),
-                final_score: card.final_score,
-                features,
-                source_memory_ids: vec![card.source_memory_id.clone()],
-                source_card_ids: card.card_id.clone().into_iter().collect(),
-                source_event_ids: Vec::new(),
-                is_gold: None,
-            }
-        })
-        .collect::<Vec<_>>();
-    let trace_id = format!(
-        "query_trace::{}::{}",
-        s.payload
-            .entity_id
-            .clone()
-            .unwrap_or_else(|| "global".to_string()),
-        s.now_ms
-    );
-    let query_trace = QueryTrace {
-        query_trace_id: trace_id,
-        entity_id: s.payload.entity_id.clone(),
-        question: s.raw_query_text.clone(),
-        query_plan: format!("{:?}", s.plan.intent),
-        candidate_sessions,
-        selected_sessions,
-        returned_memory_ids: selected
-            .iter()
-            .map(|card| card.source_memory_id.clone())
-            .collect(),
-        latency_ms: s.total_start.elapsed().as_millis() as u64,
-        gold_sessions: Vec::new(),
-        created_at_ms: s.now_ms,
-    };
-    let trace_start = Instant::now();
-    let _ = s.tenant.append_query_trace(&query_trace);
-    (s.diag.trace_ms, s.diag.trace_us) = elapsed_ms_and_us(trace_start);
-
     let queries: Vec<QueryResult> = selected
         .into_iter()
         .map(|card| {
@@ -2634,7 +2792,9 @@ pub fn execute_query_pipeline(
     let intent = s.plan.intent;
     let entity_id = s.payload.entity_id.clone().unwrap_or_else(|| "default".to_string());
     if matches!(intent, QueryIntent::Inference | QueryIntent::Recommendation) {
-        let conclusions = crate::graph_inference::run_graph_inference(&s.tenant, &entity_id, intent);
+        let conclusions = tokio::task::block_in_place(|| {
+            crate::graph_inference::run_graph_inference(&s.tenant, &entity_id, intent)
+        });
         if !conclusions.is_empty() {
             let notes: Vec<String> = conclusions.into_iter().map(|c| c.conclusion_text).collect();
             results.push(QueryResult {

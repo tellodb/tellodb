@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use crate::storage::TenantDatabaseManager;
 use anyhow::{Context, Result};
 use regex::Regex;

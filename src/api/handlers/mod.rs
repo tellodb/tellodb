@@ -5,6 +5,10 @@ pub mod query;
 pub mod system;
 
 use axum::{
+    extract::{Request, State},
+    http::StatusCode,
+    middleware::{self, Next},
+    response::Response,
     routing::{delete, get, post},
     Router,
 };
@@ -29,12 +33,49 @@ use self::system::{
 };
 use crate::api::{auth, EngineState};
 
+async fn rate_limit_middleware(
+    State(state): State<EngineState>,
+    req: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let path = req.uri().path().to_string();
+    if path == "/health" || path == "/healthz" || path == "/version" || path == "/metrics" {
+        return Ok(next.run(req).await);
+    }
+    auth::check_rate_limit(&state, req.headers())?;
+    Ok(next.run(req).await)
+}
+
+async fn request_timeout_middleware(
+    req: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let path = req.uri().path().to_string();
+    // Health and version probes never time out.
+    if path == "/health" || path == "/healthz" || path == "/version" || path == "/metrics" {
+        return Ok(next.run(req).await);
+    }
+    let timeout_secs: u64 = std::env::var("TELLODB_REQUEST_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        next.run(req),
+    )
+    .await
+    {
+        Ok(resp) => Ok(resp),
+        Err(_) => {
+            tracing::warn!(path = %path, "request exceeded timeout");
+            Err(StatusCode::REQUEST_TIMEOUT)
+        }
+    }
+}
+
 pub fn build_api(state: EngineState) -> Router {
-    Router::new()
-        .route("/health", get(health_handler))
-        .route("/healthz", get(healthz_handler))
+    let protected = Router::new()
         .route("/status", get(status_handler))
-        .route("/version", get(version_handler))
         .route("/warmup", post(warmup_handler))
         .route("/reset", post(reset_handler))
         .route("/admin/reset", post(reset_handler))
@@ -68,8 +109,16 @@ pub fn build_api(state: EngineState) -> Router {
         .route("/graph/export", post(graph_export_handler))
         .route("/analytics/query", post(analytics_query_handler))
         .route("/temporal/query", get(temporal_query_handler))
+        .layer(middleware::from_fn_with_state(state.clone(), rate_limit_middleware));
+
+    Router::new()
+        .route("/health", get(health_handler))
+        .route("/healthz", get(healthz_handler))
+        .route("/version", get(version_handler))
         .route("/metrics", get(metrics_handler))
+        .merge(protected)
         .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024)) // 10MB max body
+        .layer(middleware::from_fn(request_timeout_middleware))
         .layer(auth::build_cors_layer())
         .with_state(state)
 }

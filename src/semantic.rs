@@ -1,18 +1,35 @@
 use anyhow::Result;
-use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
+use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions, TextRerank, RerankInitOptions, RerankerModel};
 use ort::ep::CUDA;
 
-use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use lru::LruCache;
+use parking_lot::Mutex;
+use std::num::NonZeroUsize;
+use std::sync::Arc;
 
-const DEFAULT_MAX_INPUT_CHARS: usize = 8_192;
+
+
+/// Default number of embedding executors. Each holds a copy of the embed
+/// model in memory; for BGE-small-en-v1.5 (~130MB) this is fine. Override with
+/// `TEMPORAL_MEMORY_EMBED_EXECUTORS` to tune.
+const DEFAULT_EMBED_EXECUTORS: usize = 4;
+
+/// Default number of rerank executors. Each holds a copy of BGE-reranker-base
+/// (~700MB on CPU). Override with `TEMPORAL_MEMORY_RERANK_EXECUTORS`.
+const DEFAULT_RERANK_EXECUTORS: usize = 2;
+
+/// Default size of the rerank-result LRU cache. Each entry holds a Vec<f32>
+/// of length ≤ 32 (one NEURAL_BATCH chunk). Override with
+/// `TEMPORAL_MEMORY_RERANK_CACHE_SIZE`.
+const DEFAULT_RERANK_CACHE_SIZE: usize = 4096;
 
 pub struct SemanticInference {
     embedding_model_id: String,
     embedding_dim: usize,
     executors: Vec<Arc<SemanticExecutor>>,
     next_executor: std::sync::atomic::AtomicUsize,
-    max_input_chars: usize,
+    rerankers: Vec<Arc<Mutex<TextRerank>>>,
+    rerank_cache: Mutex<LruCache<u64, Arc<Vec<f32>>>>,
 }
 
 struct SemanticExecutor {
@@ -25,37 +42,90 @@ impl SemanticInference {
         let embedding_model_id = "BAAI/bge-small-en-v1.5".to_string();
         let embedding_dim = embedding_dimensions_for_model(&embedding_model_id);
 
-        let mut options = TextInitOptions::default();
-        options.model_name = EmbeddingModel::try_from(embedding_model_id.clone())
-            .unwrap_or(EmbeddingModel::AllMiniLML6V2);
-        options.show_download_progress = true;
-
         // Use GPU if TEMPORAL_MEMORY_DEVICE=gpu is set.
-        let use_gpu = std::env::var("TEMPORAL_MEMORY_DEVICE")
-            .map(|v| v.eq_ignore_ascii_case("gpu"))
-            .unwrap_or(false);
-        let mut device_label = "CPU";
-        if use_gpu {
-            let cuda_ep: ort::execution_providers::ExecutionProviderDispatch =
-                CUDA::default().into();
-            options.execution_providers.insert(0, cuda_ep);
-            device_label = "CUDA";
+        let device_env = std::env::var("TEMPORAL_MEMORY_DEVICE").unwrap_or_default().to_lowercase();
+        let use_gpu = device_env == "gpu";
+        let use_coreml = device_env == "coreml" || device_env == "mps" || device_env == "mac";
+
+        let device_label: &'static str = if use_gpu { "CUDA" } else if use_coreml { "CoreML" } else { "CPU" };
+
+        let default_n_embed = if use_gpu || use_coreml { 1 } else { DEFAULT_EMBED_EXECUTORS };
+        let default_n_rerank = if use_gpu || use_coreml { 1 } else { DEFAULT_RERANK_EXECUTORS };
+
+        let n_embed = std::env::var("TEMPORAL_MEMORY_EMBED_EXECUTORS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n: &usize| *n >= 1 && *n <= 32)
+            .unwrap_or(default_n_embed);
+
+        let n_rerank = std::env::var("TEMPORAL_MEMORY_RERANK_EXECUTORS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n: &usize| *n >= 1 && *n <= 16)
+            .unwrap_or(default_n_rerank);
+
+        let cache_size = std::env::var("TEMPORAL_MEMORY_RERANK_CACHE_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n: &usize| *n >= 64)
+            .unwrap_or(DEFAULT_RERANK_CACHE_SIZE);
+
+        info_msg(&format!(
+            "Initializing {n_embed} embed executors and {n_rerank} rerank executors on {device_label}, \
+             rerank cache size {cache_size}"
+        ));
+
+        // Build embed executors
+        let mut executors = Vec::with_capacity(n_embed);
+        for i in 0..n_embed {
+            let mut options = TextInitOptions::default();
+            options.model_name = EmbeddingModel::try_from(embedding_model_id.clone())
+                .unwrap_or(EmbeddingModel::AllMiniLML6V2);
+            options.show_download_progress = i == 0; // only show progress on the first
+            if use_gpu {
+                let cuda_ep: ort::execution_providers::ExecutionProviderDispatch =
+                    CUDA::default().into();
+                options.execution_providers.insert(0, cuda_ep);
+            } else if use_coreml {
+                #[cfg(target_os = "macos")]
+                {
+                    let coreml_ep: ort::execution_providers::ExecutionProviderDispatch =
+                        ort::ep::CoreML::default().into();
+                    options.execution_providers.insert(0, coreml_ep);
+                }
+            }
+            let model = TextEmbedding::try_new(options)?;
+            executors.push(Arc::new(SemanticExecutor {
+                fast_embedding: Some(Mutex::new(model)),
+                execution_device_label: device_label,
+            }));
         }
 
-        let model = TextEmbedding::try_new(options)?;
-
-        let executor = Arc::new(SemanticExecutor {
-            fast_embedding: Some(Mutex::new(model)),
-            execution_device_label: device_label,
-        });
+        // Build rerank executors
+        let mut rerankers = Vec::with_capacity(n_rerank);
+        for i in 0..n_rerank {
+            let mut rerank_options = RerankInitOptions::default();
+            rerank_options.model_name = RerankerModel::BGERerankerBase;
+            rerank_options.show_download_progress = i == 0;
+            let rr = TextRerank::try_new(rerank_options)?;
+            rerankers.push(Arc::new(Mutex::new(rr)));
+        }
 
         Ok(Self {
             embedding_model_id,
             embedding_dim,
-            executors: vec![executor],
+            executors,
             next_executor: std::sync::atomic::AtomicUsize::new(0),
-            max_input_chars: DEFAULT_MAX_INPUT_CHARS,
+            rerankers,
+            rerank_cache: Mutex::new(LruCache::new(
+                NonZeroUsize::new(cache_size).expect("cache size must be non-zero"),
+            )),
         })
+    }
+
+    fn next_executor_arc(&self) -> Arc<SemanticExecutor> {
+        let idx = self.next_executor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.executors[idx % self.executors.len()].clone()
     }
 
     fn next_executor(&self) -> &SemanticExecutor {
@@ -63,21 +133,34 @@ impl SemanticInference {
         &self.executors[idx % self.executors.len()]
     }
 
-    pub async fn generate_embedding(&self, text: &str) -> Result<Vec<f32>> {
+
+    pub fn generate_embedding(&self, text: &str) -> Result<Vec<f32>> {
         let executor = self.next_executor();
         if let Some(ref model) = executor.fast_embedding {
-            let mut model = model.lock().unwrap_or_else(|e| e.into_inner());
-            let embeddings = model.embed(vec![text], None)?;
-            Ok(embeddings.first().cloned().unwrap_or_default())
+            let mut model = model.lock();
+            let embeddings: Vec<Vec<f32>> = model.embed([text], None)?;
+            Ok(embeddings.into_iter().next().unwrap_or_default())
         } else {
             anyhow::bail!("ORT model not loaded")
         }
     }
 
     pub fn generate_query_embedding(&self, text: &str) -> Result<Vec<f32>> {
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(self.generate_embedding(text))
+        self.generate_embedding(text)
+    }
+
+    pub async fn generate_query_embedding_async(&self, text: String) -> Result<Vec<f32>> {
+        let executor = self.next_executor_arc();
+        tokio::task::spawn_blocking(move || {
+            if let Some(ref model) = executor.fast_embedding {
+                let mut model = model.lock();
+                let embeddings: Vec<Vec<f32>> = model.embed([text.as_str()], None)?;
+                Ok(embeddings.into_iter().next().unwrap_or_default())
+            } else {
+                anyhow::bail!("ORT model not loaded")
+            }
         })
+        .await?
     }
 
     /// Batch-embed multiple texts in a single ONNX inference call.
@@ -89,13 +172,83 @@ impl SemanticInference {
         }
         let executor = self.next_executor();
         if let Some(ref model) = executor.fast_embedding {
-            let mut model = model.lock().unwrap_or_else(|e| e.into_inner());
-            model
-                .embed(texts.to_vec(), None)
-                .unwrap_or_else(|_| vec![Vec::new(); texts.len()])
+            let mut model = model.lock();
+            model.embed(texts, None).unwrap_or_default()
         } else {
             vec![Vec::new(); texts.len()]
         }
+    }
+
+    pub async fn embed_batch_async(&self, texts: Vec<String>) -> Vec<Vec<f32>> {
+        if texts.is_empty() {
+            return Vec::new();
+        }
+        let executor = self.next_executor_arc();
+        let len = texts.len();
+        tokio::task::spawn_blocking(move || {
+            if let Some(ref model) = executor.fast_embedding {
+                let mut model = model.lock();
+                let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+                model.embed(refs, None).unwrap_or_default()
+            } else {
+                vec![Vec::new(); len]
+            }
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    /// Embed multiple texts across all configured executors in parallel.
+    /// Splits `texts` into roughly equal chunks (one per executor) and runs
+    /// each chunk on a different executor. This is much faster than
+    /// `embed_batch_async` for large batches when N>1 executors are
+    /// configured, because each executor runs an independent ONNX inference.
+    ///
+    /// The returned Vec is in the same order as `texts`.
+    pub async fn embed_batch_parallel(&self, texts: Vec<String>) -> Vec<Vec<f32>> {
+        if texts.is_empty() {
+            return Vec::new();
+        }
+        let n_exec = self.executors.len();
+        if n_exec == 1 || texts.len() <= 16 {
+            return self.embed_batch_async(texts).await;
+        }
+
+        // Split into chunks aligned with executor count.
+        let chunk_size = (texts.len() + n_exec - 1) / n_exec;
+        let mut chunks: Vec<Vec<String>> = Vec::with_capacity(n_exec);
+        for c in texts.chunks(chunk_size) {
+            chunks.push(c.to_vec());
+        }
+        let mut handles = Vec::with_capacity(chunks.len());
+        for chunk in chunks {
+            let executor = self.next_executor_arc();
+            handles.push(tokio::task::spawn_blocking(move || -> Vec<Vec<f32>> {
+                if let Some(ref model) = executor.fast_embedding {
+                    let mut model = model.lock();
+                    let refs: Vec<&str> = chunk.iter().map(|s| s.as_str()).collect();
+                    model.embed(refs, None).unwrap_or_default()
+                } else {
+                    vec![Vec::new(); chunk.len()]
+                }
+            }));
+        }
+        let mut ordered: Vec<Vec<Vec<f32>>> = Vec::with_capacity(handles.len());
+        let total = texts.len();
+        for h in handles {
+            match h.await {
+                Ok(v) => ordered.push(v),
+                Err(e) => {
+                    tracing::warn!("embed chunk join failed: {:?}", e);
+                    return vec![Vec::new(); total];
+                }
+            }
+        }
+        let mut out = Vec::with_capacity(total);
+        for chunk_result in ordered {
+            out.extend(chunk_result);
+        }
+        out
     }
 
     pub fn embedding_dim(&self) -> usize {
@@ -114,269 +267,202 @@ impl SemanticInference {
         "CPU"
     }
 
-    /// Number of GPU executors to create (one per detected GPU, capped at 4).
-    fn gpu_executor_count() -> usize {
-        let count = std::env::var("TEMPORAL_MEMORY_EXECUTORS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(0);
-        if count > 0 { count } else { 0 }
-    }
-
     pub fn executor_count(&self) -> usize {
         self.executors.len()
     }
 
-    pub fn extract_entities(&self, text: &str) -> Result<Vec<(String, String)>> {
-        let re = regex::Regex::new(r"\b([A-Z][a-zA-Z0-9\.\-']*(?:\s+[A-Z][a-zA-Z0-9\.\-']*)*)\b")?;
+    #[allow(dead_code)]
+    pub fn extract_entities(&self, _text: &str) -> Result<Vec<(String, String)>> {
+        Ok(Vec::new())
+    }
 
-        let ignore_words: HashSet<&str> = [
-            "The", "He", "She", "It", "They", "We", "Then", "In", "On", "At", "When", "How",
-            "This", "That", "There", "Here", "A", "An", "But", "And", "Or", "If", "You", "My",
-            "Our", "Their", "Your", "His", "Her", "Its", "All", "Any", "Some", "Every", "Each",
-            "No", "Not", "Only", "Also", "Very", "So", "To", "From", "By", "For", "With", "About",
-            "I", "As", "Are", "Is", "Was", "Were", "Be", "Been", "Have", "Has", "Had", "Do",
-            "Does", "Did", "Can", "Could", "Will", "Would", "Should", "May", "Might", "Must",
-        ]
-        .iter()
-        .cloned()
-        .collect();
+    /// Rerank `texts` against `q`. Uses an LRU cache keyed by
+    /// (q, sorted(texts) hashes) so repeated questions with overlapping
+    /// candidate sets skip the cross-encoder call entirely.
+    ///
+    /// If more than one rerank executor is configured, `texts` is split
+    /// into roughly equal chunks and each chunk is run on a different
+    /// executor in parallel via `std::thread::scope`.
+    pub fn predict_scores_batch(&self, q: &str, texts: &[String]) -> Result<Vec<f32>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
 
-        let known_orgs: HashSet<&str> = [
-            "Google",
-            "Microsoft",
-            "OpenAI",
-            "Apple",
-            "Amazon",
-            "Meta",
-            "IBM",
-            "Intel",
-            "Netflix",
-            "Twitter",
-            "Github",
-            "Gitlab",
-            "Oracle",
-            "Tesla",
-            "SpaceX",
-            "NASA",
-        ]
-        .iter()
-        .cloned()
-        .collect();
-
-        let known_locs: HashSet<&str> = [
-            "Paris",
-            "London",
-            "Tokyo",
-            "Berlin",
-            "Rome",
-            "Madrid",
-            "Beijing",
-            "Sydney",
-            "California",
-            "Texas",
-            "Florida",
-            "New York",
-            "Boston",
-            "Chicago",
-            "Seattle",
-            "San Francisco",
-            "Europe",
-            "America",
-            "Asia",
-            "Africa",
-            "Canada",
-            "Germany",
-            "France",
-            "Japan",
-            "China",
-            "India",
-            "Australia",
-            "UK",
-            "US",
-            "USA",
-            "Washington",
-            "Denver",
-            "Austin",
-            "Miami",
-        ]
-        .iter()
-        .cloned()
-        .collect();
-
-        let known_pers: HashSet<&str> = [
-            "Alice",
-            "Bob",
-            "Charlie",
-            "David",
-            "Eve",
-            "Frank",
-            "Grace",
-            "Heidi",
-            "Ivan",
-            "Judy",
-            "Mallory",
-            "Niaj",
-            "Olivia",
-            "Peggy",
-            "Rupert",
-            "Sybil",
-            "Trent",
-            "Victor",
-            "Walter",
-            "John",
-            "Mary",
-            "James",
-            "Patricia",
-            "Robert",
-            "Jennifer",
-            "Michael",
-            "Linda",
-            "William",
-            "Elizabeth",
-            "Barbara",
-            "Richard",
-            "Susan",
-            "Joseph",
-            "Jessica",
-            "Thomas",
-            "Sarah",
-            "Charles",
-            "Karen",
-            "Christopher",
-            "Nancy",
-            "Daniel",
-            "Lisa",
-            "Matthew",
-            "Betty",
-            "Anthony",
-            "Margaret",
-            "Mark",
-            "Sandra",
-        ]
-        .iter()
-        .cloned()
-        .collect();
-
-        let mut entities = Vec::new();
-        let mut seen = HashSet::new();
-
-        for cap in re.captures_iter(text) {
-            let candidate = cap[1].trim();
-            if candidate.is_empty() || ignore_words.contains(candidate) || seen.contains(candidate)
-            {
-                continue;
-            }
-
-            if candidate.chars().all(|c| !c.is_alphabetic()) {
-                continue;
-            }
-
-            seen.insert(candidate.to_string());
-
-            let candidate_lower = candidate.to_lowercase();
-            let words: Vec<&str> = candidate_lower.split_whitespace().collect();
-
-            let is_org = known_orgs.contains(candidate)
-                || words.iter().any(|&w| {
-                    w == "inc"
-                        || w == "inc."
-                        || w == "corp"
-                        || w == "corp."
-                        || w == "corporation"
-                        || w == "ltd"
-                        || w == "ltd."
-                        || w == "co"
-                        || w == "co."
-                        || w == "company"
-                        || w == "university"
-                        || w == "lab"
-                        || w == "labs"
-                        || w == "institute"
-                        || w == "foundation"
-                        || w == "association"
-                        || w == "agency"
-                });
-
-            if is_org {
-                entities.push(("ORG".to_string(), candidate.to_string()));
-                continue;
-            }
-
-            let is_loc = known_locs.contains(candidate)
-                || words.iter().any(|&w| {
-                    w == "city"
-                        || w == "state"
-                        || w == "street"
-                        || w == "avenue"
-                        || w == "road"
-                        || w == "river"
-                        || w == "lake"
-                        || w == "mountain"
-                        || w == "ocean"
-                        || w == "sea"
-                        || w == "park"
-                        || w == "valley"
-                        || w == "station"
-                        || w == "airport"
-                        || w == "county"
-                        || w == "island"
-                        || w == "country"
-                });
-
-            if is_loc {
-                entities.push(("LOC".to_string(), candidate.to_string()));
-                continue;
-            }
-
-            let idx = text.find(candidate).unwrap_or(0);
-            let has_title = if idx >= 4 {
-                let start = text.floor_char_boundary(idx.saturating_sub(4));
-                let prefix = &text[start..idx].to_lowercase();
-                prefix.contains("mr.") || prefix.contains("ms.") || prefix.contains("dr.")
-            } else if idx >= 5 {
-                let start = text.floor_char_boundary(idx.saturating_sub(5));
-                let prefix = &text[start..idx].to_lowercase();
-                prefix.contains("mrs.") || prefix.contains("prof.")
-            } else {
-                false
-            };
-
-            let is_per = has_title || known_pers.contains(candidate) || words.len() >= 2;
-
-            if is_per {
-                entities.push(("PER".to_string(), candidate.to_string()));
-            } else {
-                entities.push(("PER".to_string(), candidate.to_string()));
+        // Cache lookup keyed on (query hash, sorted set of text hashes).
+        let cache_key = rerank_cache_key(q, texts);
+        {
+            let mut cache = self.rerank_cache.lock();
+            if let Some(cached) = cache.get(&cache_key) {
+                return Ok((**cached).clone());
             }
         }
 
-        Ok(entities)
-    }
+        // Decide whether to run in parallel. The cost of std::thread::spawn
+        // is ~30-50us; for tiny inputs we serialize.
+        let n_exec = self.rerankers.len();
+        let chunks: Vec<(usize, Vec<String>)> = split_for_rerank(texts, n_exec);
 
-    pub fn predict_score(&self, a: &str, b: &str) -> Result<f32> {
-        let tokens_a: HashSet<&str> = a.split_whitespace().collect();
-        let tokens_b: HashSet<&str> = b.split_whitespace().collect();
-        let intersection = tokens_a.intersection(&tokens_b).count();
-        let union = tokens_a.union(&tokens_b).count();
-        Ok(if union == 0 { 0.0 } else { intersection as f32 / union as f32 })
-    }
-
-    pub fn predict_scores_batch(&self, q: &str, texts: &[String]) -> Result<Vec<f32>> {
-        let query_tokens: HashSet<&str> = q.split_whitespace().collect();
-        Ok(texts
-            .iter()
-            .map(|text| {
-                let text_tokens: HashSet<&str> = text.split_whitespace().collect();
-                let intersection = query_tokens.intersection(&text_tokens).count();
-                let union = query_tokens.union(&text_tokens).count();
-                if union == 0 {
-                    0.0
-                } else {
-                    intersection as f32 / union as f32
+        let results: Vec<(usize, Vec<f32>)> = if chunks.len() == 1 || n_exec == 1 {
+            // Serial path.
+            let mut out = Vec::with_capacity(chunks.len());
+            for (i, (offset, chunk)) in chunks.into_iter().enumerate() {
+                let scores = self.rerank_on_executor(i, q, &chunk)?;
+                out.push((offset, scores));
+            }
+            out
+        } else {
+            // Parallel path: spawn one thread per chunk, each grabbing a
+            // different rerank executor. The executor is held only for the
+            // duration of the ONNX call, then released.
+            use std::thread;
+            thread::scope(|s| {
+                let mut handles = Vec::with_capacity(chunks.len());
+                for (i, (offset, chunk)) in chunks.into_iter().enumerate() {
+                    let rr = self.rerankers[i % n_exec].clone();
+                    let q_owned = q.to_string();
+                    let h = s.spawn(move || -> Result<(usize, Vec<f32>)> {
+                        let mut reranker = rr.lock();
+                        let doc_refs: Vec<&str> = chunk.iter().map(|s| s.as_str()).collect();
+                        let results = reranker.rerank(q_owned.as_str(), doc_refs, false, None)?;
+                        let mut scores = vec![0.0f32; chunk.len()];
+                        for res in results {
+                            if res.index < scores.len() {
+                                scores[res.index] = res.score;
+                            }
+                        }
+                        Ok((offset, scores))
+                    });
+                    handles.push(h);
                 }
-            })
-            .collect())
+                let mut out = Vec::with_capacity(handles.len());
+                for h in handles {
+                    match h.join() {
+                        Ok(Ok(pair)) => out.push(pair),
+                        Ok(Err(e)) => return Err(e),
+                        Err(_) => return Err(anyhow::anyhow!("rerank thread panicked")),
+                    }
+                }
+                Ok::<_, anyhow::Error>(out)
+            })?
+        };
+
+        // Stitch results back into a single Vec<f32> in original order.
+        let mut scores = vec![0.0f32; texts.len()];
+        for (offset, chunk_scores) in results {
+            for (i, s) in chunk_scores.into_iter().enumerate() {
+                scores[offset + i] = s;
+            }
+        }
+
+        // Cache the result.
+        let arc = Arc::new(scores.clone());
+        self.rerank_cache.lock().put(cache_key, arc);
+
+        Ok(scores)
+    }
+
+    fn rerank_on_executor(
+        &self,
+        executor_idx: usize,
+        q: &str,
+        texts: &[String],
+    ) -> Result<Vec<f32>> {
+        let rr = &self.rerankers[executor_idx % self.rerankers.len()];
+        let mut reranker = rr.lock();
+        let doc_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+        let results = reranker.rerank(q, doc_refs, false, None)?;
+        let mut scores = vec![0.0f32; texts.len()];
+        for res in results {
+            if res.index < scores.len() {
+                scores[res.index] = res.score;
+            }
+        }
+        Ok(scores)
+    }
+}
+
+/// Split `texts` into at most `n` roughly-equal chunks. Returns (offset, chunk)
+/// pairs so the caller can stitch results back into the original order.
+fn split_for_rerank(texts: &[String], n: usize) -> Vec<(usize, Vec<String>)> {
+    if n <= 1 || texts.len() <= 8 {
+        return vec![(0, texts.to_vec())];
+    }
+    let n = n.min(texts.len());
+    let chunk_size = (texts.len() + n - 1) / n;
+    let mut out = Vec::with_capacity(n);
+    for (i, chunk) in texts.chunks(chunk_size).enumerate() {
+        out.push((i * chunk_size, chunk.to_vec()));
+    }
+    out
+}
+
+/// Cache key = hash(query) XOR hash(sorted texts). Cheap, no need for crypto.
+fn rerank_cache_key(q: &str, texts: &[String]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    q.hash(&mut hasher);
+    let mut sorted: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+    sorted.sort();
+    for t in &sorted {
+        t.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn info_msg(msg: &str) {
+    eprintln!("[semantic] {msg}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rerank_cache_key_stable_for_permuted_texts() {
+        // Cache key must be order-independent so that calling rerank with the
+        // same set of candidates in any order hits the same cache entry.
+        let a = rerank_cache_key("query", &["foo".into(), "bar".into(), "baz".into()]);
+        let b = rerank_cache_key("query", &["baz".into(), "foo".into(), "bar".into()]);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn rerank_cache_key_differs_per_query() {
+        let a = rerank_cache_key("q1", &["x".into()]);
+        let b = rerank_cache_key("q2", &["x".into()]);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn rerank_cache_key_differs_per_text() {
+        let a = rerank_cache_key("q", &["x".into()]);
+        let b = rerank_cache_key("q", &["y".into()]);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn split_for_rerank_serializes_short_input() {
+        // Fewer than 8 texts should never be split, regardless of n.
+        let texts: Vec<String> = (0..5).map(|i| format!("t{i}")).collect();
+        let out = split_for_rerank(&texts, 4);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, 0);
+        assert_eq!(out[0].1, texts);
+    }
+
+    #[test]
+    fn split_for_rerank_splits_long_input() {
+        let texts: Vec<String> = (0..20).map(|i| format!("t{i}")).collect();
+        let out = split_for_rerank(&texts, 4);
+        assert_eq!(out.len(), 4);
+        // Verify offsets are correct and chunks cover the input.
+        let total: usize = out.iter().map(|(_, c)| c.len()).sum();
+        assert_eq!(total, 20);
+        assert_eq!(out[0].0, 0);
+        assert_eq!(out[1].0, 5);
+        assert_eq!(out[2].0, 10);
+        assert_eq!(out[3].0, 15);
     }
 }
 
