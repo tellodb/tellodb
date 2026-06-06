@@ -347,11 +347,11 @@ impl SemanticInference {
         let n_exec = self.rerankers.len();
         let chunks: Vec<(usize, Vec<String>)> = split_for_rerank(texts, n_exec);
 
+        let _permit = tokio::runtime::Handle::current().block_on(self.embed_sem.acquire()).ok();
         let results: Vec<(usize, Vec<f32>)> = if chunks.len() == 1 || n_exec == 1 {
             // Serial path.
             let mut out = Vec::with_capacity(chunks.len());
             for (i, (offset, chunk)) in chunks.into_iter().enumerate() {
-                let _permit = tokio::runtime::Handle::current().block_on(self.embed_sem.acquire()).ok();
                 let scores = self.rerank_on_executor(i, q, &chunk)?;
                 out.push((offset, scores));
             }
@@ -366,9 +366,7 @@ impl SemanticInference {
                 for (i, (offset, chunk)) in chunks.into_iter().enumerate() {
                     let rr = self.rerankers[i % n_exec].clone();
                     let q_owned = q.to_string();
-                    let sem = self.embed_sem.clone();
                     let h = s.spawn(move || -> Result<(usize, Vec<f32>)> {
-                        let _permit = tokio::runtime::Handle::current().block_on(sem.acquire()).ok();
                         let mut reranker = rr.lock();
                         let doc_refs: Vec<&str> = chunk.iter().map(|s| s.as_str()).collect();
                         let results = reranker.rerank(q_owned.as_str(), doc_refs, false, None)?;

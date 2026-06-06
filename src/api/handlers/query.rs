@@ -1020,34 +1020,7 @@ fn retrieval_budget_for_plan(plan: &QueryPlan, profile: RetrievalProfile) -> Ret
     }
 }
 
-fn collect_link_cluster_scores(
-    tenant: &TenantStore,
-    seed_memory_id: &str,
-    max_depth: usize,
-) -> HashMap<String, f32> {
-    let mut accumulated = HashMap::new();
-    let mut visited = HashSet::new();
-    let mut frontier = vec![(seed_memory_id.to_string(), 0usize, 1.0f32)];
 
-    while let Some((current_mid, depth, path_weight)) = frontier.pop() {
-        if depth >= max_depth {
-            continue;
-        }
-        let visit_key = format!("{current_mid}:{depth}");
-        if !visited.insert(visit_key) {
-            continue;
-        }
-        let Ok(linked_memories) = tenant.get_linked_memories(&current_mid) else {
-            continue;
-        };
-        for linked_mid in linked_memories {
-            *accumulated.entry(linked_mid.clone()).or_insert(0.0) += path_weight;
-            frontier.push((linked_mid, depth + 1, path_weight * 0.6));
-        }
-    }
-
-    accumulated
-}
 
 fn collect_edge_cluster_scores(
     tenant: &TenantStore,
@@ -2338,7 +2311,7 @@ fn fusion_phase(s: &mut QueryPipelineState) {
         .par_iter()
         .map(|seed_mid| {
             let tenant = s.tenant.clone();
-            let link = collect_link_cluster_scores(&tenant, seed_mid, 2);
+            let link = tenant.get_link_cluster_scores(seed_mid, 2).unwrap_or_default();
             let edge = collect_edge_cluster_scores_with_intent(
                 &tenant,
                 seed_mid,

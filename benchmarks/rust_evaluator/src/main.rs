@@ -255,8 +255,8 @@ struct Cli {
 
     /// Number of questions to process in parallel for the LLM benchmark.
     /// Each worker runs query → answer → judge concurrently. The engine
-    /// rate limit caps useful parallelism at ~16.
-    #[arg(long, global = true, default_value_t = 16)]
+    /// rate limit caps useful parallelism at ~4.
+    #[arg(long, global = true, default_value_t = 4)]
     llm_concurrency: usize,
 }
 

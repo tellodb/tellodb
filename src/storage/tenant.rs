@@ -1319,6 +1319,38 @@ impl TenantStore {
         Ok(result)
     }
 
+    pub fn get_link_cluster_scores(
+        &self,
+        seed_memory_id: &str,
+        max_depth: usize,
+    ) -> Result<HashMap<String, f32>> {
+        let conn = self.get_conn()?;
+        let mut stmt = conn.prepare_cached(
+            "WITH RECURSIVE
+               bfs(node, depth, path_weight) AS (
+                 SELECT ?1, 0, 1.0
+                 UNION ALL
+                 SELECT
+                   CASE WHEN ml.source_memory_id = bfs.node THEN ml.target_memory_id ELSE ml.source_memory_id END,
+                   bfs.depth + 1,
+                   bfs.path_weight * 0.6
+                 FROM bfs
+                 JOIN memory_links ml ON ml.source_memory_id = bfs.node OR ml.target_memory_id = bfs.node
+                 WHERE bfs.depth < ?2
+               )
+             SELECT node, SUM(path_weight) FROM bfs WHERE depth > 0 GROUP BY node;"
+        )?;
+        let rows = stmt.query_map(params![seed_memory_id, max_depth as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)? as f32))
+        })?;
+        let mut result = HashMap::new();
+        for row in rows {
+            let (node, weight) = row?;
+            result.insert(node, weight);
+        }
+        Ok(result)
+    }
+
     #[allow(dead_code)]
     pub fn get_edge_cluster_neighbors(
         &self,
