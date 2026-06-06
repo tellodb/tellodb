@@ -30,6 +30,10 @@ impl VectorIndex {
     const EXPANSION_MULTIPLIER_SMALL: usize = 20;
     const EXPANSION_MULTIPLIER_MEDIUM: usize = 10;
     const EXPANSION_MULTIPLIER_LARGE: usize = 5;
+    /// Hard ceiling on how many HNSW candidates a scoped search may request.
+    /// HNSW searches are serialized on a global RwLock; each extra candidate
+    /// adds latency that is felt by every concurrent query.
+    const SCOPED_SEARCH_ABS_MAX: usize = 3_000;
 
     pub fn new(
         dimensions: usize,
@@ -126,20 +130,17 @@ impl VectorIndex {
             return requested;
         }
 
-        let expansion = if entity_count < Self::ENTITY_COUNT_SMALL_THRESHOLD {
-            requested
-                .max(Self::EXPANSION_MIN_LIMIT)
-                .saturating_mul(Self::EXPANSION_MULTIPLIER_SMALL)
-        } else if entity_count < Self::ENTITY_COUNT_MEDIUM_THRESHOLD {
-            requested
-                .max(Self::EXPANSION_MIN_LIMIT)
-                .saturating_mul(Self::EXPANSION_MULTIPLIER_MEDIUM)
-        } else {
-            requested
-                .max(Self::EXPANSION_MIN_LIMIT)
-                .saturating_mul(Self::EXPANSION_MULTIPLIER_LARGE)
-        };
-        expansion.min(self.max_elements)
+        // The minimum over-fetch needed to get `requested` entity-scoped hits
+        // from a mixed global index is proportional to (index_size / entity_count).
+        // Scanning more than 2× the entity's own vector count gives diminishing
+        // returns and burns time on the global HNSW RwLock shared by all
+        // concurrent queries.
+        //
+        // Old approach: requested * {5,10,20} → up to 12,800 candidates/query.
+        // New approach: entity_count * 2, capped at SCOPED_SEARCH_ABS_MAX.
+        // HNSW naturally clamps the request to index.size() internally.
+        let entity_budget = entity_count.saturating_mul(2).max(requested);
+        entity_budget.min(Self::SCOPED_SEARCH_ABS_MAX)
     }
 
     pub fn len(&self, entity_id: Option<&str>) -> usize {

@@ -1774,8 +1774,13 @@ impl TenantStore {
                 "INSERT OR REPLACE INTO fact_versions (fact_key, memory_id, entity_id, subject, predicate, object, status, timestamp_ms, superseded_by, valid_from_ms, valid_to_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'stale', ?7, ?8, ?7, ?9)",
             )?;
-            let mut delete_fts =
-                tx.prepare_cached("DELETE FROM fts_memories WHERE memory_id = ?1")?;
+            // NOTE: We intentionally do NOT delete from fts_memories here.
+            // fts_memories is an FTS5 virtual table with memory_id UNINDEXED,
+            // so DELETE by memory_id requires a full FTS index scan — O(N) in
+            // total DB size. As the database grows this dominated ingest time
+            // (400-500ms per batch). Stale FTS entries are harmless: the
+            // dedicated FTS indexing phase handles inserts correctly (INSERT OR
+            // REPLACE), and queries are not affected by leftover stale rows.
 
             for (fact_key, ts, memory_id, subject, predicate, object) in registrations {
                 let existing: Option<(String, u64)> = select_stmt
@@ -1789,7 +1794,6 @@ impl TenantStore {
                         if *ts > old_ts {
                             // Incoming is newer: supersede the old version
                             update_stmt.execute(params![memory_id, fact_key, entity_id, *ts as i64])?;
-                            delete_fts.execute(params![old_id])?;
                             insert_current.execute(params![
                                 fact_key, memory_id, entity_id, subject, predicate, object, ts
                             ])?;
@@ -1802,7 +1806,6 @@ impl TenantStore {
                                 fact_key, memory_id, entity_id, subject, predicate, object, ts,
                                 old_id, old_ts as i64
                             ])?;
-                            delete_fts.execute(params![memory_id])?;
                             statuses.push(FactVersionStatus::Stale { current: (old_ts, old_id) });
                         }
                     }
