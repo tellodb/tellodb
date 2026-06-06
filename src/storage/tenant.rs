@@ -1308,7 +1308,7 @@ impl TenantStore {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT target_memory_id FROM memory_links WHERE source_memory_id = ?1
-             UNION
+             UNION ALL
              SELECT source_memory_id FROM memory_links WHERE target_memory_id = ?1",
         )?;
         let rows = stmt.query_map(params![memory_id], |row| row.get::<_, String>(0))?;
@@ -1365,7 +1365,7 @@ impl TenantStore {
         let mut stmt = conn.prepare_cached(
             "WITH seed_nodes AS (
                  SELECT source AS node FROM edges WHERE memory_id = ?1
-                 UNION
+                 UNION ALL
                  SELECT target AS node FROM edges WHERE memory_id = ?1
              )
              SELECT memory_id, weight, edge_type FROM (
@@ -1374,7 +1374,7 @@ impl TenantStore {
                  JOIN seed_nodes sn ON e.source = sn.node
                  WHERE e.memory_id != ?1
                    AND (?2 IS NULL OR e.edge_type = ?2)
-                 UNION
+                 UNION ALL
                  SELECT e.memory_id, e.weight, e.edge_type
                  FROM edges e
                  JOIN seed_nodes sn ON e.target = sn.node

@@ -2332,9 +2332,10 @@ fn fusion_phase(s: &mut QueryPipelineState) {
     let mut graph_scores: HashMap<String, f32> = HashMap::new();
     let seed_top: Vec<String> = link_seed_ids.into_iter().take(24).map(|(mid, _)| mid).collect();
 
+    use rayon::prelude::*;
     let intent_for_graph = s.plan.intent;
     let per_seed: Vec<(HashMap<String, f32>, HashMap<String, f32>)> = seed_top
-        .iter()
+        .par_iter()
         .map(|seed_mid| {
             let tenant = s.tenant.clone();
             let link = collect_link_cluster_scores(&tenant, seed_mid, 2);
