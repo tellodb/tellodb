@@ -2230,11 +2230,10 @@ fn fusion_phase(s: &mut QueryPipelineState) {
         scored_items
             .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         let mut neural_items = Vec::new();
+        let mids: Vec<String> = scored_items.iter().map(|(mid, _)| mid.clone()).collect();
+        let lookup = s.tenant.lookup_by_memory_ids_batch(&mids).unwrap_or_default();
         for (mid, _) in scored_items {
-            if let Some((ts, _)) = s.tenant
-                .lookup_by_memory_id(&mid)
-                .unwrap_or(None)
-            {
+            if let Some(&(ts, _)) = lookup.get(&mid) {
                 neural_items.push(RankedItem {
                     memory_id: mid,
                     timestamp: ts,
@@ -2333,10 +2332,9 @@ fn fusion_phase(s: &mut QueryPipelineState) {
     let mut graph_scores: HashMap<String, f32> = HashMap::new();
     let seed_top: Vec<String> = link_seed_ids.into_iter().take(24).map(|(mid, _)| mid).collect();
 
-    use rayon::prelude::*;
     let intent_for_graph = s.plan.intent;
     let per_seed: Vec<(HashMap<String, f32>, HashMap<String, f32>)> = seed_top
-        .par_iter()
+        .iter()
         .map(|seed_mid| {
             let tenant = s.tenant.clone();
             let link = collect_link_cluster_scores(&tenant, seed_mid, 2);

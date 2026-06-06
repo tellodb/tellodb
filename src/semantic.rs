@@ -114,6 +114,18 @@ impl SemanticInference {
             let mut rerank_options = RerankInitOptions::default();
             rerank_options.model_name = RerankerModel::BGERerankerBase;
             rerank_options.show_download_progress = i == 0;
+            if use_gpu {
+                let cuda_ep: ort::execution_providers::ExecutionProviderDispatch =
+                    CUDA::default().into();
+                rerank_options.execution_providers.insert(0, cuda_ep);
+            } else if use_coreml {
+                #[cfg(target_os = "macos")]
+                {
+                    let coreml_ep: ort::execution_providers::ExecutionProviderDispatch =
+                        ort::ep::CoreML::default().into();
+                    rerank_options.execution_providers.insert(0, coreml_ep);
+                }
+            }
             let rr = TextRerank::try_new(rerank_options)?;
             rerankers.push(Arc::new(Mutex::new(rr)));
         }
@@ -339,6 +351,7 @@ impl SemanticInference {
             // Serial path.
             let mut out = Vec::with_capacity(chunks.len());
             for (i, (offset, chunk)) in chunks.into_iter().enumerate() {
+                let _permit = tokio::runtime::Handle::current().block_on(self.embed_sem.acquire()).ok();
                 let scores = self.rerank_on_executor(i, q, &chunk)?;
                 out.push((offset, scores));
             }
@@ -353,7 +366,9 @@ impl SemanticInference {
                 for (i, (offset, chunk)) in chunks.into_iter().enumerate() {
                     let rr = self.rerankers[i % n_exec].clone();
                     let q_owned = q.to_string();
+                    let sem = self.embed_sem.clone();
                     let h = s.spawn(move || -> Result<(usize, Vec<f32>)> {
+                        let _permit = tokio::runtime::Handle::current().block_on(sem.acquire()).ok();
                         let mut reranker = rr.lock();
                         let doc_refs: Vec<&str> = chunk.iter().map(|s| s.as_str()).collect();
                         let results = reranker.rerank(q_owned.as_str(), doc_refs, false, None)?;
