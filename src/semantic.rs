@@ -30,6 +30,13 @@ pub struct SemanticInference {
     next_executor: std::sync::atomic::AtomicUsize,
     rerankers: Vec<Arc<Mutex<TextRerank>>>,
     rerank_cache: Mutex<LruCache<u64, Arc<Vec<f32>>>>,
+    /// Limits the number of concurrent ONNX embedding inference calls.
+    /// On GPU (1 executor) the per-model Mutex already serialises calls, but
+    /// ingest and query threads can concurrently pick DIFFERENT executors,
+    /// causing two simultaneous GPU MatMul ops that together exceed GPU memory
+    /// (each needs 90–220 MB of intermediate tensor space). This semaphore
+    /// caps total in-flight embed calls to min(n_exec, 2) on CPU or 1 on GPU.
+    embed_sem: Arc<tokio::sync::Semaphore>,
 }
 
 struct SemanticExecutor {
@@ -111,6 +118,12 @@ impl SemanticInference {
             rerankers.push(Arc::new(Mutex::new(rr)));
         }
 
+        // Maximum concurrent embedding calls. On GPU we allow exactly 1;
+        // on CPU we allow up to n_embed (each executor runs independently).
+        // This prevents two simultaneous CUDA MatMuls from fighting over
+        // GPU memory (each needs 90-220 MB of intermediate tensor space).
+        let sem_permits = if use_gpu { 1 } else { n_embed };
+
         Ok(Self {
             embedding_model_id,
             embedding_dim,
@@ -120,6 +133,7 @@ impl SemanticInference {
             rerank_cache: Mutex::new(LruCache::new(
                 NonZeroUsize::new(cache_size).expect("cache size must be non-zero"),
             )),
+            embed_sem: Arc::new(tokio::sync::Semaphore::new(sem_permits)),
         })
     }
 
@@ -183,6 +197,7 @@ impl SemanticInference {
         if texts.is_empty() {
             return Vec::new();
         }
+        let _permit = self.embed_sem.acquire().await.ok();
         let executor = self.next_executor_arc();
         let len = texts.len();
         tokio::task::spawn_blocking(move || {
@@ -210,8 +225,26 @@ impl SemanticInference {
             return Vec::new();
         }
         let n_exec = self.executors.len();
+        // Acquire the global semaphore BEFORE splitting into per-executor
+        // chunks. On GPU (sem_permits=1) this serialises all embed calls;
+        // on CPU it allows n_exec parallel calls. Holding the permit for the
+        // duration ensures no two concurrent batches compete for GPU memory.
+        let _permit = self.embed_sem.acquire().await.ok();
         if n_exec == 1 || texts.len() <= 16 {
-            return self.embed_batch_async(texts).await;
+            // Single-executor or small batch: run synchronously on one executor.
+            let executor = self.next_executor_arc();
+            let len = texts.len();
+            return tokio::task::spawn_blocking(move || {
+                if let Some(ref model) = executor.fast_embedding {
+                    let mut model = model.lock();
+                    let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+                    model.embed(refs, None).unwrap_or_default()
+                } else {
+                    vec![Vec::new(); len]
+                }
+            })
+            .await
+            .unwrap_or_default();
         }
 
         // Split into chunks aligned with executor count.

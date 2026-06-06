@@ -1532,10 +1532,23 @@ fn plan_phase(s: &mut QueryPipelineState) {
     s.diag = QueryDiagnostics::default();
     s.adaptive_profile = build_query_adaptive_profile(&s.query_text, &s.plan);
 
+    // IMPORTANT: generate_query_embedding can return an empty Vec when the
+    // embedding model fails (e.g. CUDA OOM). Passing an empty vector to
+    // usearch's search() is undefined behaviour in release builds (the debug
+    // dimension-check assert is stripped) and can cause the search to spin or
+    // hang indefinitely, which is what causes the 30-second query timeouts.
+    // Normalize to a correctly-sized zero vector here so downstream code
+    // always gets a valid (if semantically meaningless) embedding.
+    let embed_dim = s.state.semantic.embedding_dim();
     s.primary_qembed = s.state
         .semantic
         .generate_query_embedding(&s.query_text)
-        .unwrap_or_default();
+        .ok()
+        .filter(|e| e.len() == embed_dim)
+        .unwrap_or_else(|| {
+            tracing::warn!(query = %s.raw_query_text, "query embedding failed or returned wrong dimension; using zero vector");
+            vec![0.0f32; embed_dim]
+        });
 
     s.routed_memory_ids = HashMap::new();
     s.session_route_scores = HashMap::new();
@@ -1805,6 +1818,7 @@ fn retrieval_phase(s: &mut QueryPipelineState) {
 
 fn retrieval_ann(s: &mut QueryPipelineState) {
     let stage_start = Instant::now();
+    let embed_dim = s.state.semantic.embedding_dim();
     let semantic_queries = s.plan
         .semantic_queries
         .iter()
@@ -1812,17 +1826,30 @@ fn retrieval_ann(s: &mut QueryPipelineState) {
         .cloned()
         .collect::<Vec<_>>();
     let primary_qembed_clone = s.primary_qembed.clone();
+    // Guard: only proceed if the primary embedding has the right dimension.
+    // An empty or wrong-dimension vector causes usearch to exhibit undefined
+    // behaviour (the debug assert is stripped in release builds) and the
+    // search can spin/hang indefinitely → 30-second timeouts.
+    if primary_qembed_clone.len() != embed_dim {
+        tracing::warn!(
+            got = primary_qembed_clone.len(),
+            expected = embed_dim,
+            "primary query embedding has wrong dimension; skipping ANN retrieval"
+        );
+        (s.diag.ann_ms, s.diag.ann_us) = elapsed_ms_and_us(stage_start);
+        return;
+    }
     let mut embeddings = vec![primary_qembed_clone];
     if semantic_queries.len() > 1 {
         let query_refs: Vec<&str> = semantic_queries.iter().skip(1).map(|q| q.as_str()).collect();
         let batch_results = s.state.semantic.embed_batch(&query_refs);
         for emb in batch_results {
-            if !emb.is_empty() {
+            // Skip any embedding that is empty or has the wrong dimension.
+            if emb.len() == embed_dim {
                 embeddings.push(emb);
             }
         }
     }
-    (s.diag.embed_ms, s.diag.embed_us) = elapsed_ms_and_us(stage_start);
 
     let scoped_entity_id = s.payload.entity_id.clone();
     let scope_prefix: Option<String> =
