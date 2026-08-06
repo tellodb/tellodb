@@ -187,6 +187,10 @@ pub async fn query_handler(
                 textual_content: text,
                 evidence: None,
                 inference_notes: None,
+                fact_key: None,
+                conflict_flag: None,
+                superseded_by: None,
+                stability_score: None,
             },
         );
     }
@@ -1312,6 +1316,10 @@ pub async fn temporal_query_handler(
 }
 const NEURAL_TOP: usize = 25;
 const NEURAL_BATCH: usize = 32;
+// Minimum similarity for an HNSW hit to be retained post-ANN.
+// Hits below this threshold (similarity = 1.0 - distance) are dropped to
+// prevent zero-or-near-zero-similarity noise from contaminating RRF.
+const MIN_HIT_SIMILARITY: f32 = 0.30;
 
 struct QueryPipelineState {
     payload: QueryPayload,
@@ -1367,13 +1375,21 @@ impl QueryPipelineState {
         limit: usize,
         enable_neural_rerank: bool,
     ) -> Self {
+        let ambiguity_threshold = state
+            .ranking_config
+            .ambiguity_delta_threshold
+            .unwrap_or_else(|| ScoringWeights::default().ambiguity_delta_threshold);
         Self {
             payload,
             state,
             tenant,
             limit,
             enable_neural_rerank,
-            weights: ScoringWeights::default(),
+            weights: {
+                let mut w = ScoringWeights::default();
+                w.ambiguity_delta_threshold = ambiguity_threshold;
+                w
+            },
             total_start: Instant::now(),
             route_start: Instant::now(),
             raw_query_text: String::new(),
@@ -1397,6 +1413,7 @@ impl QueryPipelineState {
                 needs_decomposition: false,
                 coverage_mode: false,
                 ordinal_rank: None,
+                fact_key: None,
             },
             primary_qembed: Vec::new(),
             budget: RetrievalBudget {
@@ -1902,6 +1919,13 @@ fn retrieval_ann(s: &mut QueryPipelineState) {
                                 if !mem_id.starts_with(prefix.as_str()) {
                                     continue;
                                 }
+                                // Post-ANN similarity floor: drop zero/near-zero hits
+                                // before they pollute cumulative_hnsw_hits and the
+                                // downstream RRF lane.
+                                let similarity = (1.0f32 - *dist).clamp(-1.0, 1.0);
+                                if similarity < MIN_HIT_SIMILARITY {
+                                    continue;
+                                }
                                 new_scoped_hits += 1;
                                 if cumulative_hnsw_hits.len() < NEURAL_TOP {
                                     variant_rerank_seed_ids.push(mem_id.clone());
@@ -1952,6 +1976,12 @@ fn retrieval_ann(s: &mut QueryPipelineState) {
                         {
                             for (rank, (_vid, dist)) in hnsw_raw.iter().enumerate() {
                                 if let Some((ts, mem_id)) = looked[rank].clone() {
+                                    // Post-ANN similarity floor: drop zero/near-zero hits
+                                    // before they enter hnsw_hits and the downstream RRF lane.
+                                    let raw_similarity = (1.0f32 - *dist * 0.5f32).max(0.0f32);
+                                    if raw_similarity < MIN_HIT_SIMILARITY {
+                                        continue;
+                                    }
                                     let routed_match = routed_session_from_memory_id(&mem_id)
                                         .map(|s| profile.route_sessions.contains(&s))
                                         .unwrap_or(false);
@@ -1959,8 +1989,7 @@ fn retrieval_ann(s: &mut QueryPipelineState) {
                                         && !routed_match
                                         && hnsw_hits.len() < (query_limit.saturating_div(2).max(1))
                                     {
-                                        let similarity = (1.0f32 - *dist * 0.5f32).max(0.0f32);
-                                        if similarity < dedup_threshold {
+                                        if raw_similarity < dedup_threshold {
                                             continue;
                                         }
                                     }
@@ -2693,6 +2722,7 @@ fn score_loop(s: &mut QueryPipelineState) -> Vec<EvidenceCard> {
                 is_latest: false,
                 card_type: format!("{:?}", obs.kind),
                 final_score: fs,
+                inference_notes: None,
                 internal_kind: obs.kind,
                 created_at_ms,
                 entity_id: obs.entity_id.clone(),
@@ -2707,11 +2737,98 @@ fn score_build_response(s: &mut QueryPipelineState, mut evidence_cards: Vec<Evid
     (s.diag.hydrate_ms, s.diag.hydrate_us) = elapsed_ms_and_us(Instant::now());
 
     let stage_start = Instant::now();
+
+    // Pre-synthesized Phase 1: direct fact lookup.
+    // When the planner inferred a `fact_key` (e.g., "relationship_status",
+    // "purchase", "favorite_team") and we have an entity scope, attempt a
+    // deterministic lookup against the fact_versions table and inject the
+    // answer as a high-priority synthetic EvidenceCard so the reader LLM
+    // receives the fact verbatim at the top of its context.
+    if let (Some(ref fact_key), Some(ref entity_id)) =
+        (s.plan.fact_key.as_ref(), s.payload.entity_id.as_ref())
+    {
+        if let Ok(Some(fact_value)) = s.tenant.get_current_fact_value(entity_id, fact_key) {
+            let synthetic_score = 1.0e9_f32;
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let synthetic_id = format!("__pre_synth_fact::{}::{}", entity_id, fact_key);
+            evidence_cards.push(EvidenceCard {
+                claim_text: format!(
+                    "{}: {}",
+                    fact_key.replace('_', " "),
+                    fact_value
+                ),
+                source_memory_id: synthetic_id.clone(),
+                source_session_id: String::new(),
+                card_id: Some(synthetic_id),
+                semantic_rank: None,
+                semantic_score: synthetic_score,
+                bm25_rank: None,
+                bm25_score: 0.0,
+                session_router_rank: None,
+                session_router_score: 0.0,
+                card_score: 0.0,
+                reranker_score: synthetic_score,
+                entity_hits: 0,
+                lexical_hits: 0,
+                temporal_hits: 0,
+                facet_mask: 0,
+                graph_score: 0.0,
+                child_score: 0.0,
+                is_latest: true,
+                card_type: "PreSynthesizedFact".to_string(),
+                final_score: synthetic_score,
+                inference_notes: None,
+                internal_kind: MemoryKind::Fact,
+                created_at_ms: now_ms,
+                entity_id: entity_id.to_string(),
+            });
+            tracing::debug!(
+                entity_id = %entity_id,
+                fact_key = %fact_key,
+                "pre-synthesized fact lookup injected"
+            );
+        }
+    }
+
     evidence_cards.sort_by(|a, b| {
         b.final_score
             .partial_cmp(&a.final_score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+
+    // Ambiguity packet: when the top two candidates are nearly tied (e.g.
+    // "James" vs "John"), surface the close runner-up to the reader LLM via
+    // the top card's `inference_notes` so the model can disambiguate or
+    // ask the user. The threshold is loaded from `ranking_config.json` and
+    // propagated into `s.weights.ambiguity_delta_threshold` at construction.
+    if evidence_cards.len() >= 2 {
+        let top_score = evidence_cards[0].final_score;
+        let second_score = evidence_cards[1].final_score;
+        let delta = (top_score - second_score).abs();
+        if delta < s.weights.ambiguity_delta_threshold
+            && !evidence_cards[0]
+                .source_memory_id
+                .starts_with("__pre_synth_")
+        {
+            let note = format!(
+                "AmbiguityPacket: top-2 candidates are within {:.3} of each other ({} vs {}); consider asking the user to disambiguate.",
+                delta,
+                evidence_cards[0].source_memory_id,
+                evidence_cards[1].source_memory_id
+            );
+            if let Some(card) = evidence_cards.get_mut(0) {
+                if let Some(notes) = card.inference_notes.as_mut() {
+                    notes.push(note);
+                } else {
+                    card.inference_notes = Some(vec![note]);
+                }
+            }
+        }
+    }
+
     let selected = select_candidates_with_session_head(
         evidence_cards,
         s.limit,
@@ -2728,9 +2845,24 @@ fn score_build_response(s: &mut QueryPipelineState, mut evidence_cards: Vec<Evid
     let source_observations = s.tenant
         .get_observations_batch(&source_keys)
         .unwrap_or_default();
+    
+    let mut fact_memory_ids = Vec::new();
+    let mut card_ids = Vec::new();
+    for card in &selected {
+        if card.internal_kind == crate::storage::MemoryKind::Fact {
+            fact_memory_ids.push(card.source_memory_id.clone());
+        }
+        if let Some(ref cid) = card.card_id {
+            card_ids.push(cid.clone());
+        }
+    }
+    
+    let fact_versions = s.tenant.get_fact_versions_by_memory_ids(&fact_memory_ids).unwrap_or_default();
+    let memory_cards = s.tenant.get_memory_cards_batch(&card_ids).unwrap_or_default();
+
     (s.diag.hydrate_obs_ms, s.diag.hydrate_obs_us) = elapsed_ms_and_us(hydrate_obs_start);
 
-    let queries: Vec<QueryResult> = selected
+    let mut queries: Vec<QueryResult> = selected
         .into_iter()
         .map(|card| {
             let text =
@@ -2752,6 +2884,24 @@ fn score_build_response(s: &mut QueryPipelineState, mut evidence_cards: Vec<Evid
             } else {
                 None
             };
+            let mut fact_key = None;
+            let mut superseded_by = None;
+            if card.internal_kind == crate::storage::MemoryKind::Fact {
+                if let Some((fk, sup)) = fact_versions.get(&card.source_memory_id) {
+                    fact_key = Some(fk.clone());
+                    superseded_by = sup.clone();
+                }
+            }
+
+            let mut stability_score = None;
+            if let Some(ref cid) = card.card_id {
+                if let Some(mc) = memory_cards.get(cid) {
+                    if let Some(ref lc) = mc.lifecycle {
+                        stability_score = Some(lc.stability_score);
+                    }
+                }
+            }
+
             QueryResult {
                 memory_id: card.source_memory_id.clone(),
                 entity_id: card.entity_id,
@@ -2762,6 +2912,10 @@ fn score_build_response(s: &mut QueryPipelineState, mut evidence_cards: Vec<Evid
                 textual_content: text,
                 evidence,
                 inference_notes: None,
+                fact_key,
+                conflict_flag: Some(!card.is_latest),
+                superseded_by,
+                stability_score,
             }
         })
         .collect();
@@ -2770,6 +2924,43 @@ fn score_build_response(s: &mut QueryPipelineState, mut evidence_cards: Vec<Evid
     s.diag.abstain_recommended = evidence_conf < 0.24 && !queries.is_empty();
     (s.diag.session_ms, s.diag.session_us) = elapsed_ms_and_us(stage_start);
     (s.diag.total_ms, s.diag.total_us) = elapsed_ms_and_us(s.total_start);
+
+    // Pre-synthesized Phase 2: memory card as answer.
+    // If the top-ranked result is backed by a latest, high-confidence memory
+    // card, surface its claim_text as a synthetic answer row at position 0
+    // so the reader LLM receives the distilled claim verbatim.
+    if let Some(top) = queries.first() {
+        if !top.memory_id.starts_with("__pre_synth_") {
+            if let Ok(Some(card)) = s.tenant.get_memory_card_by_source(&top.memory_id) {
+                if card.is_latest && card.confidence >= 0.70 {
+                    let now_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let synthetic = QueryResult {
+                        memory_id: format!("__pre_synth_card::{}", card.card_id),
+                        entity_id: card.entity_id.clone(),
+                        session_id: card.source_session_id.clone(),
+                        turn_index: 0,
+                        created_at_ms: now_ms,
+                        similarity: 1.0,
+                        textual_content: format!("{}: {}", card.subject, card.object),
+                        evidence: None,
+                        inference_notes: Some(vec![format!(
+                            "Pre-synthesized from memory card {} (confidence {:.2})",
+                            card.card_id, card.confidence
+                        )]),
+                        fact_key: None,
+                        conflict_flag: Some(false),
+                        superseded_by: None,
+                        stability_score: None,
+                    };
+                    queries.insert(0, synthetic);
+                }
+            }
+        }
+    }
+
     queries
 }
 
@@ -2806,6 +2997,10 @@ pub fn execute_query_pipeline(
                 textual_content: "Graph inference conclusions derived from relationship patterns.".to_string(),
                 evidence: None,
                 inference_notes: Some(notes),
+                fact_key: None,
+                conflict_flag: None,
+                superseded_by: None,
+                stability_score: None,
             });
         }
     }

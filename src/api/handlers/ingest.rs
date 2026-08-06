@@ -439,7 +439,9 @@ fn expand_and_enrich_payloads(
 
         for chunked_payload in expand_payload_for_content_type(&payload) {
             expanded_payloads.push(chunked_payload.clone());
-            expanded_payloads.extend(build_companion_payloads(&chunked_payload));
+            if payload.enable_mining.unwrap_or(true) {
+                expanded_payloads.extend(build_companion_payloads(&chunked_payload));
+            }
         }
     }
 

@@ -42,6 +42,9 @@ pub struct ScoringWeights {
     /// Four-signal blend: weight of the temporal signal (0.0-1.0).
     /// Remaining weight goes to the legacy composite.
     pub four_signal_temporal_weight: f32,
+
+    /// Threshold for difference between top two candidates to determine ambiguity.
+    pub ambiguity_delta_threshold: f32,
 }
 
 impl Default for ScoringWeights {
@@ -57,6 +60,7 @@ impl Default for ScoringWeights {
             route_boost_simple: 0.035,
             route_penalty: -0.008,
             four_signal_temporal_weight: 0.7,
+            ambiguity_delta_threshold: 0.08,
         }
     }
 }

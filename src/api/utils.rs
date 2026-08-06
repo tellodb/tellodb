@@ -46,7 +46,7 @@ pub fn env_bool(name: &str, default: bool) -> bool {
 }
 
 pub fn temporal_recency_scoring_enabled() -> bool {
-    env_bool("TEMPORAL_MEMORY_ENABLE_TEMPORAL_RECENCY_SCORING", false)
+    env_bool("TEMPORAL_MEMORY_ENABLE_TEMPORAL_RECENCY_SCORING", true)
 }
 
 pub fn scoped_semantic_top() -> usize {

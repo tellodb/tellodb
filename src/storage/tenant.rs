@@ -1782,6 +1782,37 @@ impl TenantStore {
         Ok(results)
     }
 
+    pub fn get_fact_versions_by_memory_ids(
+        &self,
+        memory_ids: &[String],
+    ) -> Result<HashMap<String, (String, Option<String>)>> {
+        if memory_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let conn = self.get_conn()?;
+        let placeholders: Vec<String> = memory_ids.iter().map(|_| "?".to_string()).collect();
+        let sql = format!(
+            "SELECT memory_id, fact_key, superseded_by FROM fact_versions WHERE memory_id IN ({})",
+            placeholders.join(",")
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            memory_ids.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
+        let rows = stmt.query_map(param_refs.as_slice(), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        let mut result = HashMap::new();
+        for row in rows {
+            let (memory_id, fact_key, superseded_by) = row?;
+            result.insert(memory_id, (fact_key, superseded_by));
+        }
+        Ok(result)
+    }
+
     // ── Fact Versions ──
 
     pub fn register_fact_versions_batch(
@@ -1856,6 +1887,31 @@ impl TenantStore {
         }
         tx.commit()?;
         Ok(statuses)
+    }
+
+    /// Direct fact lookup for pre-synthesized retrieval paths.
+    /// Returns the `object` column of the most recent current row in `fact_versions`
+    /// matching the given fact_key and entity_id.
+    pub fn get_current_fact_value(
+        &self,
+        entity_id: &str,
+        fact_key: &str,
+    ) -> Result<Option<String>> {
+        let conn = self.get_conn()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT object FROM fact_versions
+             WHERE fact_key = ?1 AND entity_id = ?2 AND status = 'current'
+             ORDER BY timestamp_ms DESC LIMIT 1",
+        )?;
+        let res = stmt.query_row(params![fact_key, entity_id], |row| {
+            row.get::<_, Option<String>>(0)
+        });
+        match res {
+            Ok(Some(value)) => Ok(Some(value)),
+            Ok(None) => Ok(None),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     // ── Core Profile ──
@@ -2642,6 +2698,59 @@ impl TenantStore {
 
     // ── Get memory cards batch ──
 
+    /// Look up the highest-confidence, most-recent memory card for a given
+    /// source memory_id. Returns the most recent `is_latest` card, or the
+    /// most recent card of any kind if no `is_latest` row exists.
+    pub fn get_memory_card_by_source(
+        &self,
+        source_memory_id: &str,
+    ) -> Result<Option<MemoryCard>> {
+        let conn = self.get_conn()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT card_id, entity_id, user_id, source_memory_id, source_session_id,
+                    subject, predicate, object, memory_text, card_type, confidence,
+                    is_latest, is_static, is_inference, expires_at, root_card_id, parent_card_id,
+                    lifecycle, created_at_ms, updated_at_ms
+             FROM memory_cards WHERE source_memory_id = ?1
+             ORDER BY is_latest DESC, updated_at_ms DESC LIMIT 1",
+        )?;
+        let res = stmt.query_row(params![source_memory_id], |row| {
+            Ok(MemoryCard {
+                card_id: row.get(0)?,
+                entity_id: row.get(1)?,
+                user_id: row.get(2)?,
+                source_memory_id: row.get(3)?,
+                source_session_id: row.get(4)?,
+                source_turn_index: 0,
+                document_time: 0,
+                conversation_time: 0,
+                event_time: None,
+                subject: row.get(5)?,
+                predicate: row.get(6)?,
+                object: row.get(7)?,
+                memory_text: row.get(8)?,
+                card_type: row.get(9)?,
+                confidence: row.get(10)?,
+                is_latest: row.get::<_, i32>(11)? != 0,
+                is_static: row.get::<_, i32>(12)? != 0,
+                is_inference: row.get::<_, i32>(13)? != 0,
+                expires_at: row.get(14)?,
+                root_card_id: row.get(15)?,
+                parent_card_id: row.get(16)?,
+                lifecycle: row
+                    .get::<_, Option<String>>(17)?
+                    .and_then(|s| serde_json::from_str(&s).ok()),
+                created_at_ms: row.get(18)?,
+                updated_at_ms: row.get(19)?,
+            })
+        });
+        match res {
+            Ok(card) => Ok(Some(card)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     pub fn get_memory_cards_batch(
         &self,
         card_ids: &[String],
@@ -3020,13 +3129,13 @@ mod tests {
         let store = TenantStore::new(&db_path).unwrap();
 
         let registrations1 = vec![
-            ("fact_key_1".to_string(), 100, "mem-100".to_string(), "Caroline".to_string(), "prefers".to_string(), "counseling".to_string())
+            ("fact_key_1", 100, "mem-100", "Caroline", "prefers", "counseling")
         ];
         let statuses1 = store.register_fact_versions_batch("Caroline", &registrations1).unwrap();
         assert_eq!(statuses1.len(), 1);
 
         let registrations2 = vec![
-            ("fact_key_1".to_string(), 200, "mem-200".to_string(), "Caroline".to_string(), "prefers".to_string(), "coaching".to_string())
+            ("fact_key_1", 200, "mem-200", "Caroline", "prefers", "coaching")
         ];
         let statuses2 = store.register_fact_versions_batch("Caroline", &registrations2).unwrap();
         assert_eq!(statuses2.len(), 1);
@@ -3079,13 +3188,13 @@ mod tests {
         let store = TenantStore::new(&db_path).unwrap();
 
         let registrations1 = vec![
-            ("pref_key_1".to_string(), 100, "mem-pref-1".to_string(), "Caroline".to_string(), "prefers".to_string(), "counseling".to_string())
+            ("pref_key_1", 100, "mem-pref-1", "Caroline", "prefers", "counseling")
         ];
         let statuses1 = store.register_fact_versions_batch("Caroline", &registrations1).unwrap();
         assert_eq!(statuses1.len(), 1);
 
         let registrations2 = vec![
-            ("pref_key_1".to_string(), 200, "mem-pref-2".to_string(), "Caroline".to_string(), "prefers".to_string(), "coaching".to_string())
+            ("pref_key_1", 200, "mem-pref-2", "Caroline", "prefers", "coaching")
         ];
         let statuses2 = store.register_fact_versions_batch("Caroline", &registrations2).unwrap();
         assert_eq!(statuses2.len(), 1);

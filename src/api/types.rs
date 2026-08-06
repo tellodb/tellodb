@@ -39,6 +39,8 @@ pub struct RankingConfig {
     pub stale_penalty: f32,
     /// Penalty subtracted when a result contradicts an existing fact. Default: -0.10
     pub contradiction_penalty: f32,
+    /// Threshold for difference between top two candidates. Default: 0.08
+    pub ambiguity_delta_threshold: Option<f32>,
 }
 
 impl Default for RankingConfig {
@@ -58,6 +60,7 @@ impl Default for RankingConfig {
             evidence_density_weight: 0.03,
             stale_penalty: -0.08,
             contradiction_penalty: -0.10,
+            ambiguity_delta_threshold: Some(0.08),
         }
     }
 }
@@ -86,6 +89,8 @@ pub struct EvidenceCard {
     pub is_latest: bool,
     pub card_type: String,
     pub final_score: f32,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub inference_notes: Option<Vec<String>>,
     // Internal fields for hydration
     #[serde(skip)]
     pub internal_kind: crate::storage::MemoryKind,
@@ -149,6 +154,12 @@ pub struct IngestPayload {
     pub enable_semantic_dedup: Option<bool>,
     /// Optional benchmark override. Defaults to true in production.
     pub enable_consolidation: Option<bool>,
+    /// Optional benchmark override. Defaults to true in production.
+    /// When false, the NER/companion pipeline (canonical facts, session summaries,
+    /// relation companions, event memories) is skipped — only the raw payload
+    /// is stored. This shrinks the surface area for tests that don't need
+    /// derived structures.
+    pub enable_mining: Option<bool>,
     /// Optional content type hint for ingest chunking.
     pub content_type: Option<String>,
     /// Optional fact semantics metadata.
@@ -218,6 +229,14 @@ pub struct QueryResult {
     pub evidence: Option<ProofPacket>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inference_notes: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fact_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conflict_flag: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stability_score: Option<f32>,
 }
 
 /// Proof packet for evidence-verified query responses.

@@ -144,5 +144,6 @@ pub fn build_query_plan(query: &str, classifier: Option<&QueryIntentClassifier>)
         needs_decomposition,
         coverage_mode,
         ordinal_rank,
+        fact_key: slot_key,
     }
 }

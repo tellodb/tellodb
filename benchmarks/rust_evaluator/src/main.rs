@@ -131,9 +131,9 @@ JSON:";
 
 const ANSWER_VERIFY_PROMPT: &str = "\
 You are validating a candidate answer against evidence.\n\
-If the candidate is correct and fully supported, reply exactly PASS.\n\
-If the candidate is incorrect but evidence supports a short corrected answer, reply exactly CORRECT: <answer>.\n\
-If evidence is insufficient, reply exactly IDK.\n\n\
+If the candidate is correct and fully supported, reply exactly PASS.
+If the candidate is incorrect but evidence supports a short corrected answer, reply exactly CORRECT: <answer>.
+If the candidate attempts a partial guess that is not fully supported, or if evidence is insufficient, reply exactly IDK.\n\n\
 Question: {question}\n\
 Candidate: {candidate}\n\
 Evidence:\n{evidence}\n\
@@ -382,6 +382,7 @@ struct IngestPayload<'a> {
     relations: Vec<(&'a str, &'a str, &'a str)>,
     enable_semantic_dedup: bool,
     enable_consolidation: bool,
+    enable_mining: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -395,6 +396,8 @@ struct QueryPayload<'a> {
     limit: usize,
     entity_id: Option<&'a str>,
     enable_neural_rerank: bool,
+    include_evidence: Option<bool>,
+    proof_mode: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -1390,16 +1393,18 @@ async fn process_question_llm(
     gold_rank_writer: &Arc<std::sync::Mutex<Option<BufWriter<File>>>>,
 ) -> Result<QuestionResult> {
     let display_index = i;
-    println!(
-        "\n--- Question {}/{} [{}] ---",
+    let mut log_output = String::new();
+    log_output.push_str(&format!(
+        "\n--- Question {}/{} [{}] ---\n",
         display_index + 1,
         max_questions,
         eval_question_id
-    );
-    println!("Q: {}", instance.question);
+    ));
+    log_output.push_str(&format!("Q: {}\n", instance.question));
 
     if instance.haystack_sessions.is_empty() {
-        println!("Skipping empty haystack");
+        log_output.push_str("Skipping empty haystack\n");
+        print!("{}", log_output);
         if let Ok(mut g) = totals.lock() {
             g.skipped += 1;
         }
@@ -1407,7 +1412,7 @@ async fn process_question_llm(
     }
 
     let total_start = Instant::now();
-    println!("Reusing indexed conversation for entity {}", entity_id);
+    log_output.push_str(&format!("Reusing indexed conversation for entity {}\n", entity_id));
     let ingest_ms: u128 = 0;
 
     let query_start = Instant::now();
@@ -1469,7 +1474,8 @@ async fn process_question_llm(
     }
 
     if packed_sessions.is_empty() {
-        println!("No packed session context retrieved");
+        log_output.push_str("No packed session context retrieved\n");
+        print!("{}", log_output);
         anyhow::bail!("no packed context");
     }
 
@@ -1600,11 +1606,11 @@ async fn process_question_llm(
         }
     }
 
-    println!("{retrieval_symbol} | {answer_symbol}");
-    println!("Predicted: {}", truncate_chars(&prediction_for_judge, 160));
-    println!("Ground truth: {}", truncate_chars(&ground_truth, 160));
-    println!(
-        "timings: ingest={}ms | query={}ms (plan={} route={} embed={} ann={} rerank={} fts={} card={} pref={} graph={} session={} fuse={} hydrate={} hyd_obs={} trace={} visible={} other={} total={}) | pack={}ms | answer={}ms | judge={}ms",
+    log_output.push_str(&format!("{retrieval_symbol} | {answer_symbol}\n"));
+    log_output.push_str(&format!("Predicted: {}\n", truncate_chars(&prediction_for_judge, 160)));
+    log_output.push_str(&format!("Ground truth: {}\n", truncate_chars(&ground_truth, 160)));
+    log_output.push_str(&format!(
+        "timings: ingest={}ms | query={}ms (plan={} route={} embed={} ann={} rerank={} fts={} card={} pref={} graph={} session={} fuse={} hydrate={} hyd_obs={} trace={} visible={} other={} total={}) | pack={}ms | answer={}ms | judge={}ms\n",
         ingest_ms,
         query_ms,
         query.timings.planning_ms,
@@ -1627,9 +1633,9 @@ async fn process_question_llm(
         pack_ms,
         answer_ms,
         judge_ms,
-    );
-    println!(
-        "routing: routed_sessions={} cards={} events={} shadows={} facets={} scenes={} scoped_ann_attempts={} scoped_primary_hits={}",
+    ));
+    log_output.push_str(&format!(
+        "routing: routed_sessions={} cards={} events={} shadows={} facets={} scenes={} scoped_ann_attempts={} scoped_primary_hits={}\n",
         query.timings.routed_sessions,
         query.timings.memory_card_hits,
         query.timings.temporal_event_hits,
@@ -1638,7 +1644,7 @@ async fn process_question_llm(
         query.timings.mem_scene_hits,
         query.timings.scoped_ann_attempts,
         query.timings.scoped_primary_hits,
-    );
+    ));
 
     let (recall_pct, accuracy_pct) = {
         let g = totals.lock().expect("totals poisoned");
@@ -1646,17 +1652,19 @@ async fn process_question_llm(
         let a = g.answer_correct as f64 / g.evaluated.max(1) as f64 * 100.0;
         (r, a)
     };
-    println!(
-        "📊 STATUS: [ {}/{} ] | Recall: {:.1}% | Accuracy: {:.1}%",
+    log_output.push_str(&format!(
+        "📊 STATUS: [ {}/{} ] | Recall: {:.1}% | Accuracy: {:.1}%\n",
         display_index + 1,
         max_questions,
         recall_pct,
         accuracy_pct
-    );
-    println!(
-        "📈 MemScore: {:.1}% / {:.1}% / {}ms / {}tok",
+    ));
+    log_output.push_str(&format!(
+        "📈 MemScore: {:.1}% / {:.1}% / {}ms / {}tok\n",
         recall_pct, accuracy_pct, query_ms, context_tokens,
-    );
+    ));
+
+    print!("{}", log_output);
 
     Ok(QuestionResult {
         question_id: eval_question_id.to_string(),
@@ -1773,6 +1781,7 @@ async fn ingest_instance(
                 relations: vec![("", "BELONGS_TO", q_id)],
                 enable_semantic_dedup: config.enable_semantic_dedup,
                 enable_consolidation: config.enable_consolidation,
+                enable_mining: true,
             };
             payloads.push(payload);
         }
@@ -1881,6 +1890,8 @@ async fn query_engine(
         limit: config.top_k * 6,
         entity_id: Some(q_id),
         enable_neural_rerank: config.enable_neural_rerank,
+        include_evidence: Some(true),
+        proof_mode: Some("light".to_string()),
     };
 
     let response = with_engine_auth(
@@ -4036,6 +4047,9 @@ fn is_idk_answer(prediction: &str) -> bool {
     cleaned == "i don't know"
         || cleaned == "i do not know"
         || cleaned == "idk"
+        || cleaned == "unknown"
+        || cleaned == "i'm not sure"
+        || cleaned == "there is no information"
         || cleaned.starts_with("i don't know ")
         || cleaned.starts_with("i do not know ")
         || cleaned.starts_with("idk ")

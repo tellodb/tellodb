@@ -19,6 +19,9 @@ pub struct QueryPlan {
     pub needs_decomposition: bool,
     pub coverage_mode: bool,
     pub ordinal_rank: Option<usize>,
+    /// Inferred fact_key for direct fact lookup pre-synthesized paths.
+    /// Populated from `infer_query_fact_key(query)` in the planner.
+    pub fact_key: Option<String>,
 }
 
 #[derive(Debug, Clone)]
