@@ -52,9 +52,12 @@ The setup script installs CUDA 12.6, cuDNN 9, TensorRT 10 runtime libraries, Rus
 
 ```bash
 cd /root/Tellodb
+# Linux with TensorRT:
 cargo run --release --features gpu-tensorrt
+# Linux with CUDA:
 cargo run --release --features gpu-cuda
-TEMPORAL_MEMORY_DEVICE=metal TEMPORAL_MEMORY_API_KEY=XXX1111AAA cargo run --features gpu-metal --release
+# macOS with CoreML:
+cargo run --release --features coreml
 ```
 
 Warm up before benchmarking. TensorRT may spend the first run building engines and cache files.

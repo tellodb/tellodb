@@ -15,10 +15,10 @@ use crate::api::auth::{
 use crate::api::ingest_utils::*;
 use crate::api::types::{BatchIngestPayload, IngestPayload};
 use crate::api::utils::*;
-use crate::ml::cosine_similarity;
-use std::sync::Arc;
 use crate::api::{EngineState, PlatformWriteOp};
 use crate::graph::EdgeType;
+use crate::ml::cosine_similarity;
+use std::sync::Arc;
 
 type GraphEdgeRecord = crate::storage::GraphEdgeEntry<'static>;
 type EmbeddingPairSet = (Vec<(String, Vec<f32>)>, Vec<(String, Vec<f32>)>);
@@ -273,10 +273,7 @@ pub async fn ingest_handler(
 
     let mut payload = payload;
     payload.entity_id = scope_entity_id(&payload.entity_id, ns_prefix.as_deref());
-    if !payload
-        .memory_id
-        .starts_with(ns_prefix.as_deref().unwrap_or(""))
-    {
+    if !payload.memory_id.starts_with(ns_prefix.as_deref().unwrap_or("")) {
         if let Some(ref p) = ns_prefix {
             payload.memory_id = format!("{}{}", p, payload.memory_id);
         }
@@ -294,12 +291,7 @@ pub async fn ingest_handler(
         diag.derived_embed_ms,
         diag.derived_embed_us,
     );
-    insert_stage_timing_headers(
-        &mut headers,
-        "x-tm-storage",
-        diag.storage_ms,
-        diag.storage_us,
-    );
+    insert_stage_timing_headers(&mut headers, "x-tm-storage", diag.storage_ms, diag.storage_us);
     insert_stage_timing_headers(&mut headers, "x-tm-fts", diag.fts_ms, diag.fts_us);
     insert_stage_timing_headers(&mut headers, "x-tm-vector", diag.vector_ms, diag.vector_us);
     insert_stage_timing_headers(&mut headers, "x-tm-graph", diag.graph_ms, diag.graph_us);
@@ -348,10 +340,7 @@ pub async fn batch_ingest_handler(
     let mut payload = payload;
     for item in payload.items.iter_mut() {
         item.entity_id = scope_entity_id(&item.entity_id, ns_prefix.as_deref());
-        if !item
-            .memory_id
-            .starts_with(ns_prefix.as_deref().unwrap_or(""))
-        {
+        if !item.memory_id.starts_with(ns_prefix.as_deref().unwrap_or("")) {
             if let Some(ref p) = ns_prefix {
                 item.memory_id = format!("{}{}", p, item.memory_id);
             }
@@ -370,12 +359,7 @@ pub async fn batch_ingest_handler(
         diag.derived_embed_ms,
         diag.derived_embed_us,
     );
-    insert_stage_timing_headers(
-        &mut headers,
-        "x-tm-storage",
-        diag.storage_ms,
-        diag.storage_us,
-    );
+    insert_stage_timing_headers(&mut headers, "x-tm-storage", diag.storage_ms, diag.storage_us);
     insert_stage_timing_headers(&mut headers, "x-tm-fts", diag.fts_ms, diag.fts_us);
     insert_stage_timing_headers(&mut headers, "x-tm-vector", diag.vector_ms, diag.vector_us);
     insert_stage_timing_headers(&mut headers, "x-tm-graph", diag.graph_ms, diag.graph_us);
@@ -564,10 +548,8 @@ async fn generate_embeddings(
         let idx = *spec_to_idx.get(&spec).expect("embedding spec not found in index");
         // Use .get() instead of direct index to guard against any remaining
         // edge case where unique_embeddings is empty (all-empty batch etc.).
-        let embedding = unique_embeddings
-            .get(idx)
-            .cloned()
-            .unwrap_or_else(|| vec![0.0f32; embed_dim]);
+        let embedding =
+            unique_embeddings.get(idx).cloned().unwrap_or_else(|| vec![0.0f32; embed_dim]);
         semantic_embeddings.push(embedding);
     }
 
@@ -590,10 +572,14 @@ fn build_observations(
     for payload in expanded_payloads.into_iter() {
         let mut payload = payload;
         let kind = parse_kind(payload.kind.as_deref());
-        if (kind == MemoryKind::Preference || kind == MemoryKind::Decision || kind == MemoryKind::Fact)
+        if (kind == MemoryKind::Preference
+            || kind == MemoryKind::Decision
+            || kind == MemoryKind::Fact)
             && payload.fact_key.as_ref().map_or(true, |k| k.trim().is_empty())
         {
-            if let Some(inferred_key) = crate::api::plan::infer_query_fact_key(&payload.textual_content) {
+            if let Some(inferred_key) =
+                crate::api::plan::infer_query_fact_key(&payload.textual_content)
+            {
                 payload.fact_key = Some(inferred_key);
             }
         }
@@ -638,7 +624,8 @@ fn build_observations(
             semantic_seen.push((payload.entity_id.clone(), embedding.clone()));
         }
 
-        let hash = content_hash(&payload.textual_content, &payload.entity_id, &format!("{:?}", kind));
+        let hash =
+            content_hash(&payload.textual_content, &payload.entity_id, &format!("{:?}", kind));
         let obs = AgentObservation {
             entity_id: payload.entity_id.clone(),
             textual_content: payload.textual_content.clone(),
@@ -785,20 +772,23 @@ fn build_artifacts(
             }
         }
 
-            if let Some(source_memory_id) = record.payload.source_memory_id.as_deref() {
-                batches.memory_links_batch.push((
-                    record.payload.memory_id.clone(),
-                    source_memory_id.to_string(),
-                    EdgeType::DerivedFrom.as_str().to_string(),
-                ));
-                batches.memory_links_batch.push((
-                    source_memory_id.to_string(),
-                    record.payload.memory_id.clone(),
-                    EdgeType::DerivedVariant.as_str().to_string(),
-                ));
-            }
+        if let Some(source_memory_id) = record.payload.source_memory_id.as_deref() {
+            batches.memory_links_batch.push((
+                record.payload.memory_id.clone(),
+                source_memory_id.to_string(),
+                EdgeType::DerivedFrom.as_str().to_string(),
+            ));
+            batches.memory_links_batch.push((
+                source_memory_id.to_string(),
+                record.payload.memory_id.clone(),
+                EdgeType::DerivedVariant.as_str().to_string(),
+            ));
+        }
 
-        if record.obs.kind == MemoryKind::Fact || record.obs.kind == MemoryKind::Preference || record.obs.kind == MemoryKind::Decision {
+        if record.obs.kind == MemoryKind::Fact
+            || record.obs.kind == MemoryKind::Preference
+            || record.obs.kind == MemoryKind::Decision
+        {
             if let Some(fact_key) = record.payload.fact_key.as_deref() {
                 batches.fact_batch.push(FactRegistration {
                     entity_id: record.payload.entity_id.clone(),
@@ -1108,106 +1098,128 @@ async fn commit_batches(
         }
 
         let tenant_fact = tenant.clone();
-        let fact_side_effects: Vec<Result<FactSideEffects, StatusCode>> = tokio::task::spawn_blocking(move || {
-            by_entity
-                .into_iter()
-                .map(|(entity_id, registrations)| {
-                let mut se = FactSideEffects::default();
-                let items: Vec<(&str, u64, &str, &str, &str, &str)> = registrations
-                    .iter()
-                    .map(|r| {
-                        (
-                            r.fact_key.as_str(),
-                            r.timestamp,
-                            r.memory_id.as_str(),
-                            r.subject.as_str(),
-                            r.predicate.as_str(),
-                            r.object.as_str(),
-                        )
+        let fact_side_effects: Vec<Result<FactSideEffects, StatusCode>> =
+            tokio::task::spawn_blocking(move || {
+                by_entity
+                    .into_iter()
+                    .map(|(entity_id, registrations)| {
+                        let mut se = FactSideEffects::default();
+                        let items: Vec<(&str, u64, &str, &str, &str, &str)> = registrations
+                            .iter()
+                            .map(|r| {
+                                (
+                                    r.fact_key.as_str(),
+                                    r.timestamp,
+                                    r.memory_id.as_str(),
+                                    r.subject.as_str(),
+                                    r.predicate.as_str(),
+                                    r.object.as_str(),
+                                )
+                            })
+                            .collect();
+                        let statuses = tenant_fact
+                            .register_fact_versions_batch(&entity_id, &items)
+                            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+                        let mut graph_status_batch = Vec::new();
+
+                        for (status, reg) in statuses.iter().zip(registrations.iter()) {
+                            match status {
+                                FactVersionStatus::Current { superseded: Some((_, old_id)) } => {
+                                    se.card_updates.push((old_id.clone(), false, reg.timestamp));
+                                    se.card_updates.push((
+                                        reg.memory_id.clone(),
+                                        true,
+                                        reg.timestamp,
+                                    ));
+                                    se.card_relations.push((
+                                        old_id.clone(),
+                                        EdgeType::Updates.as_str().to_string(),
+                                        reg.memory_id.clone(),
+                                    ));
+                                    graph_status_batch.push(GraphEdgeEntry {
+                                        memory_id: reg.memory_id.as_str(),
+                                        subject: reg.subject.as_str(),
+                                        predicate: reg.predicate.as_str(),
+                                        object: reg.object.as_str(),
+                                        status: "current",
+                                        ref_info: Some((
+                                            EdgeType::Supersedes.as_str(),
+                                            old_id.as_str(),
+                                        )),
+                                        timestamp: reg.timestamp,
+                                    });
+                                    graph_status_batch.push(GraphEdgeEntry {
+                                        memory_id: old_id.as_str(),
+                                        subject: reg.subject.as_str(),
+                                        predicate: reg.predicate.as_str(),
+                                        object: reg.object.as_str(),
+                                        status: "stale",
+                                        ref_info: Some((
+                                            EdgeType::SupersededBy.as_str(),
+                                            reg.memory_id.as_str(),
+                                        )),
+                                        timestamp: reg.timestamp,
+                                    });
+                                }
+                                FactVersionStatus::Stale { current: (_, cur_id) } => {
+                                    se.card_updates.push((
+                                        reg.memory_id.clone(),
+                                        false,
+                                        reg.timestamp,
+                                    ));
+                                    se.card_relations.push((
+                                        reg.memory_id.clone(),
+                                        EdgeType::SupersededBy.as_str().to_string(),
+                                        cur_id.clone(),
+                                    ));
+                                    graph_status_batch.push(GraphEdgeEntry {
+                                        memory_id: reg.memory_id.as_str(),
+                                        subject: reg.subject.as_str(),
+                                        predicate: reg.predicate.as_str(),
+                                        object: reg.object.as_str(),
+                                        status: "stale",
+                                        ref_info: Some((
+                                            EdgeType::SupersededBy.as_str(),
+                                            cur_id.as_str(),
+                                        )),
+                                        timestamp: reg.timestamp,
+                                    });
+                                }
+                                FactVersionStatus::Current { superseded: None } => {
+                                    se.card_updates.push((
+                                        reg.memory_id.clone(),
+                                        true,
+                                        reg.timestamp,
+                                    ));
+                                    graph_status_batch.push(GraphEdgeEntry {
+                                        memory_id: reg.memory_id.as_str(),
+                                        subject: reg.subject.as_str(),
+                                        predicate: reg.predicate.as_str(),
+                                        object: reg.object.as_str(),
+                                        status: "current",
+                                        ref_info: None,
+                                        timestamp: reg.timestamp,
+                                    });
+                                }
+                            }
+                        }
+
+                        if !graph_status_batch.is_empty() {
+                            tenant_fact
+                                .graph_upsert_fact_status_batch(&entity_id, &graph_status_batch)
+                                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                        }
+
+                        Ok(se)
                     })
-                    .collect();
-                let statuses = tenant_fact
-                    .register_fact_versions_batch(&entity_id, &items)
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-                let mut graph_status_batch = Vec::new();
-
-                for (status, reg) in statuses.iter().zip(registrations.iter()) {
-                    match status {
-                        FactVersionStatus::Current { superseded: Some((_, old_id)) } => {
-                            se.card_updates.push((old_id.clone(), false, reg.timestamp));
-                            se.card_updates.push((reg.memory_id.clone(), true, reg.timestamp));
-                            se.card_relations.push((
-                                old_id.clone(),
-                                EdgeType::Updates.as_str().to_string(),
-                                reg.memory_id.clone(),
-                            ));
-                            graph_status_batch.push(GraphEdgeEntry {
-                                memory_id: reg.memory_id.as_str(),
-                                subject: reg.subject.as_str(),
-                                predicate: reg.predicate.as_str(),
-                                object: reg.object.as_str(),
-                                status: "current",
-                                ref_info: Some((EdgeType::Supersedes.as_str(), old_id.as_str())),
-                                timestamp: reg.timestamp,
-                            });
-                            graph_status_batch.push(GraphEdgeEntry {
-                                memory_id: old_id.as_str(),
-                                subject: reg.subject.as_str(),
-                                predicate: reg.predicate.as_str(),
-                                object: reg.object.as_str(),
-                                status: "stale",
-                                ref_info: Some((EdgeType::SupersededBy.as_str(), reg.memory_id.as_str())),
-                                timestamp: reg.timestamp,
-                            });
-                        }
-                        FactVersionStatus::Stale { current: (_, cur_id) } => {
-                            se.card_updates.push((reg.memory_id.clone(), false, reg.timestamp));
-                            se.card_relations.push((
-                                reg.memory_id.clone(),
-                                EdgeType::SupersededBy.as_str().to_string(),
-                                cur_id.clone(),
-                            ));
-                            graph_status_batch.push(GraphEdgeEntry {
-                                memory_id: reg.memory_id.as_str(),
-                                subject: reg.subject.as_str(),
-                                predicate: reg.predicate.as_str(),
-                                object: reg.object.as_str(),
-                                status: "stale",
-                                ref_info: Some((EdgeType::SupersededBy.as_str(), cur_id.as_str())),
-                                timestamp: reg.timestamp,
-                            });
-                        }
-                        FactVersionStatus::Current { superseded: None } => {
-                            se.card_updates.push((reg.memory_id.clone(), true, reg.timestamp));
-                            graph_status_batch.push(GraphEdgeEntry {
-                                memory_id: reg.memory_id.as_str(),
-                                subject: reg.subject.as_str(),
-                                predicate: reg.predicate.as_str(),
-                                object: reg.object.as_str(),
-                                status: "current",
-                                ref_info: None,
-                                timestamp: reg.timestamp,
-                            });
-                        }
-                    }
-                }
-
-                if !graph_status_batch.is_empty() {
-                    tenant_fact
-                        .graph_upsert_fact_status_batch(&entity_id, &graph_status_batch)
-                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-                }
-
-                Ok(se)
+                    .collect()
             })
-            .collect()
-        })
-        .await
-        .map_err(|e| {
-            tracing::error!("fact supersession spawn panic: {:?}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+            .await
+            .map_err(|e| {
+                tracing::error!("fact supersession spawn panic: {:?}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
 
         for result in fact_side_effects {
             match result {
@@ -1308,10 +1320,8 @@ fn build_memory_card_from_payload(
     kind: MemoryKind,
     lifecycle: &LifecycleMetadata,
 ) -> Option<MemoryCard> {
-    let source_memory_id = payload
-        .source_memory_id
-        .clone()
-        .unwrap_or_else(|| payload.memory_id.clone());
+    let source_memory_id =
+        payload.source_memory_id.clone().unwrap_or_else(|| payload.memory_id.clone());
     let source_session_id = session_id_from_memory_id(&source_memory_id)
         .or_else(|| session_id_from_memory_id(&payload.memory_id))
         .unwrap_or_default();
@@ -1327,9 +1337,7 @@ fn build_memory_card_from_payload(
         .fact_subject
         .clone()
         .or_else(|| {
-            extract_named_phrases(std::slice::from_ref(&payload.textual_content))
-                .into_iter()
-                .next()
+            extract_named_phrases(std::slice::from_ref(&payload.textual_content)).into_iter().next()
         })
         .unwrap_or_else(|| payload.entity_id.clone());
     let predicate = payload
@@ -1344,15 +1352,9 @@ fn build_memory_card_from_payload(
             MemoryKind::Fact => "states".to_string(),
             MemoryKind::Conversational => "mentions".to_string(),
         });
-    let object = payload
-        .fact_object
-        .clone()
-        .unwrap_or_else(|| truncate_router_value(&memory_text, 320));
-    let operation = payload
-        .fact_operation
-        .as_deref()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+    let object =
+        payload.fact_object.clone().unwrap_or_else(|| truncate_router_value(&memory_text, 320));
+    let operation = payload.fact_operation.as_deref().unwrap_or_default().to_ascii_lowercase();
     let confidence = payload
         .fact_confidence
         .unwrap_or(match kind {
@@ -1451,10 +1453,7 @@ fn build_session_router_update_from_payload(
     let dialogue_texts = if dialogue.is_empty() {
         vec![payload.textual_content.clone()]
     } else {
-        dialogue
-            .iter()
-            .map(|(speaker, line)| format!("{speaker}: {line}"))
-            .collect::<Vec<_>>()
+        dialogue.iter().map(|(speaker, line)| format!("{speaker}: {line}")).collect::<Vec<_>>()
     };
     let speakers = dedupe_preserve_order(
         dialogue
@@ -1471,10 +1470,7 @@ fn build_session_router_update_from_payload(
     let mut canonical_facts = Vec::new();
     let mut events = Vec::new();
     let mut preference_signals = Vec::new();
-    if matches!(
-        kind,
-        MemoryKind::Fact | MemoryKind::Decision | MemoryKind::Lesson
-    ) {
+    if matches!(kind, MemoryKind::Fact | MemoryKind::Decision | MemoryKind::Lesson) {
         canonical_facts.push(compact_text.clone());
     }
     if matches!(kind, MemoryKind::Preference)
@@ -1484,11 +1480,9 @@ fn build_session_router_update_from_payload(
     }
     if extract_event_time_ms(&payload.textual_content, document_time_ms).is_some()
         || !extract_temporal_terms(&payload.textual_content).is_empty()
-        || [
-            "went", "visited", "watched", "joined", "started", "finished", "won", "bought",
-        ]
-        .iter()
-        .any(|needle| lower.contains(needle))
+        || ["went", "visited", "watched", "joined", "started", "finished", "won", "bought"]
+            .iter()
+            .any(|needle| lower.contains(needle))
     {
         events.push(compact_text.clone());
     }
@@ -1521,11 +1515,7 @@ fn truncate_router_value(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         text.to_string()
     } else {
-        text.chars()
-            .take(max_chars)
-            .collect::<String>()
-            .trim()
-            .to_string()
+        text.chars().take(max_chars).collect::<String>().trim().to_string()
     }
 }
 
@@ -1610,10 +1600,7 @@ fn build_temporal_event_from_payload(
         source_session_id,
         source_memory_id: payload.memory_id.clone(),
         source_turn_index: turn_index_from_memory_id(&payload.memory_id),
-        subject: people
-            .first()
-            .cloned()
-            .unwrap_or_else(|| payload.entity_id.clone()),
+        subject: people.first().cloned().unwrap_or_else(|| payload.entity_id.clone()),
         relation,
         object: terms.first().cloned(),
         participants: people.clone(),
@@ -1643,10 +1630,7 @@ fn build_shadow_questions_from_payload(
 ) -> Vec<ShadowQuestion> {
     let source_session_id = session_id_from_memory_id(&payload.memory_id).unwrap_or_default();
     let people = extract_named_phrases(std::slice::from_ref(&payload.textual_content));
-    let subject = people
-        .first()
-        .cloned()
-        .unwrap_or_else(|| payload.entity_id.clone());
+    let subject = people.first().cloned().unwrap_or_else(|| payload.entity_id.clone());
     let terms = extract_salient_terms(&payload.textual_content, 6);
     let lower = payload.textual_content.to_ascii_lowercase();
     let answer_type = infer_shadow_answer_type(kind, &lower);
@@ -1655,10 +1639,7 @@ fn build_shadow_questions_from_payload(
         if question.trim().len() < 12 {
             return;
         }
-        if questions
-            .iter()
-            .any(|existing: &ShadowQuestion| existing.question_text == question)
-        {
+        if questions.iter().any(|existing: &ShadowQuestion| existing.question_text == question) {
             return;
         }
         let idx = questions.len();
@@ -1733,10 +1714,7 @@ fn build_shadow_questions_from_payload(
     if lower.contains("decided") || matches!(kind, MemoryKind::Decision) {
         push_question(format!("What did {subject} decide?"));
     }
-    if matches!(
-        kind,
-        MemoryKind::Fact | MemoryKind::Preference | MemoryKind::Decision
-    ) {
+    if matches!(kind, MemoryKind::Fact | MemoryKind::Preference | MemoryKind::Decision) {
         push_question(format!("What fact is known about {subject}?"));
     }
     questions.into_iter().take(12).collect()
@@ -1767,12 +1745,7 @@ fn build_facet_postings_from_payload(
             entity_id: payload.entity_id.clone(),
             facet_type: facet_type.to_string(),
             facet_value: value,
-            target_id: format!(
-                "facet::{}::{}::{}",
-                facet_type,
-                payload.memory_id,
-                postings.len()
-            ),
+            target_id: format!("facet::{}::{}::{}", facet_type, payload.memory_id, postings.len()),
             target_type: "memory".to_string(),
             session_id: session_id.clone(),
             memory_id: Some(payload.memory_id.clone()),
@@ -1792,25 +1765,13 @@ fn build_facet_postings_from_payload(
         || lower.contains("favorite")
         || lower.contains("prefers")
     {
-        push(
-            "preference",
-            normalize_fact_text(&payload.textual_content),
-            0.88,
-        );
+        push("preference", normalize_fact_text(&payload.textual_content), 0.88);
     }
     if matches!(kind, MemoryKind::Decision) || lower.contains("decided") {
-        push(
-            "decision",
-            normalize_fact_text(&payload.textual_content),
-            0.82,
-        );
+        push("decision", normalize_fact_text(&payload.textual_content), 0.82);
     }
     if lower.contains("how many") || lower.contains("number") || lower.contains("count") {
-        push(
-            "number",
-            normalize_fact_text(&payload.textual_content),
-            0.70,
-        );
+        push("number", normalize_fact_text(&payload.textual_content), 0.70);
     }
     for term in extract_temporal_terms(&payload.textual_content) {
         push("date", term, 0.78);
@@ -1841,9 +1802,7 @@ fn build_mem_cell_from_payload(
         subjects: people.clone(),
         objects: terms.clone(),
         activities: terms,
-        places: infer_place_hint(&payload.textual_content)
-            .into_iter()
-            .collect(),
+        places: infer_place_hint(&payload.textual_content).into_iter().collect(),
         document_time_ms,
         event_time_ms: extract_event_time_ms(&payload.textual_content, document_time_ms),
         confidence: 0.78,
@@ -1864,33 +1823,18 @@ fn build_mem_scene_from_payload(
     if terms.is_empty() && people.is_empty() {
         return None;
     }
-    let scene_key = terms
-        .iter()
-        .take(3)
-        .cloned()
-        .collect::<Vec<_>>()
-        .join("_")
-        .replace(' ', "_");
+    let scene_key = terms.iter().take(3).cloned().collect::<Vec<_>>().join("_").replace(' ', "_");
     Some(MemSceneRecord {
         scene_id: format!(
             "scene::{}::{}",
             source_session_id,
-            if scene_key.is_empty() {
-                "general"
-            } else {
-                scene_key.as_str()
-            }
+            if scene_key.is_empty() { "general" } else { scene_key.as_str() }
         ),
         entity_id: payload.entity_id.clone(),
         scene_title: if terms.is_empty() {
             format!("{} session context", source_session_id)
         } else {
-            terms
-                .iter()
-                .take(4)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(" / ")
+            terms.iter().take(4).cloned().collect::<Vec<_>>().join(" / ")
         },
         scene_summary: truncate_router_value(&normalize_fact_text(&payload.textual_content), 520),
         source_cell_ids: vec![format!("cell::{}", payload.memory_id)],
@@ -1898,9 +1842,7 @@ fn build_mem_scene_from_payload(
         entities: people,
         activities: terms.clone(),
         objects: terms,
-        places: infer_place_hint(&payload.textual_content)
-            .into_iter()
-            .collect(),
+        places: infer_place_hint(&payload.textual_content).into_iter().collect(),
         time_range_ms: Some((payload.timestamp, payload.timestamp)),
         scene_type: card_type_for_kind(kind, &payload.textual_content),
         saliency: compute_memory_saliency(&payload.textual_content, kind),
@@ -1974,10 +1916,7 @@ fn infer_event_relation(lower: &str, terms: &[String]) -> String {
             return relation.to_string();
         }
     }
-    terms
-        .first()
-        .cloned()
-        .unwrap_or_else(|| "event".to_string())
+    terms.first().cloned().unwrap_or_else(|| "event".to_string())
 }
 
 fn infer_place_hint(text: &str) -> Option<String> {
@@ -2054,10 +1993,7 @@ fn compute_memory_saliency(text: &str, kind: MemoryKind) -> f32 {
     if life_event {
         score += 0.25;
     }
-    if matches!(
-        kind,
-        MemoryKind::Fact | MemoryKind::Preference | MemoryKind::Decision
-    ) {
+    if matches!(kind, MemoryKind::Fact | MemoryKind::Preference | MemoryKind::Decision) {
         score += 0.15;
     }
     score.min(1.0)
@@ -2091,10 +2027,9 @@ fn mine_hard_negative_profiles(
                 if candidate_mid == record.memory_id {
                     continue;
                 }
-                if let (Some(a), Some(b)) = (
-                    current_session.as_ref(),
-                    session_id_from_memory_id(&candidate_mid).as_ref(),
-                ) {
+                if let (Some(a), Some(b)) =
+                    (current_session.as_ref(), session_id_from_memory_id(&candidate_mid).as_ref())
+                {
                     if a == b {
                         continue;
                     }
@@ -2107,23 +2042,21 @@ fn mine_hard_negative_profiles(
                 *candidate_scores.entry(candidate_mid).or_insert(0.0) += similarity * 0.75;
             }
 
-            let fts_hits = tenant.fts_search(&record.textual_content, 8, Some(&record.entity_id))
+            let fts_hits = tenant
+                .fts_search(&record.textual_content, 8, Some(&record.entity_id))
                 .unwrap_or_default();
             for (rank, (memory_id, lexical_score)) in fts_hits.into_iter().enumerate() {
                 if memory_id == record.memory_id {
                     continue;
                 }
-                if let (Some(a), Some(b)) = (
-                    current_session.as_ref(),
-                    session_id_from_memory_id(&memory_id).as_ref(),
-                ) {
+                if let (Some(a), Some(b)) =
+                    (current_session.as_ref(), session_id_from_memory_id(&memory_id).as_ref())
+                {
                     if a == b {
                         continue;
                     }
                 }
-                if let Some((ts, _)) = tenant.lookup_by_memory_id(&memory_id)
-                    .unwrap_or(None)
-                {
+                if let Some((ts, _)) = tenant.lookup_by_memory_id(&memory_id).unwrap_or(None) {
                     candidate_keys.entry(memory_id.clone()).or_insert(ts);
                     *candidate_scores.entry(memory_id).or_insert(0.0) +=
                         lexical_score.min(1.5) / 1.5 * 0.25 - rank as f32 * 0.01;
@@ -2142,9 +2075,7 @@ fn mine_hard_negative_profiles(
             let obs_keys: Vec<(u64, String)> = ranked_candidates
                 .iter()
                 .filter_map(|(memory_id, _)| {
-                    candidate_keys
-                        .get(memory_id)
-                        .map(|ts| (*ts, memory_id.clone()))
+                    candidate_keys.get(memory_id).map(|ts| (*ts, memory_id.clone()))
                 })
                 .collect();
             let observations = ok_or_500(tenant.get_observations_batch(&obs_keys))?;
@@ -2176,11 +2107,7 @@ fn mine_hard_negative_profiles(
             for (cur, neg) in record.embedding.iter().zip(centroid.iter()) {
                 disambiguation.push(cur - neg);
             }
-            let norm = disambiguation
-                .iter()
-                .map(|value| value * value)
-                .sum::<f32>()
-                .sqrt();
+            let norm = disambiguation.iter().map(|value| value * value).sum::<f32>().sqrt();
             if norm <= 1e-6 {
                 return Ok(None);
             }
@@ -2226,15 +2153,12 @@ fn build_retrospective_links(
         let mut timestamp_by_memory: std::collections::HashMap<String, u64> =
             std::collections::HashMap::new();
 
-        let fts_hits = tenant.fts_search(reference_query, 8, Some(entity_id))
-            .unwrap_or_default();
+        let fts_hits = tenant.fts_search(reference_query, 8, Some(entity_id)).unwrap_or_default();
         for (rank, (memory_id, lexical_score)) in fts_hits.into_iter().enumerate() {
             if memory_id == *current_memory_id || memory_id == *source_memory_id {
                 continue;
             }
-            if let Some((ts, _)) = tenant.lookup_by_memory_id(&memory_id)
-                .unwrap_or(None)
-            {
+            if let Some((ts, _)) = tenant.lookup_by_memory_id(&memory_id).unwrap_or(None) {
                 timestamp_by_memory.insert(memory_id.clone(), ts);
                 *score_by_memory.entry(memory_id).or_insert(0.0) +=
                     0.45 + lexical_score.min(1.0) * 0.10 - rank as f32 * 0.02;
@@ -2242,11 +2166,7 @@ fn build_retrospective_links(
         }
 
         let query_embedding = ok_or_500(state.semantic.generate_query_embedding(reference_query))?;
-        let ann_hits = ok_or_500(
-            state
-                .vector_index
-                .search(Some(entity_id), &query_embedding, 10),
-        )?;
+        let ann_hits = ok_or_500(state.vector_index.search(Some(entity_id), &query_embedding, 10))?;
         let ann_ids: Vec<u64> = ann_hits.iter().map(|(vid, _)| *vid).collect();
         let ann_lookup = ok_or_500(tenant.lookup_by_vector_ids_batch(&ann_ids))?;
         for (rank, ((_, dist), maybe_lookup)) in
@@ -2274,11 +2194,13 @@ fn build_retrospective_links(
                 .unwrap_or(false)
         }) {
             if score >= 0.55 {
-                let target_text = tenant.lookup_by_memory_id(&target_memory_id)
+                let target_text = tenant
+                    .lookup_by_memory_id(&target_memory_id)
                     .ok()
                     .flatten()
                     .and_then(|(ts, _)| {
-                        tenant.get_observation(ts, &target_memory_id)
+                        tenant
+                            .get_observation(ts, &target_memory_id)
                             .ok()
                             .flatten()
                             .map(|obs| obs.textual_content)
@@ -2288,21 +2210,12 @@ fn build_retrospective_links(
                     current_text,
                     &target_text,
                     *current_timestamp,
-                    timestamp_by_memory
-                        .get(&target_memory_id)
-                        .copied()
-                        .unwrap_or(0),
+                    timestamp_by_memory.get(&target_memory_id).copied().unwrap_or(0),
                 );
-                let forward = (
-                    source_memory_id.clone(),
-                    target_memory_id.clone(),
-                    forward_type.to_string(),
-                );
-                let reverse = (
-                    target_memory_id.clone(),
-                    source_memory_id.clone(),
-                    reverse_type.to_string(),
-                );
+                let forward =
+                    (source_memory_id.clone(), target_memory_id.clone(), forward_type.to_string());
+                let reverse =
+                    (target_memory_id.clone(), source_memory_id.clone(), reverse_type.to_string());
                 if seen.insert(forward.clone()) {
                     links.push(forward);
                 }
@@ -2324,14 +2237,7 @@ fn classify_retrospective_link(
 ) -> (&'static str, &'static str) {
     let current_lower = current_text.to_ascii_lowercase();
     let target_lower = target_text.to_ascii_lowercase();
-    let contradiction_markers = [
-        "actually",
-        "turns out",
-        "not ",
-        "never ",
-        "instead",
-        "wrong",
-    ];
+    let contradiction_markers = ["actually", "turns out", "not ", "never ", "instead", "wrong"];
     if contradiction_markers
         .iter()
         .any(|marker| current_lower.contains(marker) && !target_lower.contains(marker))
@@ -2349,10 +2255,8 @@ fn classify_retrospective_link(
 
     let current_entities = extract_named_phrases(&[current_text.to_string()]);
     let target_entities = extract_named_phrases(&[target_text.to_string()]);
-    let current_only = current_entities
-        .iter()
-        .filter(|entity| !target_entities.contains(entity))
-        .count();
+    let current_only =
+        current_entities.iter().filter(|entity| !target_entities.contains(entity)).count();
     if current_only >= 1 || current_timestamp > target_timestamp {
         return ("extends", "extended_by");
     }
@@ -2375,7 +2279,8 @@ fn update_core_profile_heuristic(tenant: &TenantStore, task: &ConsolidationTask)
         return;
     }
 
-    let mut profile = tenant.get_core_profile(&task.entity_id)
+    let mut profile = tenant
+        .get_core_profile(&task.entity_id)
         .ok()
         .flatten()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())

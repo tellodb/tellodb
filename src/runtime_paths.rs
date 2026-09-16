@@ -33,9 +33,7 @@ impl RuntimePaths {
         let configured_root = env::var("TEMPORAL_MEMORY_DATA_DIR")
             .ok()
             .filter(|value| !value.trim().is_empty())
-            .or_else(|| {
-                env::var("TELLODB_DATA_DIR").ok().filter(|value| !value.trim().is_empty())
-            });
+            .or_else(|| env::var("TELLODB_DATA_DIR").ok().filter(|value| !value.trim().is_empty()));
 
         let (root, explicit_root) = match configured_root {
             Some(root) => (PathBuf::from(root), true),
@@ -106,15 +104,15 @@ impl RuntimePaths {
         &self.root
     }
 
-        pub fn temporal_db(&self) -> &Path {
+    pub fn temporal_db(&self) -> &Path {
         &self.temporal_db
     }
 
-        pub fn graph_db(&self) -> &Path {
+    pub fn graph_db(&self) -> &Path {
         &self.graph_db
     }
 
-        pub fn fts_dir(&self) -> &Path {
+    pub fn fts_dir(&self) -> &Path {
         &self.fts_dir
     }
 
@@ -122,7 +120,7 @@ impl RuntimePaths {
         &self.platform_db
     }
 
-        pub fn analytics_db(&self) -> &Path {
+    pub fn analytics_db(&self) -> &Path {
         &self.analytics_db
     }
 
@@ -130,25 +128,25 @@ impl RuntimePaths {
         &self.vector_index
     }
 
-        pub fn session_vector_index(&self) -> PathBuf {
+    pub fn session_vector_index(&self) -> PathBuf {
         let mut path = self.vector_index.clone();
         path.set_extension("session_hnsw");
         path
     }
 
-        pub fn event_vector_index(&self) -> PathBuf {
+    pub fn event_vector_index(&self) -> PathBuf {
         let mut path = self.vector_index.clone();
         path.set_extension("event_hnsw");
         path
     }
 
-        pub fn shadow_vector_index(&self) -> PathBuf {
+    pub fn shadow_vector_index(&self) -> PathBuf {
         let mut path = self.vector_index.clone();
         path.set_extension("shadow_hnsw");
         path
     }
 
-        pub fn embedding_cache(&self) -> &Path {
+    pub fn embedding_cache(&self) -> &Path {
         &self.embedding_cache
     }
 
@@ -160,7 +158,7 @@ impl RuntimePaths {
         self.tenant_dir(tenant_id).join("tellodb.db")
     }
 
-        pub fn tenant_vector_index(&self, tenant_id: &str) -> PathBuf {
+    pub fn tenant_vector_index(&self, tenant_id: &str) -> PathBuf {
         self.tenant_dir(tenant_id).join("vectors.hnsw")
     }
 

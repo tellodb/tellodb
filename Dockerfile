@@ -49,7 +49,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/release/temporal_memory /usr/local/bin/temporal_memory
+COPY --from=builder /app/target/release/tellodb /usr/local/bin/tellodb
+RUN ln -s /usr/local/bin/tellodb /usr/local/bin/temporal_memory
 COPY --from=builder /app/scripts/runpod_entrypoint.sh /usr/local/bin/runpod_entrypoint.sh
 
 RUN chmod +x /usr/local/bin/runpod_entrypoint.sh

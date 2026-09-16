@@ -139,10 +139,8 @@ pub fn should_stop_scoped_ann(state: &ScopedAnnState) -> bool {
         return false;
     }
 
-    let strong_enough = state
-        .top_similarity
-        .map(|sim| sim >= scoped_ann_stop_min_similarity())
-        .unwrap_or(false);
+    let strong_enough =
+        state.top_similarity.map(|sim| sim >= scoped_ann_stop_min_similarity()).unwrap_or(false);
     if !strong_enough {
         return false;
     }
@@ -194,7 +192,9 @@ pub fn parse_kind(s: Option<&str>) -> MemoryKind {
         Some("decision") => MemoryKind::Decision,
         Some("lesson") => MemoryKind::Lesson,
         Some("preference") => MemoryKind::Preference,
-        Some("session_summary" | "session-summary" | "sessionsummary") => MemoryKind::SessionSummary,
+        Some("session_summary" | "session-summary" | "sessionsummary") => {
+            MemoryKind::SessionSummary
+        }
         Some("fact") => MemoryKind::Fact,
         _ => MemoryKind::Conversational,
     }
@@ -1280,12 +1280,27 @@ mod tests {
         assert!(result.is_empty());
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn make_ann_state(
-        attempt: usize, current_top: usize, max_top: usize,
-        hit_count: usize, min_hits: usize,
-        top_similarity: Option<f32>, prev_hit_count: Option<usize>, prev_top_similarity: Option<f32>,
+        attempt: usize,
+        current_top: usize,
+        max_top: usize,
+        hit_count: usize,
+        min_hits: usize,
+        top_similarity: Option<f32>,
+        prev_hit_count: Option<usize>,
+        prev_top_similarity: Option<f32>,
     ) -> ScopedAnnState {
-        ScopedAnnState { attempt, current_top, max_top, hit_count, min_hits, top_similarity, prev_hit_count, prev_top_similarity }
+        ScopedAnnState {
+            attempt,
+            current_top,
+            max_top,
+            hit_count,
+            min_hits,
+            top_similarity,
+            prev_hit_count,
+            prev_top_similarity,
+        }
     }
 
     #[test]

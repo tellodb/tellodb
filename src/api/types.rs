@@ -121,6 +121,10 @@ pub struct VersionResponse {
     pub engine_version: &'static str,
     pub api_version: &'static str,
     pub auth_required: bool,
+    pub device: &'static str,
+    pub embedding_model: String,
+    pub embedding_dim: usize,
+    pub ranking_config: RankingConfig,
 }
 
 #[derive(Serialize)]
@@ -292,6 +296,8 @@ pub struct QueryPayload {
     pub max_evidence_turns_per_session: Option<usize>,
     /// Optional point in time to run the query as-of (milliseconds timestamp).
     pub point_in_time_ms: Option<u64>,
+    /// Optional reference time to resolve temporal expressions against (milliseconds timestamp).
+    pub reference_time_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]

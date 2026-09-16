@@ -1,12 +1,4 @@
 #![allow(dead_code, unused_imports)]
-use axum::{
-    extract::{Json, State},
-    http::{HeaderMap, HeaderValue, StatusCode},
-    response::IntoResponse,
-};
-use serde::Serialize;
-use std::collections::{HashMap, HashSet};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use crate::api::auth::{
     authorize_request, principal_namespace_prefix, principal_user_id, record_usage_for_principal,
     scope_entity_id,
@@ -19,18 +11,27 @@ use crate::api::types::{
     QueryResult,
 };
 use crate::api::utils::{
-    apply_decay_with_policy, clip_profile_to_budget, elapsed_ms_and_us,
-    env_bool, extract_named_phrases, insert_f32_header, insert_stage_timing_headers,
-    insert_u64_header, parse_temporal_window, scoped_semantic_min_hits, scoped_semantic_start,
-    scoped_semantic_step, scoped_semantic_top, session_id_from_memory_id,
-    should_apply_neural_rerank, temporal_recency_scoring_enabled, turn_index_from_memory_id,
-    SEMANTIC_TOP_DEFAULT,
+    apply_decay_with_policy, clip_profile_to_budget, elapsed_ms_and_us, env_bool,
+    extract_named_phrases, insert_f32_header, insert_stage_timing_headers, insert_u64_header,
+    parse_temporal_window, scoped_semantic_min_hits, scoped_semantic_start, scoped_semantic_step,
+    scoped_semantic_top, session_id_from_memory_id, should_apply_neural_rerank,
+    temporal_recency_scoring_enabled, turn_index_from_memory_id, SEMANTIC_TOP_DEFAULT,
 };
-use crate::ml::cosine_similarity;
 use crate::api::{EngineState, PlatformWriteOp};
-use crate::retrieval::ScoringWeights;
 use crate::metrics;
-use crate::storage::{AgentObservation, MemoryCard, MemoryCardSearchInput, MemoryKind, TenantStore};
+use crate::ml::cosine_similarity;
+use crate::retrieval::{rrf_fuse, ScoringWeights};
+use crate::storage::{
+    AgentObservation, MemoryCard, MemoryCardSearchInput, MemoryKind, TenantStore,
+};
+use axum::{
+    extract::{Json, State},
+    http::{HeaderMap, HeaderValue, StatusCode},
+    response::IntoResponse,
+};
+use serde::Serialize;
+use std::collections::{HashMap, HashSet};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Default)]
 pub struct QueryDiagnostics {
@@ -125,28 +126,17 @@ pub async fn query_handler(
         let state_for_query = state.clone();
         let tenant = tenant.clone();
         tokio::task::spawn_blocking(move || {
-            execute_query_pipeline(
-                payload,
-                state_for_query,
-                tenant,
-                limit,
-                enable_neural_rerank,
-            )
+            execute_query_pipeline(payload, state_for_query, tenant, limit, enable_neural_rerank)
         })
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??
     };
 
     let obs_block = if let Some(eid) = entity_id_for_core_profile.as_deref() {
-        let _now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        let profile = tenant
-            .get_core_profile(eid)
-            .ok()
-            .flatten()
-            .map(|p| clip_profile_to_budget(&p, 8));
+        let _now_ms =
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        let profile =
+            tenant.get_core_profile(eid).ok().flatten().map(|p| clip_profile_to_budget(&p, 8));
 
         let mut scenes = Vec::new();
         let profile_query_lines: Vec<String> = vec![profile_query_text.clone()];
@@ -161,11 +151,8 @@ pub async fn query_handler(
                 scenes.push(scene);
             }
         }
-        let top_chunk_texts: Vec<String> = results
-            .iter()
-            .take(5)
-            .map(|r| r.textual_content.clone())
-            .collect();
+        let top_chunk_texts: Vec<String> =
+            results.iter().take(5).map(|r| r.textual_content.clone()).collect();
         Some((
             eid.to_string(),
             build_observation_block(profile.as_deref(), &scenes, &top_chunk_texts),
@@ -196,24 +183,14 @@ pub async fn query_handler(
     }
 
     let mut h = HeaderMap::new();
-    insert_stage_timing_headers(
-        &mut h,
-        "x-tm-route",
-        diagnostics.route_ms,
-        diagnostics.route_us,
-    );
+    insert_stage_timing_headers(&mut h, "x-tm-route", diagnostics.route_ms, diagnostics.route_us);
     insert_stage_timing_headers(
         &mut h,
         "x-tm-planning",
         diagnostics.planning_ms,
         diagnostics.planning_us,
     );
-    insert_stage_timing_headers(
-        &mut h,
-        "x-tm-embed",
-        diagnostics.embed_ms,
-        diagnostics.embed_us,
-    );
+    insert_stage_timing_headers(&mut h, "x-tm-embed", diagnostics.embed_ms, diagnostics.embed_us);
     insert_stage_timing_headers(&mut h, "x-tm-ann", diagnostics.ann_ms, diagnostics.ann_us);
     insert_stage_timing_headers(&mut h, "x-tm-route-session", diagnostics.route_session_ms, 0);
     insert_stage_timing_headers(&mut h, "x-tm-route-window", diagnostics.route_window_ms, 0);
@@ -227,18 +204,8 @@ pub async fn query_handler(
         diagnostics.rerank_us,
     );
     insert_stage_timing_headers(&mut h, "x-tm-fts", diagnostics.fts_ms, diagnostics.fts_us);
-    insert_stage_timing_headers(
-        &mut h,
-        "x-tm-card",
-        diagnostics.card_ms,
-        diagnostics.card_us,
-    );
-    insert_stage_timing_headers(
-        &mut h,
-        "x-tm-fuse",
-        diagnostics.fuse_ms,
-        diagnostics.fuse_us,
-    );
+    insert_stage_timing_headers(&mut h, "x-tm-card", diagnostics.card_ms, diagnostics.card_us);
+    insert_stage_timing_headers(&mut h, "x-tm-fuse", diagnostics.fuse_ms, diagnostics.fuse_us);
     insert_stage_timing_headers(
         &mut h,
         "x-tm-hydrate",
@@ -305,50 +272,16 @@ pub async fn query_handler(
         diagnostics.session_ms,
         diagnostics.session_us,
     );
-    insert_stage_timing_headers(
-        &mut h,
-        "x-tm-total",
-        diagnostics.total_ms,
-        diagnostics.total_us,
-    );
-    insert_stage_timing_headers(
-        &mut h,
-        "x-tm-trace",
-        diagnostics.trace_ms,
-        diagnostics.trace_us,
-    );
+    insert_stage_timing_headers(&mut h, "x-tm-total", diagnostics.total_ms, diagnostics.total_us);
+    insert_stage_timing_headers(&mut h, "x-tm-trace", diagnostics.trace_ms, diagnostics.trace_us);
     insert_u64_header(&mut h, "x-tm-scoped-ann-top", diagnostics.scoped_ann_top);
-    insert_u64_header(
-        &mut h,
-        "x-tm-scoped-ann-attempts",
-        diagnostics.scoped_ann_attempts,
-    );
-    insert_u64_header(
-        &mut h,
-        "x-tm-scoped-primary-hits",
-        diagnostics.scoped_primary_hits,
-    );
+    insert_u64_header(&mut h, "x-tm-scoped-ann-attempts", diagnostics.scoped_ann_attempts);
+    insert_u64_header(&mut h, "x-tm-scoped-primary-hits", diagnostics.scoped_primary_hits);
     insert_u64_header(&mut h, "x-tm-routed-sessions", diagnostics.routed_sessions);
-    insert_u64_header(
-        &mut h,
-        "x-tm-memory-card-hits",
-        diagnostics.memory_card_hits,
-    );
-    insert_u64_header(
-        &mut h,
-        "x-tm-temporal-event-hits",
-        diagnostics.temporal_event_hits,
-    );
-    insert_u64_header(
-        &mut h,
-        "x-tm-shadow-question-hits",
-        diagnostics.shadow_question_hits,
-    );
-    insert_u64_header(
-        &mut h,
-        "x-tm-facet-posting-hits",
-        diagnostics.facet_posting_hits,
-    );
+    insert_u64_header(&mut h, "x-tm-memory-card-hits", diagnostics.memory_card_hits);
+    insert_u64_header(&mut h, "x-tm-temporal-event-hits", diagnostics.temporal_event_hits);
+    insert_u64_header(&mut h, "x-tm-shadow-question-hits", diagnostics.shadow_question_hits);
+    insert_u64_header(&mut h, "x-tm-facet-posting-hits", diagnostics.facet_posting_hits);
     insert_u64_header(&mut h, "x-tm-mem-scene-hits", diagnostics.mem_scene_hits);
     insert_f32_header(
         &mut h,
@@ -357,11 +290,7 @@ pub async fn query_handler(
     );
     h.insert(
         "x-tm-abstain-recommended",
-        HeaderValue::from_static(if diagnostics.abstain_recommended {
-            "1"
-        } else {
-            "0"
-        }),
+        HeaderValue::from_static(if diagnostics.abstain_recommended { "1" } else { "0" }),
     );
 
     if let Some(uid) = principal_user_id(&principal) {
@@ -412,10 +341,7 @@ fn promote_query_variant(queries: &mut Vec<String>, candidate: String) {
         return;
     }
     let lower = candidate.to_ascii_lowercase();
-    if let Some(pos) = queries
-        .iter()
-        .position(|query| query.to_ascii_lowercase() == lower)
-    {
+    if let Some(pos) = queries.iter().position(|query| query.to_ascii_lowercase() == lower) {
         if pos > 1 {
             let existing = queries.remove(pos);
             queries.insert(1, existing);
@@ -440,11 +366,7 @@ fn lifecycle_rank_adjustment(
     ) {
         return None;
     }
-    if lifecycle
-        .expires_at_ms
-        .map(|expires_at| expires_at <= now_ms)
-        .unwrap_or(false)
-    {
+    if lifecycle.expires_at_ms.map(|expires_at| expires_at <= now_ms).unwrap_or(false) {
         return None;
     }
 
@@ -454,10 +376,7 @@ fn lifecycle_rank_adjustment(
         + (lifecycle.specificity_score - 0.45) * 0.025;
 
     if lifecycle.promote_to_profile
-        || matches!(
-            kind,
-            MemoryKind::Fact | MemoryKind::Preference | MemoryKind::Decision
-        )
+        || matches!(kind, MemoryKind::Fact | MemoryKind::Preference | MemoryKind::Decision)
     {
         adjustment += 0.025;
     }
@@ -506,16 +425,9 @@ fn attractor_negative_penalty(
 
     let required_entities = plan.subject_entities.len();
     let entity_deficit = required_entities.saturating_sub(entity_hits).min(3) as f32;
-    let facet_deficit = if plan.coverage_mode && facet_mask.count_ones() == 0 {
-        1.0
-    } else {
-        0.0
-    };
-    let temporal_deficit = if !plan.temporal_terms.is_empty() && temporal_hits == 0 {
-        1.0
-    } else {
-        0.0
-    };
+    let facet_deficit = if plan.coverage_mode && facet_mask.count_ones() == 0 { 1.0 } else { 0.0 };
+    let temporal_deficit =
+        if !plan.temporal_terms.is_empty() && temporal_hits == 0 { 1.0 } else { 0.0 };
     let weak_specificity = entity_deficit > 0.0
         || facet_deficit > 0.0
         || temporal_deficit > 0.0
@@ -659,10 +571,7 @@ fn build_proof_packet(
     let verified = if verify_evidence {
         checks.iter().all(|check| check.passed)
     } else {
-        checks
-            .iter()
-            .filter(|check| check.name != "facet_coverage")
-            .all(|check| check.passed)
+        checks.iter().filter(|check| check.name != "facet_coverage").all(|check| check.passed)
     };
     if !verify_evidence {
         checks.push(ProofCheck {
@@ -754,10 +663,7 @@ fn retrieval_profile() -> RetrievalProfile {
 }
 
 fn auto_rerank_enabled(profile: RetrievalProfile) -> bool {
-    env_bool(
-        "TEMPORAL_MEMORY_AUTO_RERANK",
-        matches!(profile, RetrievalProfile::Research),
-    )
+    env_bool("TEMPORAL_MEMORY_AUTO_RERANK", matches!(profile, RetrievalProfile::Research))
 }
 
 fn retrieval_budget_for_plan(plan: &QueryPlan, profile: RetrievalProfile) -> RetrievalBudget {
@@ -1024,15 +930,19 @@ fn retrieval_budget_for_plan(plan: &QueryPlan, profile: RetrievalProfile) -> Ret
     }
 }
 
-
-
 fn collect_edge_cluster_scores(
     tenant: &TenantStore,
     seed_memory_id: &str,
     max_depth: usize,
     edge_type_filter: Option<&str>,
 ) -> HashMap<String, f32> {
-    collect_edge_cluster_scores_with_intent(tenant, seed_memory_id, max_depth, edge_type_filter, None)
+    collect_edge_cluster_scores_with_intent(
+        tenant,
+        seed_memory_id,
+        max_depth,
+        edge_type_filter,
+        None,
+    )
 }
 
 /// Like `collect_edge_cluster_scores` but applies an intent-aware multiplier
@@ -1059,7 +969,9 @@ fn collect_edge_cluster_scores_with_intent(
         if !visited.insert(visit_key) {
             continue;
         }
-        let Ok(linked_edges) = tenant.get_edge_cluster_neighbors_typed(&current_mid, edge_type_filter, 50) else {
+        let Ok(linked_edges) =
+            tenant.get_edge_cluster_neighbors_typed(&current_mid, edge_type_filter, 50)
+        else {
             continue;
         };
         for (linked_mid, weight, edge_type) in linked_edges {
@@ -1113,9 +1025,7 @@ fn scoped_graph_node_id(
 ) -> Result<String, StatusCode> {
     let ns_prefix = principal_namespace_prefix(principal);
     let node_id = match requested {
-        Some(id) if !id.trim().is_empty() => {
-            scope_entity_id(id.trim(), ns_prefix.as_deref())
-        }
+        Some(id) if !id.trim().is_empty() => scope_entity_id(id.trim(), ns_prefix.as_deref()),
         None => ns_prefix
             .as_deref()
             .map(|prefix| prefix.trim_end_matches(':').to_string())
@@ -1306,10 +1216,7 @@ pub async fn temporal_query_handler(
     }
     let mapped: Vec<_> = results
         .into_iter()
-        .map(|(entity_id, textual_content)| TempObs {
-            entity_id,
-            textual_content,
-        })
+        .map(|(entity_id, textual_content)| TempObs { entity_id, textual_content })
         .collect();
     record_usage_for_principal(&state, &principal, "temporal_query");
     Ok((StatusCode::OK, Json(mapped)))
@@ -1385,10 +1292,9 @@ impl QueryPipelineState {
             tenant,
             limit,
             enable_neural_rerank,
-            weights: {
-                let mut w = ScoringWeights::default();
-                w.ambiguity_delta_threshold = ambiguity_threshold;
-                w
+            weights: ScoringWeights {
+                ambiguity_delta_threshold: ambiguity_threshold,
+                ..Default::default()
             },
             total_start: Instant::now(),
             route_start: Instant::now(),
@@ -1466,10 +1372,11 @@ impl QueryPipelineState {
 fn plan_phase(s: &mut QueryPipelineState) {
     s.raw_query_text = s.payload.textual_query.clone();
     s.query_text = rewrite_query_for_retrieval(&s.raw_query_text);
-    s.include_evidence = s.payload.include_evidence.unwrap_or(false)
-        || s.payload.verify_evidence.unwrap_or(false);
+    s.include_evidence =
+        s.payload.include_evidence.unwrap_or(false) || s.payload.verify_evidence.unwrap_or(false);
     s.verify_evidence = s.payload.verify_evidence.unwrap_or(false);
-    s.proof_mode = s.payload
+    s.proof_mode = s
+        .payload
         .proof_mode
         .clone()
         .unwrap_or_else(|| if s.verify_evidence { "light" } else { "off" }.to_string())
@@ -1504,11 +1411,8 @@ fn plan_phase(s: &mut QueryPipelineState) {
         QueryIntent::Recommendation | QueryIntent::General => 72,
     }
     .min(s.budget.fts_top);
-    s.semantic_top = if s.payload.entity_id.is_some() {
-        scoped_semantic_top()
-    } else {
-        SEMANTIC_TOP_DEFAULT
-    };
+    s.semantic_top =
+        if s.payload.entity_id.is_some() { scoped_semantic_top() } else { SEMANTIC_TOP_DEFAULT };
     s.semantic_top = if s.plan.cross_entity || s.plan.ordinal_rank.is_some() {
         s.semantic_top.saturating_mul(2).min(1200)
     } else if matches!(s.plan.intent, QueryIntent::Inference) {
@@ -1560,7 +1464,9 @@ fn plan_phase(s: &mut QueryPipelineState) {
                 let t = temporal_for_routes.clone();
                 let s_e = subject_for_routes.clone();
                 sc.spawn(move || {
-                    tenant.search_session_router(&eid, &q, &l, &t, &s_e, session_router_limit).unwrap_or_default()
+                    tenant
+                        .search_session_router(&eid, &q, &l, &t, &s_e, session_router_limit)
+                        .unwrap_or_default()
                 })
             };
             let h_win = {
@@ -1570,7 +1476,9 @@ fn plan_phase(s: &mut QueryPipelineState) {
                 sc.spawn(move || {
                     if let Some((st, en)) = parse_temporal_window(&q) {
                         tenant.sessions_in_time_window(&eid, st, en).unwrap_or_default()
-                    } else { Vec::new() }
+                    } else {
+                        Vec::new()
+                    }
                 })
             };
             let h_pivot = {
@@ -1580,7 +1488,9 @@ fn plan_phase(s: &mut QueryPipelineState) {
                 sc.spawn(move || {
                     if !s_e.is_empty() {
                         tenant.entity_pivot_sessions(&eid, &s_e).unwrap_or_default()
-                    } else { Vec::new() }
+                    } else {
+                        Vec::new()
+                    }
                 })
             };
 
@@ -1596,13 +1506,15 @@ fn plan_phase(s: &mut QueryPipelineState) {
             let coverage_bonus = hit.lexical_hits as f32 * s.state.ranking_config.lexical_weight
                 + hit.temporal_hits as f32 * s.state.ranking_config.temporal_weight
                 + hit.entity_hits as f32 * s.state.ranking_config.entity_weight;
-            *s.session_route_scores.entry(hit.session_id).or_insert(0.0) += hit.score + coverage_bonus;
+            *s.session_route_scores.entry(hit.session_id).or_insert(0.0) +=
+                hit.score + coverage_bonus;
         }
         s.diag.route_session_ms = start_proc.elapsed().as_millis() as u64;
 
         let start_proc = Instant::now();
         for hit in win_hits {
-            *s.session_route_scores.entry(hit.session_id).or_insert(0.0) += s.weights.time_window_bonus;
+            *s.session_route_scores.entry(hit.session_id).or_insert(0.0) +=
+                s.weights.time_window_bonus;
         }
         s.diag.route_window_ms = start_proc.elapsed().as_millis() as u64;
 
@@ -1627,13 +1539,10 @@ fn route_phase(s: &mut QueryPipelineState) {
     let route_probe_queries = if s.budget.route_probe_query_limit == 0 {
         Vec::new()
     } else if s.plan.coverage_facets.is_empty() {
-        vec![s.plan
-            .fts_queries
-            .first()
-            .cloned()
-            .unwrap_or_else(|| s.query_text.clone())]
+        vec![s.plan.fts_queries.first().cloned().unwrap_or_else(|| s.query_text.clone())]
     } else {
-        s.plan.coverage_facets
+        s.plan
+            .coverage_facets
             .iter()
             .take(s.budget.route_probe_query_limit)
             .map(|facet| facet.text.clone())
@@ -1649,11 +1558,9 @@ fn route_phase(s: &mut QueryPipelineState) {
             let tenant = tenant_for_probes.clone();
             let eid = eid_for_probes.clone();
             handles.push(sc.spawn(move || {
-                let hits = tenant.fts_search(
-                    probe_query.as_str(),
-                    hit_limit,
-                    eid.as_deref(),
-                ).unwrap_or_default();
+                let hits = tenant
+                    .fts_search(probe_query.as_str(), hit_limit, eid.as_deref())
+                    .unwrap_or_default();
                 (probe_idx, hits)
             }));
         }
@@ -1673,22 +1580,14 @@ fn route_phase(s: &mut QueryPipelineState) {
         let tenant = s.tenant.clone();
         let eid = s.payload.entity_id.clone();
         let subjects = s.plan.subject_entities.clone();
-        if let Ok(hits) = tenant.entity_pivot_sessions(
-            eid.as_deref().unwrap_or(""),
-            &subjects,
-        ) {
-            lanes.push(
-                hits.into_iter().map(|h| (h.session_id, h.score)).collect(),
-            );
+        if let Ok(hits) = tenant.entity_pivot_sessions(eid.as_deref().unwrap_or(""), &subjects) {
+            lanes.push(hits.into_iter().map(|h| (h.session_id, h.score)).collect());
         }
     }
 
     // Lane 2: FTS session router (router_text OR of query terms).
-    let s_router_lane: Vec<(String, f32)> = s
-        .session_route_scores
-        .iter()
-        .map(|(sid, score)| (sid.clone(), *score))
-        .collect();
+    let s_router_lane: Vec<(String, f32)> =
+        s.session_route_scores.iter().map(|(sid, score)| (sid.clone(), *score)).collect();
     if !s_router_lane.is_empty() {
         lanes.push(s_router_lane);
     }
@@ -1706,8 +1605,7 @@ fn route_phase(s: &mut QueryPipelineState) {
             1 => 2.0,
             _ => 1.0,
         };
-        let mut seen_in_probe: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut seen_in_probe: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (memory_id, _) in route_probe_hits.iter().take(s.budget.route_probe_hit_limit) {
             if let Some(session_id) = routed_session_from_memory_id(memory_id) {
                 if seen_in_probe.insert(session_id.clone()) {
@@ -1734,10 +1632,8 @@ fn route_phase(s: &mut QueryPipelineState) {
             &s.plan.subject_entities,
             24,
         ) {
-            let lane: Vec<(String, f32)> = hits
-                .into_iter()
-                .map(|h| (h.session_id, h.score))
-                .collect();
+            let lane: Vec<(String, f32)> =
+                hits.into_iter().map(|h| (h.session_id, h.score)).collect();
             if !lane.is_empty() {
                 lanes.push(lane);
             }
@@ -1755,11 +1651,8 @@ fn route_phase(s: &mut QueryPipelineState) {
     } else {
         s.budget.route_take_simple
     };
-    s.adaptive_profile.route_sessions = fused
-        .into_iter()
-        .take(route_take)
-        .map(|(session, _)| session)
-        .collect();
+    s.adaptive_profile.route_sessions =
+        fused.into_iter().take(route_take).map(|(session, _)| session).collect();
     s.adaptive_profile.route_strength = if s.adaptive_profile.route_sessions.is_empty() {
         0.0
     } else if s.plan.needs_decomposition || s.plan.cross_entity {
@@ -1771,35 +1664,6 @@ fn route_phase(s: &mut QueryPipelineState) {
     (s.diag.route_ms, s.diag.route_us) = elapsed_ms_and_us(s.route_start);
 }
 
-/// Reciprocal Rank Fusion (RRF) over multiple independent ranking lanes.
-///
-/// Each lane is a Vec of (item_id, score) where higher score = better. We rank
-/// each lane (ties broken by score, then by appearance order), then aggregate:
-///
-///   S(item) = sum_lane  1 / (c + rank_lane(item))
-///
-/// c=60 is the standard RRF constant (Cormack et al., 2009) that prevents
-/// high-rank items from dominating the sum and gives low-rank items a
-/// reasonable contribution. Items not in a lane contribute 0 from that lane.
-fn rrf_fuse(lanes: &[Vec<(String, f32)>], c: f32) -> Vec<(String, f32)> {
-    let mut scores: HashMap<String, f32> = HashMap::new();
-    for lane in lanes {
-        // Sort the lane by score descending, then take ranks (1-indexed).
-        let mut sorted: Vec<&(String, f32)> = lane.iter().collect();
-        sorted.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        for (rank, (item, _score)) in sorted.iter().enumerate() {
-            let r = (rank + 1) as f32;
-            *scores.entry((*item).clone()).or_insert(0.0) += 1.0 / (c + r);
-        }
-    }
-    let mut out: Vec<(String, f32)> = scores.into_iter().collect();
-    out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    out
-}
-
 fn retrieval_phase(s: &mut QueryPipelineState) {
     retrieval_ann(s);
     retrieval_fts(s);
@@ -1809,7 +1673,8 @@ fn retrieval_phase(s: &mut QueryPipelineState) {
 fn retrieval_ann(s: &mut QueryPipelineState) {
     let stage_start = Instant::now();
     let embed_dim = s.state.semantic.embedding_dim();
-    let semantic_queries = s.plan
+    let semantic_queries = s
+        .plan
         .semantic_queries
         .iter()
         .take(s.budget.semantic_query_limit)
@@ -1842,15 +1707,10 @@ fn retrieval_ann(s: &mut QueryPipelineState) {
     }
 
     let scoped_entity_id = s.payload.entity_id.clone();
-    let scope_prefix: Option<String> =
-        scoped_entity_id.as_ref().map(|id| format!("{}::", id));
+    let scope_prefix: Option<String> = scoped_entity_id.as_ref().map(|id| format!("{}::", id));
     let stage_start = Instant::now();
-    let ann_results: Vec<(
-        usize,
-        Vec<String>,
-        Vec<RankedItem>,
-        Vec<(u64, f32)>,
-    )> = {
+    type AnnWorkerResult = (usize, Vec<String>, Vec<RankedItem>, Vec<(u64, f32)>);
+    let ann_results: Vec<AnnWorkerResult> = {
         let state_clone = s.state.clone();
         let tenant_clone = s.tenant.clone();
         let eid = scoped_entity_id.clone();
@@ -1900,7 +1760,8 @@ fn retrieval_ann(s: &mut QueryPipelineState) {
                                 .filter(|vid| !local_cache.contains_key(vid))
                                 .collect();
                             if !unresolved_ids.is_empty() {
-                                if let Ok(looked) = tenant.lookup_by_vector_ids_batch(&unresolved_ids)
+                                if let Ok(looked) =
+                                    tenant.lookup_by_vector_ids_batch(&unresolved_ids)
                                 {
                                     for (vid, hit) in unresolved_ids.into_iter().zip(looked) {
                                         local_cache.insert(vid, hit);
@@ -1930,10 +1791,8 @@ fn retrieval_ann(s: &mut QueryPipelineState) {
                                 if cumulative_hnsw_hits.len() < NEURAL_TOP {
                                     variant_rerank_seed_ids.push(mem_id.clone());
                                 }
-                                cumulative_hnsw_hits.push(RankedItem {
-                                    memory_id: mem_id,
-                                    timestamp: ts,
-                                });
+                                cumulative_hnsw_hits
+                                    .push(RankedItem { memory_id: mem_id, timestamp: ts });
                                 if scoped_top_similarity.is_none() {
                                     scoped_top_similarity = Some((1.0 - *dist).clamp(-1.0, 1.0));
                                 }
@@ -1956,7 +1815,8 @@ fn retrieval_ann(s: &mut QueryPipelineState) {
                             {
                                 break scoped_last_raw;
                             }
-                            let next_top = current_top.saturating_add(scoped_step).min(scoped_max_top);
+                            let next_top =
+                                current_top.saturating_add(scoped_step).min(scoped_max_top);
                             if next_top == current_top {
                                 break scoped_last_raw;
                             }
@@ -1972,8 +1832,7 @@ fn retrieval_ann(s: &mut QueryPipelineState) {
                             .search(None, &embedding, semantic_top)
                             .unwrap_or_default();
                         let vids: Vec<u64> = hnsw_raw.iter().map(|(vid, _)| *vid).collect();
-                        if let Ok(looked) = tenant.lookup_by_vector_ids_batch(&vids)
-                        {
+                        if let Ok(looked) = tenant.lookup_by_vector_ids_batch(&vids) {
                             for (rank, (_vid, dist)) in hnsw_raw.iter().enumerate() {
                                 if let Some((ts, mem_id)) = looked[rank].clone() {
                                     // Post-ANN similarity floor: drop zero/near-zero hits
@@ -1988,18 +1847,14 @@ fn retrieval_ann(s: &mut QueryPipelineState) {
                                     if profile.route_strength > 0.0
                                         && !routed_match
                                         && hnsw_hits.len() < (query_limit.saturating_div(2).max(1))
+                                        && raw_similarity < dedup_threshold
                                     {
-                                        if raw_similarity < dedup_threshold {
-                                            continue;
-                                        }
+                                        continue;
                                     }
                                     if rank < NEURAL_TOP {
                                         variant_rerank_seed_ids.push(mem_id.clone());
                                     }
-                                    hnsw_hits.push(RankedItem {
-                                        memory_id: mem_id,
-                                        timestamp: ts,
-                                    });
+                                    hnsw_hits.push(RankedItem { memory_id: mem_id, timestamp: ts });
                                 }
                             }
                         }
@@ -2044,7 +1899,8 @@ fn retrieval_fts(s: &mut QueryPipelineState) {
     let mut fts_memory_ids_to_lookup = Vec::new();
     let mut fts_results_per_query = Vec::new();
 
-    let fts_queries_to_run: Vec<&String> = s.plan.fts_queries.iter().take(s.budget.fts_query_limit).collect();
+    let fts_queries_to_run: Vec<&String> =
+        s.plan.fts_queries.iter().take(s.budget.fts_query_limit).collect();
     {
         let tenant_clone = s.tenant.clone();
         let eid = s.payload.entity_id.clone();
@@ -2079,17 +1935,13 @@ fn retrieval_fts(s: &mut QueryPipelineState) {
             fts_memory_ids_to_lookup.push(mid.clone());
         }
     }
-    let fts_lookup = s.tenant
-        .lookup_by_memory_ids_batch(&fts_memory_ids_to_lookup)
-        .unwrap_or_default();
+    let fts_lookup =
+        s.tenant.lookup_by_memory_ids_batch(&fts_memory_ids_to_lookup).unwrap_or_default();
     for (idx, hits) in fts_results_per_query.into_iter().enumerate() {
         let mut ranked_hits = Vec::new();
         for (mid, _) in hits {
             if let Some((ts, _)) = fts_lookup.get(&mid).copied() {
-                ranked_hits.push(RankedItem {
-                    memory_id: mid,
-                    timestamp: ts,
-                });
+                ranked_hits.push(RankedItem { memory_id: mid, timestamp: ts });
             }
         }
         fts_ranked_lists.push((
@@ -2107,7 +1959,8 @@ fn retrieval_cards(s: &mut QueryPipelineState) {
     let mut card_ranked_items = Vec::new();
     if let Some(ref entity_id) = s.payload.entity_id {
         let include_stale_cards = query_allows_stale_cards(&s.query_text, &s.plan);
-        let card_hits = s.tenant
+        let card_hits = s
+            .tenant
             .search_memory_cards(&MemoryCardSearchInput {
                 entity_id,
                 lexical_terms: &s.plan.lexical_terms,
@@ -2120,16 +1973,11 @@ fn retrieval_cards(s: &mut QueryPipelineState) {
             .unwrap_or_default();
         s.diag.memory_card_hits = card_hits.len() as u64;
         for hit in card_hits {
-            card_ranked_items.push(RankedItem {
-                memory_id: hit.card_id,
-                timestamp: hit.timestamp,
-            });
+            card_ranked_items.push(RankedItem { memory_id: hit.card_id, timestamp: hit.timestamp });
             if !hit.source_session_id.is_empty()
                 && hit.lexical_hits + hit.temporal_hits + hit.entity_hits >= 2
             {
-                *s.session_route_scores
-                    .entry(hit.source_session_id)
-                    .or_insert(0.0) +=
+                *s.session_route_scores.entry(hit.source_session_id).or_insert(0.0) +=
                     hit.score * s.state.ranking_config.session_boost * 1.5;
             }
         }
@@ -2175,17 +2023,13 @@ fn rerank_phase(s: &mut QueryPipelineState) {
             .into_iter()
             .filter(|mid: &String| rerank_seen.insert(mid.clone()))
             .collect();
-        let lookup = s.tenant
-            .lookup_by_memory_ids_batch(&active_seeds)
-            .unwrap_or_default();
+        let lookup = s.tenant.lookup_by_memory_ids_batch(&active_seeds).unwrap_or_default();
         let obs_keys: Vec<(u64, String)> = active_seeds
             .iter()
             .filter_map(|mid: &String| lookup.get(mid).map(|(ts, _)| (*ts, mid.clone())))
             .take(NEURAL_TOP)
             .collect();
-        let observations = s.tenant
-            .get_observations_batch(&obs_keys)
-            .unwrap_or_default();
+        let observations = s.tenant.get_observations_batch(&obs_keys).unwrap_or_default();
         let mut rerank_items = Vec::new();
         let mut rerank_texts = Vec::new();
         for mid in active_seeds {
@@ -2194,11 +2038,11 @@ fn rerank_phase(s: &mut QueryPipelineState) {
                 rerank_texts.push(obs.textual_content.clone());
             }
         }
-        for (item_chunk, text_chunk) in rerank_items
-            .chunks(NEURAL_BATCH)
-            .zip(rerank_texts.chunks(NEURAL_BATCH))
+        for (item_chunk, text_chunk) in
+            rerank_items.chunks(NEURAL_BATCH).zip(rerank_texts.chunks(NEURAL_BATCH))
         {
-            let scores = s.state
+            let scores = s
+                .state
                 .semantic
                 .predict_scores_batch(&s.query_text, text_chunk)
                 .unwrap_or_else(|_| vec![0.0; item_chunk.len()]);
@@ -2217,10 +2061,8 @@ fn fusion_phase(s: &mut QueryPipelineState) {
     if !s.card_ranked_items.is_empty() {
         let card_weight = if s.plan.needs_decomposition || s.plan.cross_entity {
             s.state.ranking_config.card_boost * 1.3
-        } else if matches!(
-            s.plan.intent,
-            QueryIntent::TemporalAggregation | QueryIntent::Inference
-        ) {
+        } else if matches!(s.plan.intent, QueryIntent::TemporalAggregation | QueryIntent::Inference)
+        {
             s.state.ranking_config.card_boost * 1.15
         } else {
             s.state.ranking_config.card_boost
@@ -2229,17 +2071,13 @@ fn fusion_phase(s: &mut QueryPipelineState) {
     }
     if !s.neural_scores.is_empty() {
         let mut scored_items: Vec<_> = s.neural_scores.clone().into_iter().collect();
-        scored_items
-            .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored_items.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         let mut neural_items = Vec::new();
         let mids: Vec<String> = scored_items.iter().map(|(mid, _)| mid.clone()).collect();
         let lookup = s.tenant.lookup_by_memory_ids_batch(&mids).unwrap_or_default();
         for (mid, _) in scored_items {
             if let Some(&(ts, _)) = lookup.get(&mid) {
-                neural_items.push(RankedItem {
-                    memory_id: mid,
-                    timestamp: ts,
-                });
+                neural_items.push(RankedItem { memory_id: mid, timestamp: ts });
             }
         }
         ranked_sources.push((1.5, neural_items));
@@ -2247,10 +2085,7 @@ fn fusion_phase(s: &mut QueryPipelineState) {
     let fused = weighted_reciprocal_rank_fusion(ranked_sources, adaptive_rrf_k(&s.plan));
     (s.diag.fuse_ms, s.diag.fuse_us) = elapsed_ms_and_us(stage_start);
 
-    s.now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
+    s.now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
     let mut fused_map: HashMap<String, (u64, f32)> = HashMap::new();
     for (mid, ts, score) in fused {
         let entry = fused_map.entry(mid).or_insert((ts, 0.0));
@@ -2259,10 +2094,7 @@ fn fusion_phase(s: &mut QueryPipelineState) {
     }
 
     for (mid, boost) in &s.routed_memory_ids {
-        if let Some((ts, _)) = s.tenant
-            .lookup_by_memory_id(mid)
-            .unwrap_or(None)
-        {
+        if let Some((ts, _)) = s.tenant.lookup_by_memory_id(mid).unwrap_or(None) {
             let entry = fused_map.entry(mid.clone()).or_insert((ts, 0.0));
             entry.0 = ts;
             entry.1 += *boost;
@@ -2272,36 +2104,26 @@ fn fusion_phase(s: &mut QueryPipelineState) {
     let stage_start = Instant::now();
     if s.plan.intent == QueryIntent::Inference && !s.primary_qembed.is_empty() {
         if let Some(ref entity_id) = s.payload.entity_id {
-            let preference_memories = s.tenant
-                .get_preference_memories(entity_id, 96)
-                .unwrap_or_default();
+            let preference_memories =
+                s.tenant.get_preference_memories(entity_id, 96).unwrap_or_default();
             if !preference_memories.is_empty() {
                 let option_embeddings = [s.primary_qembed.clone()];
-                let memory_ids: Vec<String> = preference_memories
-                    .iter()
-                    .map(|(memory_id, _)| memory_id.clone())
-                    .collect();
-                let lookup = s.tenant
-                    .lookup_by_memory_ids_batch(&memory_ids)
-                    .unwrap_or_default();
+                let memory_ids: Vec<String> =
+                    preference_memories.iter().map(|(memory_id, _)| memory_id.clone()).collect();
+                let lookup = s.tenant.lookup_by_memory_ids_batch(&memory_ids).unwrap_or_default();
                 let observation_keys: Vec<(u64, String)> = memory_ids
                     .iter()
                     .filter_map(|memory_id| {
-                        lookup
-                            .get(memory_id)
-                            .map(|(ts, _)| (*ts, memory_id.clone()))
+                        lookup.get(memory_id).map(|(ts, _)| (*ts, memory_id.clone()))
                     })
                     .collect();
-                let observations = s.tenant
-                    .get_observations_batch(&observation_keys)
-                    .unwrap_or_default();
+                let observations =
+                    s.tenant.get_observations_batch(&observation_keys).unwrap_or_default();
                 for (memory_id, strength) in preference_memories {
                     let Some(obs) = observations.get(&memory_id) else {
                         continue;
                     };
-                    if obs.embedding.len() != s.primary_qembed.len()
-                        || obs.embedding.is_empty()
-                    {
+                    if obs.embedding.len() != s.primary_qembed.len() || obs.embedding.is_empty() {
                         continue;
                     }
                     let best_similarity = option_embeddings
@@ -2311,8 +2133,7 @@ fn fusion_phase(s: &mut QueryPipelineState) {
                         .fold(-1.0f32, f32::max);
                     if best_similarity >= 0.35 {
                         if let Some((ts, _)) = lookup.get(&memory_id).copied() {
-                            let entry =
-                                fused_map.entry(memory_id.clone()).or_insert((ts, 0.0));
+                            let entry = fused_map.entry(memory_id.clone()).or_insert((ts, 0.0));
                             entry.0 = ts;
                             entry.1 += best_similarity.max(0.0) * 0.12 + strength * 0.04;
                         }
@@ -2324,12 +2145,9 @@ fn fusion_phase(s: &mut QueryPipelineState) {
     (s.diag.preference_ms, s.diag.preference_us) = elapsed_ms_and_us(stage_start);
 
     let stage_start = Instant::now();
-    let mut link_seed_ids: Vec<(String, f32)> = fused_map
-        .iter()
-        .map(|(mid, (_, score))| (mid.clone(), *score))
-        .collect();
-    link_seed_ids
-        .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut link_seed_ids: Vec<(String, f32)> =
+        fused_map.iter().map(|(mid, (_, score))| (mid.clone(), *score)).collect();
+    link_seed_ids.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     let mut graph_scores: HashMap<String, f32> = HashMap::new();
     let seed_top: Vec<String> = link_seed_ids.into_iter().take(24).map(|(mid, _)| mid).collect();
@@ -2375,24 +2193,18 @@ fn fusion_phase(s: &mut QueryPipelineState) {
     }
     if s.plan.needs_decomposition
         || s.plan.cross_entity
-        || matches!(
-            s.plan.intent,
-            QueryIntent::Inference | QueryIntent::TemporalAggregation
-        )
+        || matches!(s.plan.intent, QueryIntent::Inference | QueryIntent::TemporalAggregation)
     {
         let mut graph_seed_nodes = s.plan.subject_entities.clone();
         let query_phrase_lines = [s.payload.textual_query.clone()];
         for phrase in extract_named_phrases(&query_phrase_lines) {
             if phrase.len() >= 3
-                && !graph_seed_nodes
-                    .iter()
-                    .any(|existing| existing.eq_ignore_ascii_case(&phrase))
+                && !graph_seed_nodes.iter().any(|existing| existing.eq_ignore_ascii_case(&phrase))
             {
                 graph_seed_nodes.push(phrase);
             }
         }
         graph_seed_nodes.truncate(8);
-
     }
 
     // Entity-graph retrieval lane: resolve query entities against registry,
@@ -2400,7 +2212,8 @@ fn fusion_phase(s: &mut QueryPipelineState) {
     if let Some(ref entity_scope) = s.payload.entity_id {
         if !entity_scope.is_empty() {
             let mut entity_seeds: Vec<String> = s.plan.subject_entities.clone();
-            let query_lines: Vec<String> = std::iter::once(s.payload.textual_query.clone()).collect();
+            let query_lines: Vec<String> =
+                std::iter::once(s.payload.textual_query.clone()).collect();
             for phrase in extract_named_phrases(&query_lines) {
                 if phrase.len() >= 3
                     && !entity_seeds.iter().any(|e| e.eq_ignore_ascii_case(&phrase))
@@ -2417,16 +2230,18 @@ fn fusion_phase(s: &mut QueryPipelineState) {
                 }
             }
             if !batched_edges.is_empty() {
-                let mut edge_mids = batched_edges.iter().map(|e| e.memory_id.clone()).collect::<Vec<_>>();
+                let mut edge_mids =
+                    batched_edges.iter().map(|e| e.memory_id.clone()).collect::<Vec<_>>();
                 edge_mids.sort();
                 edge_mids.dedup();
-                
+
                 if let Ok(lookup) = s.tenant.lookup_by_memory_ids_batch(&edge_mids) {
                     for edge in batched_edges {
                         if let Some(&(ts, _)) = lookup.get(&edge.memory_id) {
                             let boost = edge.weight * 0.5;
                             *graph_scores.entry(edge.memory_id.clone()).or_insert(0.0) += boost;
-                            let entry = fused_map.entry(edge.memory_id.clone()).or_insert((ts, 0.0));
+                            let entry =
+                                fused_map.entry(edge.memory_id.clone()).or_insert((ts, 0.0));
                             entry.0 = ts;
                         }
                     }
@@ -2438,10 +2253,8 @@ fn fusion_phase(s: &mut QueryPipelineState) {
     s.graph_scores = graph_scores;
     (s.diag.graph_ms, s.diag.graph_us) = elapsed_ms_and_us(stage_start);
 
-    let mut fused_vec: Vec<(String, u64, f32)> = fused_map
-        .into_iter()
-        .map(|(mid, (ts, score))| (mid, ts, score))
-        .collect();
+    let mut fused_vec: Vec<(String, u64, f32)> =
+        fused_map.into_iter().map(|(mid, (ts, score))| (mid, ts, score)).collect();
     fused_vec.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
     s.fused = fused_vec;
 }
@@ -2453,55 +2266,53 @@ fn score_phase(s: &mut QueryPipelineState) -> Vec<QueryResult> {
 }
 
 fn score_hydrate(s: &mut QueryPipelineState) {
-    let observation_keys: Vec<(u64, String)> = s.fused
-        .iter()
-        .map(|(mid, ts, _)| (*ts, mid.clone()))
-        .collect();
-    let observation_memory_ids: Vec<String> = observation_keys
-        .iter()
-        .map(|(_, mid)| mid.clone())
-        .collect();
+    let observation_keys: Vec<(u64, String)> =
+        s.fused.iter().map(|(mid, ts, _)| (*ts, mid.clone())).collect();
+    let observation_memory_ids: Vec<String> =
+        observation_keys.iter().map(|(_, mid)| mid.clone()).collect();
     let entity_for_vec = s.payload.entity_id.as_deref().unwrap_or("default").to_string();
     let pit = s.payload.point_in_time_ms;
 
     let obs_start = Instant::now();
     let handle = tokio::runtime::Handle::current();
-    let (obs_res, cards_res, vectors_res, neg_res, invalid_res) = handle.block_on(async {
-        let tenant = s.tenant.clone();
-        let obs_keys = observation_keys.clone();
-        let obs_task = tokio::task::spawn_blocking(move || {
-            tenant.get_observations_batch(&obs_keys).unwrap_or_default()
-        });
+    let (obs_res, cards_res, vectors_res, neg_res, invalid_res) = handle
+        .block_on(async {
+            let tenant = s.tenant.clone();
+            let obs_keys = observation_keys.clone();
+            let obs_task = tokio::task::spawn_blocking(move || {
+                tenant.get_observations_batch(&obs_keys).unwrap_or_default()
+            });
 
-        let tenant2 = s.tenant.clone();
-        let obs_mids = observation_memory_ids.clone();
-        let cards_task = tokio::task::spawn_blocking(move || {
-            tenant2.get_memory_cards_batch(&obs_mids).unwrap_or_default()
-        });
+            let tenant2 = s.tenant.clone();
+            let obs_mids = observation_memory_ids.clone();
+            let cards_task = tokio::task::spawn_blocking(move || {
+                tenant2.get_memory_cards_batch(&obs_mids).unwrap_or_default()
+            });
 
-        let tenant3 = s.tenant.clone();
-        let entity = entity_for_vec.clone();
-        let vectors_task = tokio::task::spawn_blocking(move || {
-            tenant3.get_disambiguation_vectors_batch(&entity).unwrap_or_default()
-        });
+            let tenant3 = s.tenant.clone();
+            let entity = entity_for_vec.clone();
+            let vectors_task = tokio::task::spawn_blocking(move || {
+                tenant3.get_disambiguation_vectors_batch(&entity).unwrap_or_default()
+            });
 
-        let tenant4 = s.tenant.clone();
-        let entity2 = entity_for_vec.clone();
-        let neg_task = tokio::task::spawn_blocking(move || {
-            tenant4.get_negative_centroids_batch(&entity2).unwrap_or_default()
-        });
+            let tenant4 = s.tenant.clone();
+            let entity2 = entity_for_vec.clone();
+            let neg_task = tokio::task::spawn_blocking(move || {
+                tenant4.get_negative_centroids_batch(&entity2).unwrap_or_default()
+            });
 
-        let tenant5 = s.tenant.clone();
-        let invalid_task = tokio::task::spawn_blocking(move || {
-            if let Some(pit_ms) = pit {
-                tenant5.invalidated_set_at_time(pit_ms).unwrap_or_default()
-            } else {
-                tenant5.invalidated_set().unwrap_or_default()
-            }
-        });
+            let tenant5 = s.tenant.clone();
+            let invalid_task = tokio::task::spawn_blocking(move || {
+                if let Some(pit_ms) = pit {
+                    tenant5.invalidated_set_at_time(pit_ms).unwrap_or_default()
+                } else {
+                    tenant5.invalidated_set().unwrap_or_default()
+                }
+            });
 
-        tokio::try_join!(obs_task, cards_task, vectors_task, neg_task, invalid_task)
-    }).unwrap_or_default();
+            tokio::try_join!(obs_task, cards_task, vectors_task, neg_task, invalid_task)
+        })
+        .unwrap_or_default();
 
     s.observations = obs_res;
     s.memory_cards = cards_res;
@@ -2541,8 +2352,10 @@ fn score_loop(s: &mut QueryPipelineState) -> Vec<EvidenceCard> {
     let adaptive_profile = &s.adaptive_profile;
     let session_route_scores = &s.session_route_scores;
 
-    let disambiguation_map: std::collections::HashMap<&str, &[f32]> = disambiguation_vectors.iter().map(|(k, v)| (k.as_str(), v.as_slice())).collect();
-    let negative_map: std::collections::HashMap<&str, &[f32]> = negative_centroids.iter().map(|(k, v)| (k.as_str(), v.as_slice())).collect();
+    let disambiguation_map: std::collections::HashMap<&str, &[f32]> =
+        disambiguation_vectors.iter().map(|(k, v)| (k.as_str(), v.as_slice())).collect();
+    let negative_map: std::collections::HashMap<&str, &[f32]> =
+        negative_centroids.iter().map(|(k, v)| (k.as_str(), v.as_slice())).collect();
 
     for (mid, ts, rrf_score) in &s.fused {
         if is_synthetic_query_memory(mid) {
@@ -2551,13 +2364,11 @@ fn score_loop(s: &mut QueryPipelineState) -> Vec<EvidenceCard> {
         let Some(obs) = observations.get(mid) else {
             continue;
         };
-        let is_stale_fact = (obs.kind == MemoryKind::Fact || obs.kind == MemoryKind::Preference || obs.kind == MemoryKind::Decision)
+        let is_stale_fact = (obs.kind == MemoryKind::Fact
+            || obs.kind == MemoryKind::Preference
+            || obs.kind == MemoryKind::Decision)
             && invalidated_facts.contains(mid);
-        let created_at_ms = if obs.created_at_ms > 0 {
-            obs.created_at_ms
-        } else {
-            *ts
-        };
+        let created_at_ms = if obs.created_at_ms > 0 { obs.created_at_ms } else { *ts };
         if let Some(pit) = s.payload.point_in_time_ms {
             if created_at_ms > pit {
                 continue;
@@ -2569,30 +2380,29 @@ fn score_loop(s: &mut QueryPipelineState) -> Vec<EvidenceCard> {
         let temporal_hits = temporal_hit_count(&scorable, plan);
         let facet_mask = facet_match_mask(&scorable, plan);
         let mut base_score = neural_scores.get(mid).copied().unwrap_or(*rrf_score);
-        if base_score <= 0.001 && !primary_qembed.is_empty() && obs.embedding.len() == primary_qembed.len() {
+        if base_score <= 0.001
+            && !primary_qembed.is_empty()
+            && obs.embedding.len() == primary_qembed.len()
+        {
             base_score = cosine_similarity(primary_qembed, &obs.embedding).max(0.0);
         }
-        let lifecycle = memory_cards
-            .get(mid)
-            .and_then(|card| card.lifecycle.as_ref())
-            .cloned()
-            .unwrap_or_else(|| {
-                crate::lifecycle::evaluate_lifecycle(
-                    &obs.textual_content,
-                    obs.kind,
-                    created_at_ms,
-                    None,
-                    false,
-                )
-            });
-        let Some(lifecycle_adjustment) =
-            lifecycle_rank_adjustment(&lifecycle, obs.kind, now_ms)
+        let lifecycle =
+            memory_cards.get(mid).and_then(|card| card.lifecycle.as_ref()).cloned().unwrap_or_else(
+                || {
+                    crate::lifecycle::evaluate_lifecycle(
+                        &obs.textual_content,
+                        obs.kind,
+                        created_at_ms,
+                        None,
+                        false,
+                    )
+                },
+            );
+        let Some(lifecycle_adjustment) = lifecycle_rank_adjustment(&lifecycle, obs.kind, now_ms)
         else {
             continue;
         };
-        if let Some(mut fs) =
-            apply_decay_with_policy(base_score, created_at_ms, obs.kind, now_ms)
-        {
+        if let Some(mut fs) = apply_decay_with_policy(base_score, created_at_ms, obs.kind, now_ms) {
             fs += lifecycle_adjustment;
             if is_stale_fact {
                 fs *= s.weights.stale_fact_decay;
@@ -2612,11 +2422,8 @@ fn score_loop(s: &mut QueryPipelineState) -> Vec<EvidenceCard> {
             fs += numeric_signal_bonus(&obs.textual_content, &scorable.lower, plan_intent);
             fs += ordinal_signal_bonus(obs.kind, &scorable, plan);
             if let Some(disambiguation) = disambiguation_map.get(mid.as_str()) {
-                if disambiguation.len() == primary_qembed.len()
-                    && !primary_qembed.is_empty()
-                {
-                    fs +=
-                        cosine_similarity(primary_qembed, disambiguation) * 0.05;
+                if disambiguation.len() == primary_qembed.len() && !primary_qembed.is_empty() {
+                    fs += cosine_similarity(primary_qembed, disambiguation) * 0.05;
                 }
             }
             if let Some(negative_centroid) = negative_map.get(mid.as_str()) {
@@ -2624,12 +2431,8 @@ fn score_loop(s: &mut QueryPipelineState) -> Vec<EvidenceCard> {
                     && obs.embedding.len() == primary_qembed.len()
                     && !primary_qembed.is_empty()
                 {
-                    let margin =
-                        cosine_similarity(primary_qembed, &obs.embedding)
-                            - cosine_similarity(
-                                primary_qembed,
-                                negative_centroid,
-                             );
+                    let margin = cosine_similarity(primary_qembed, &obs.embedding)
+                        - cosine_similarity(primary_qembed, negative_centroid);
                     fs += margin * 0.08;
                 }
             }
@@ -2640,10 +2443,15 @@ fn score_loop(s: &mut QueryPipelineState) -> Vec<EvidenceCard> {
             } else {
                 0.0
             };
-            let confidence_signal: f32 = if is_stale_fact { s.weights.rerank_stale_penalty }
-                else if lifecycle.stability_score > 0.7 { s.weights.rerank_confidence_stable }
-                else if lifecycle.confidence_score > 0.7 { s.weights.rerank_confidence_high }
-                else { 0.0 };
+            let confidence_signal: f32 = if is_stale_fact {
+                s.weights.rerank_stale_penalty
+            } else if lifecycle.stability_score > 0.7 {
+                s.weights.rerank_confidence_stable
+            } else if lifecycle.confidence_score > 0.7 {
+                s.weights.rerank_confidence_high
+            } else {
+                0.0
+            };
 
             let weights = FourSignalWeights::for_intent(plan_intent);
             let semantic_signal = base_score.max(0.0);
@@ -2655,7 +2463,8 @@ fn score_loop(s: &mut QueryPipelineState) -> Vec<EvidenceCard> {
                 graph_score.max(0.0),
                 &weights,
             );
-            fs = fs * (1.0 - s.weights.four_signal_temporal_weight) + reweighted * s.weights.four_signal_temporal_weight;
+            fs = fs * (1.0 - s.weights.four_signal_temporal_weight)
+                + reweighted * s.weights.four_signal_temporal_weight;
             if adaptive_profile.route_strength > 0.0 {
                 let routed_sid = memory_cards
                     .get(mid)
@@ -2663,8 +2472,7 @@ fn score_loop(s: &mut QueryPipelineState) -> Vec<EvidenceCard> {
                     .or_else(|| routed_session_from_memory_id(mid));
                 if let Some(sid) = routed_sid {
                     if adaptive_profile.route_sessions.contains(&sid) {
-                        let route_score =
-                            session_route_scores.get(&sid).copied().unwrap_or(0.0);
+                        let route_score = session_route_scores.get(&sid).copied().unwrap_or(0.0);
                         fs += if plan.needs_decomposition || plan.cross_entity {
                             s.weights.route_boost_hard
                         } else {
@@ -2676,35 +2484,21 @@ fn score_loop(s: &mut QueryPipelineState) -> Vec<EvidenceCard> {
                     }
                 }
             }
-            let (source_memory_id, source_session_id) =
-                if let Some(card) = memory_cards.get(mid) {
-                    if card.source_memory_id != *mid {
-                        (
-                            card.source_memory_id.clone(),
-                            card.source_session_id.clone(),
-                        )
-                    } else {
-                        (
-                            mid.clone(),
-                            session_id_from_memory_id(mid).unwrap_or_default(),
-                        )
-                    }
+            let (source_memory_id, source_session_id) = if let Some(card) = memory_cards.get(mid) {
+                if card.source_memory_id != *mid {
+                    (card.source_memory_id.clone(), card.source_session_id.clone())
                 } else {
-                    (
-                        mid.clone(),
-                        session_id_from_memory_id(mid).unwrap_or_default(),
-                    )
-                };
+                    (mid.clone(), session_id_from_memory_id(mid).unwrap_or_default())
+                }
+            } else {
+                (mid.clone(), session_id_from_memory_id(mid).unwrap_or_default())
+            };
 
             scored.push(EvidenceCard {
                 claim_text: obs.textual_content.clone(),
                 source_memory_id,
                 source_session_id,
-                card_id: if memory_cards.contains_key(mid) {
-                    Some(mid.clone())
-                } else {
-                    None
-                },
+                card_id: if memory_cards.contains_key(mid) { Some(mid.clone()) } else { None },
                 semantic_rank: None,
                 semantic_score: base_score,
                 bm25_rank: None,
@@ -2733,7 +2527,10 @@ fn score_loop(s: &mut QueryPipelineState) -> Vec<EvidenceCard> {
     scored
 }
 
-fn score_build_response(s: &mut QueryPipelineState, mut evidence_cards: Vec<EvidenceCard>) -> Vec<QueryResult> {
+fn score_build_response(
+    s: &mut QueryPipelineState,
+    mut evidence_cards: Vec<EvidenceCard>,
+) -> Vec<QueryResult> {
     (s.diag.hydrate_ms, s.diag.hydrate_us) = elapsed_ms_and_us(Instant::now());
 
     let stage_start = Instant::now();
@@ -2755,11 +2552,7 @@ fn score_build_response(s: &mut QueryPipelineState, mut evidence_cards: Vec<Evid
                 .unwrap_or(0);
             let synthetic_id = format!("__pre_synth_fact::{}::{}", entity_id, fact_key);
             evidence_cards.push(EvidenceCard {
-                claim_text: format!(
-                    "{}: {}",
-                    fact_key.replace('_', " "),
-                    fact_value
-                ),
+                claim_text: format!("{}: {}", fact_key.replace('_', " "), fact_value),
                 source_memory_id: synthetic_id.clone(),
                 source_session_id: String::new(),
                 card_id: Some(synthetic_id),
@@ -2794,9 +2587,7 @@ fn score_build_response(s: &mut QueryPipelineState, mut evidence_cards: Vec<Evid
     }
 
     evidence_cards.sort_by(|a, b| {
-        b.final_score
-            .partial_cmp(&a.final_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        b.final_score.partial_cmp(&a.final_score).unwrap_or(std::cmp::Ordering::Equal)
     });
 
     // Ambiguity packet: when the top two candidates are nearly tied (e.g.
@@ -2809,9 +2600,7 @@ fn score_build_response(s: &mut QueryPipelineState, mut evidence_cards: Vec<Evid
         let second_score = evidence_cards[1].final_score;
         let delta = (top_score - second_score).abs();
         if delta < s.weights.ambiguity_delta_threshold
-            && !evidence_cards[0]
-                .source_memory_id
-                .starts_with("__pre_synth_")
+            && !evidence_cards[0].source_memory_id.starts_with("__pre_synth_")
         {
             let note = format!(
                 "AmbiguityPacket: top-2 candidates are within {:.3} of each other ({} vs {}); consider asking the user to disambiguate.",
@@ -2842,10 +2631,8 @@ fn score_build_response(s: &mut QueryPipelineState, mut evidence_cards: Vec<Evid
         source_keys.push((card.created_at_ms, card.source_memory_id.clone()));
     }
     let hydrate_obs_start = Instant::now();
-    let source_observations = s.tenant
-        .get_observations_batch(&source_keys)
-        .unwrap_or_default();
-    
+    let source_observations = s.tenant.get_observations_batch(&source_keys).unwrap_or_default();
+
     let mut fact_memory_ids = Vec::new();
     let mut card_ids = Vec::new();
     for card in &selected {
@@ -2856,8 +2643,9 @@ fn score_build_response(s: &mut QueryPipelineState, mut evidence_cards: Vec<Evid
             card_ids.push(cid.clone());
         }
     }
-    
-    let fact_versions = s.tenant.get_fact_versions_by_memory_ids(&fact_memory_ids).unwrap_or_default();
+
+    let fact_versions =
+        s.tenant.get_fact_versions_by_memory_ids(&fact_memory_ids).unwrap_or_default();
     let memory_cards = s.tenant.get_memory_cards_batch(&card_ids).unwrap_or_default();
 
     (s.diag.hydrate_obs_ms, s.diag.hydrate_obs_us) = elapsed_ms_and_us(hydrate_obs_start);
@@ -2865,12 +2653,11 @@ fn score_build_response(s: &mut QueryPipelineState, mut evidence_cards: Vec<Evid
     let mut queries: Vec<QueryResult> = selected
         .into_iter()
         .map(|card| {
-            let text =
-                if let Some(source_obs) = source_observations.get(&card.source_memory_id) {
-                    source_obs.textual_content.clone()
-                } else {
-                    card.claim_text.clone()
-                };
+            let text = if let Some(source_obs) = source_observations.get(&card.source_memory_id) {
+                source_obs.textual_content.clone()
+            } else {
+                card.claim_text.clone()
+            };
             let evidence = if s.include_evidence && s.proof_mode != "off" {
                 Some(build_proof_packet(
                     &s.tenant,
@@ -2919,7 +2706,8 @@ fn score_build_response(s: &mut QueryPipelineState, mut evidence_cards: Vec<Evid
             }
         })
         .collect();
-    let evidence_conf = compute_evidence_confidence(&queries, &s.query_text, s.state.intent_classifier.as_deref());
+    let evidence_conf =
+        compute_evidence_confidence(&queries, &s.query_text, s.state.intent_classifier.as_deref());
     s.diag.evidence_confidence_bp = (evidence_conf * 10_000.0) as u64;
     s.diag.abstain_recommended = evidence_conf < 0.24 && !queries.is_empty();
     (s.diag.session_ms, s.diag.session_us) = elapsed_ms_and_us(stage_start);
@@ -2978,7 +2766,7 @@ pub fn execute_query_pipeline(
     rerank_phase(&mut s);
     fusion_phase(&mut s);
     let mut results = score_phase(&mut s);
-    
+
     let intent = s.plan.intent;
     let entity_id = s.payload.entity_id.clone().unwrap_or_else(|| "default".to_string());
     if matches!(intent, QueryIntent::Inference | QueryIntent::Recommendation) {
@@ -2994,7 +2782,8 @@ pub fn execute_query_pipeline(
                 turn_index: 0,
                 similarity: 1.0,
                 created_at_ms: 0,
-                textual_content: "Graph inference conclusions derived from relationship patterns.".to_string(),
+                textual_content: "Graph inference conclusions derived from relationship patterns."
+                    .to_string(),
                 evidence: None,
                 inference_notes: Some(notes),
                 fact_key: None,

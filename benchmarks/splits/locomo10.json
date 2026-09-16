@@ -1,0 +1,20 @@
+{
+  "dataset": "locomo10.json",
+  "seed": 20260916,
+  "dev_fraction": 0.3,
+  "unit": "conversation",
+  "dev": [
+    "conv-26",
+    "conv-30",
+    "conv-42"
+  ],
+  "test": [
+    "conv-41",
+    "conv-43",
+    "conv-44",
+    "conv-47",
+    "conv-48",
+    "conv-49",
+    "conv-50"
+  ]
+}

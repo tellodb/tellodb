@@ -716,7 +716,7 @@ fn verify_password(password_hash: &str, password: &str) -> bool {
 
 fn is_safe_user_id(user_id: &str) -> bool {
     let len = user_id.len();
-    if len < 8 || len > 128 {
+    if !(8..=128).contains(&len) {
         return false;
     }
     if !user_id.starts_with("usr_") {

@@ -1,6 +1,6 @@
 #![allow(dead_code)]
-use crate::storage::tenant::TenantStore;
 use crate::api::plan::types::QueryIntent;
+use crate::storage::tenant::TenantStore;
 use rusqlite::params;
 
 pub struct InferredConclusion {
@@ -37,14 +37,17 @@ pub fn run_graph_inference(
          JOIN edges e2 ON e1.source = e2.source
          WHERE e1.source = ?1
            AND e1.edge_type = 'prefers'
-           AND e2.edge_type = 'caused_by'"
+           AND e2.edge_type = 'caused_by'",
     ) {
         if let Ok(mut rows) = stmt.query(params![entity_id]) {
             while let Ok(Some(row)) = rows.next() {
                 if let (Ok(pref), Ok(cause)) = (row.get::<_, String>(0), row.get::<_, String>(1)) {
                     conclusions.push(InferredConclusion {
                         entity_id: entity_id.to_string(),
-                        conclusion_text: format!("{} prefers {} possibly because of {}.", entity_id, pref, cause),
+                        conclusion_text: format!(
+                            "{} prefers {} possibly because of {}.",
+                            entity_id, pref, cause
+                        ),
                         confidence: 0.60,
                         pattern: "preference_chain",
                     });
@@ -60,14 +63,19 @@ pub fn run_graph_inference(
          JOIN edges e2 ON e1.target = e2.source
          WHERE e1.source = ?1
            AND e1.edge_type = 'leads_to'
-           AND e2.edge_type = 'leads_to'"
+           AND e2.edge_type = 'leads_to'",
     ) {
         if let Ok(mut rows) = stmt.query(params![entity_id]) {
             while let Ok(Some(row)) = rows.next() {
-                if let (Ok(rc), Ok(fe), Ok(im)) = (row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, String>(2)) {
+                if let (Ok(rc), Ok(fe), Ok(im)) =
+                    (row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, String>(2))
+                {
                     conclusions.push(InferredConclusion {
                         entity_id: entity_id.to_string(),
-                        conclusion_text: format!("{}: {} is a root cause of {} via {}.", entity_id, rc, fe, im),
+                        conclusion_text: format!(
+                            "{}: {} is a root cause of {} via {}.",
+                            entity_id, rc, fe, im
+                        ),
                         confidence: 0.55,
                         pattern: "causal_sequence",
                     });

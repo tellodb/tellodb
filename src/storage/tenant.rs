@@ -494,7 +494,9 @@ impl TenantStore {
                 .unwrap_or(0)
                 > 0;
             if !has_hash_col {
-                conn.execute_batch("ALTER TABLE memories ADD COLUMN content_hash TEXT NOT NULL DEFAULT '';")?;
+                conn.execute_batch(
+                    "ALTER TABLE memories ADD COLUMN content_hash TEXT NOT NULL DEFAULT '';",
+                )?;
             }
             let has_hash_idx: bool = conn
                 .prepare("SELECT COUNT(*) FROM pragma_index_list('memories') WHERE name = 'idx_memories_content_hash'")?
@@ -1123,10 +1125,8 @@ impl TenantStore {
     /// Register a canonical entity name with its phonetic key.
     /// If the name already exists for this scope, it is a no-op.
     pub fn register_entity(&self, entity_id: &str, canonical_name: &str) -> Result<()> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let now =
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
         let sk = crate::storage::entity_resolver::phonetic_key(canonical_name);
         let conn = self.get_conn()?;
         conn.execute(
@@ -1152,7 +1152,8 @@ impl TenantStore {
         })?;
 
         let mut candidates: Vec<crate::storage::entity_resolver::EntityCandidate> = Vec::new();
-        let mut name_index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut name_index: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
 
         for row in rows {
             let (name, sk) = row?;
@@ -1166,9 +1167,8 @@ impl TenantStore {
             name_index.insert(name.to_ascii_lowercase(), idx);
         }
 
-        let mut alias_stmt = conn.prepare_cached(
-            "SELECT alias FROM aliases WHERE entity_id = ?1",
-        )?;
+        let mut alias_stmt =
+            conn.prepare_cached("SELECT alias FROM aliases WHERE entity_id = ?1")?;
         let alias_rows = alias_stmt.query_map(params![entity_id], |row| row.get::<_, String>(0))?;
         for alias in alias_rows {
             let alias = alias?;
@@ -1189,7 +1189,11 @@ impl TenantStore {
             "SELECT canonical_name, embedding_blob, dim FROM name_embeddings WHERE entity_id = ?1",
         )?;
         let emb_rows = emb_stmt.query_map(params![entity_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, i64>(2)? as usize))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, i64>(2)? as usize,
+            ))
         })?;
         for row in emb_rows {
             let (cname, blob, dim) = row?;
@@ -1227,10 +1231,8 @@ impl TenantStore {
         tier: &str,
         confidence: f32,
     ) -> Result<Option<String>> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let now =
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
         let pid = Self::proposal_id(entity_id, from_name, to_name, now);
         let conn = self.get_conn()?;
         let inserted = conn.execute(
@@ -1238,7 +1240,11 @@ impl TenantStore {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7)",
             params![pid, entity_id, from_name, to_name, tier, confidence as f64, now as i64],
         )?;
-        if inserted > 0 { Ok(Some(pid)) } else { Ok(None) }
+        if inserted > 0 {
+            Ok(Some(pid))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Run the tiered resolver against the entity registry.
@@ -1251,7 +1257,12 @@ impl TenantStore {
         config: &crate::storage::entity_resolver::ResolutionConfig,
     ) -> Result<crate::storage::entity_resolver::EntityResolution> {
         let candidates = self.load_entity_candidates(entity_id)?;
-        let resolution = crate::storage::entity_resolver::resolve_name(name, &candidates, name_embedding, config);
+        let resolution = crate::storage::entity_resolver::resolve_name(
+            name,
+            &candidates,
+            name_embedding,
+            config,
+        );
         if let Some(ref matched) = resolution.matched_name {
             let tier_label = match resolution.tier {
                 crate::storage::entity_resolver::ResolverTier::Exact => return Ok(resolution),
@@ -1259,8 +1270,14 @@ impl TenantStore {
                 crate::storage::entity_resolver::ResolverTier::Phonetic => "phonetic",
                 crate::storage::entity_resolver::ResolverTier::Embedding(_) => "embedding",
             };
-            if name.to_ascii_lowercase() != matched.to_ascii_lowercase() {
-                let _ = self.create_merge_proposal(entity_id, name, matched, tier_label, resolution.tier.confidence());
+            if !name.eq_ignore_ascii_case(matched) {
+                let _ = self.create_merge_proposal(
+                    entity_id,
+                    name,
+                    matched,
+                    tier_label,
+                    resolution.tier.confidence(),
+                );
             }
         }
         Ok(resolution)
@@ -1268,12 +1285,14 @@ impl TenantStore {
 
     /// Batch check which content hashes already exist.
     /// Returns a set of hashes that are already stored.
-    pub fn existing_content_hashes(&self, hashes: &[String]) -> Result<std::collections::HashSet<String>> {
+    pub fn existing_content_hashes(
+        &self,
+        hashes: &[String],
+    ) -> Result<std::collections::HashSet<String>> {
         let conn = self.get_conn()?;
         let mut found = std::collections::HashSet::new();
-        let mut stmt = conn.prepare_cached(
-            "SELECT content_hash FROM memories WHERE content_hash = ?1",
-        )?;
+        let mut stmt =
+            conn.prepare_cached("SELECT content_hash FROM memories WHERE content_hash = ?1")?;
         for h in hashes {
             let exists: bool = stmt
                 .query_row(params![h], |row| row.get::<_, String>(0))
@@ -1305,6 +1324,7 @@ impl TenantStore {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn get_linked_memories(&self, memory_id: &str) -> Result<Vec<String>> {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
@@ -1372,12 +1392,12 @@ impl TenantStore {
              WHERE e.memory_id != ?1
                AND (?2 IS NULL OR e.edge_type = ?2)
              ORDER BY e.weight DESC
-             LIMIT ?3"
+             LIMIT ?3",
         )?;
-        let rows = stmt.query_map(
-            params![seed_memory_id, edge_type_filter, limit as i64],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)? as f32))
-        )?;
+        let rows = stmt
+            .query_map(params![seed_memory_id, edge_type_filter, limit as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)? as f32))
+            })?;
         let mut result = Vec::new();
         for row in rows {
             result.push(row?);
@@ -1415,16 +1435,16 @@ impl TenantStore {
                    AND (?2 IS NULL OR e.edge_type = ?2)
              )
              ORDER BY weight DESC
-             LIMIT ?3"
+             LIMIT ?3",
         )?;
-        let rows = stmt.query_map(
-            params![seed_memory_id, edge_type_filter, limit as i64],
-            |row| Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, f64>(1)? as f32,
-                row.get::<_, String>(2)?,
-            ))
-        )?;
+        let rows =
+            stmt.query_map(params![seed_memory_id, edge_type_filter, limit as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, f64>(1)? as f32,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
         let mut result = Vec::new();
         for row in rows {
             result.push(row?);
@@ -1476,15 +1496,18 @@ impl TenantStore {
                     Err(_) => record.clone(),
                 };
                 let json = serde_json::to_string(&merged)?;
-                let rowid: i64 = upsert_stmt.query_row(params![
-                    merged.session_id,
-                    merged.entity_id,
-                    json,
-                    &merged.router_text,
-                    merged.created_at_ms.min(now),
-                    now,
-                ], |row| row.get(0))?;
-                
+                let rowid: i64 = upsert_stmt.query_row(
+                    params![
+                        merged.session_id,
+                        merged.entity_id,
+                        json,
+                        &merged.router_text,
+                        merged.created_at_ms.min(now),
+                        now,
+                    ],
+                    |row| row.get(0),
+                )?;
+
                 fts.execute(params![
                     rowid,
                     &merged.session_id,
@@ -1588,11 +1611,7 @@ impl TenantStore {
                     .filter(|part| part.len() >= FOCUS_MATCH_MIN_LEN)
                     .any(|part| record.session_focus.to_ascii_lowercase().contains(part));
 
-            if lexical_hits == 0
-                && temporal_hits == 0
-                && entity_hits == 0
-                && !exact_focus_hit
-            {
+            if lexical_hits == 0 && temporal_hits == 0 && entity_hits == 0 && !exact_focus_hit {
                 // Last-ditch accept: if the router_text has ANY of the raw query
                 // terms (not just the classified lexical/temporal/entity terms),
                 // keep the row. The classified term lists are often empty for
@@ -1601,8 +1620,8 @@ impl TenantStore {
                     .split_whitespace()
                     .filter(|t| t.len() > SEARCH_MIN_TERM_LEN)
                     .collect();
-                let has_raw_term = !lower_terms.is_empty()
-                    && lower_terms.iter().any(|t| lower.contains(t));
+                let has_raw_term =
+                    !lower_terms.is_empty() && lower_terms.iter().any(|t| lower.contains(t));
                 if !has_raw_term {
                     continue;
                 }
@@ -1702,7 +1721,7 @@ impl TenantStore {
             )?;
             let rows = stmt.query_map(
                 params![fts_query, entity_id, (subject_entities.len().saturating_mul(8)) as i64],
-                |row| Ok(row.get::<_, String>(0)?),
+                |row| row.get::<_, String>(0),
             )?;
             for row in rows.flatten() {
                 *session_to_hits.entry(row).or_insert(0) += 1;
@@ -1720,10 +1739,9 @@ impl TenantStore {
                 "SELECT session_id FROM session_router
                  WHERE entity_id = ?1 AND LOWER(router_text) LIKE ?2",
             )?;
-            let rows = stmt.query_map(
-                params![entity_id, format!("%{}%", needle)],
-                |row| Ok(row.get::<_, String>(0)?),
-            )?;
+            let rows = stmt.query_map(params![entity_id, format!("%{}%", needle)], |row| {
+                row.get::<_, String>(0)
+            })?;
             for row in rows.flatten() {
                 *session_to_hits.entry(row).or_insert(0) += 1;
             }
@@ -1857,7 +1875,8 @@ impl TenantStore {
                     Some((old_id, old_ts)) if old_id != *memory_id => {
                         if *ts > old_ts {
                             // Incoming is newer: supersede the old version
-                            update_stmt.execute(params![memory_id, fact_key, entity_id, *ts as i64])?;
+                            update_stmt
+                                .execute(params![memory_id, fact_key, entity_id, *ts as i64])?;
                             insert_current.execute(params![
                                 fact_key, memory_id, entity_id, subject, predicate, object, ts
                             ])?;
@@ -1867,8 +1886,15 @@ impl TenantStore {
                         } else {
                             // Incoming is older or equal: mark incoming as stale, keep existing current
                             insert_stale.execute(params![
-                                fact_key, memory_id, entity_id, subject, predicate, object, ts,
-                                old_id, old_ts as i64
+                                fact_key,
+                                memory_id,
+                                entity_id,
+                                subject,
+                                predicate,
+                                object,
+                                ts,
+                                old_id,
+                                old_ts as i64
                             ])?;
                             statuses.push(FactVersionStatus::Stale { current: (old_ts, old_id) });
                         }
@@ -1903,9 +1929,8 @@ impl TenantStore {
              WHERE fact_key = ?1 AND entity_id = ?2 AND status = 'current'
              ORDER BY timestamp_ms DESC LIMIT 1",
         )?;
-        let res = stmt.query_row(params![fact_key, entity_id], |row| {
-            row.get::<_, Option<String>>(0)
-        });
+        let res =
+            stmt.query_row(params![fact_key, entity_id], |row| row.get::<_, Option<String>>(0));
         match res {
             Ok(Some(value)) => Ok(Some(value)),
             Ok(None) => Ok(None),
@@ -2001,31 +2026,34 @@ impl TenantStore {
         // child chunks have card_id = "{parent}::ct{N}" and source_memory_id
         // = parent. Clean them up.
         let chunk_pattern = format!("{}::ct%", memory_id);
-        
+
         let mut chunk_rowids: Vec<i64> = Vec::new();
         {
-            let mut stmt = tx.prepare("SELECT rowid FROM memories WHERE source_memory_id = ?1 OR memory_id LIKE ?2")?;
+            let mut stmt = tx.prepare(
+                "SELECT rowid FROM memories WHERE source_memory_id = ?1 OR memory_id LIKE ?2",
+            )?;
             let mut rows = stmt.query(params![memory_id, chunk_pattern])?;
             while let Some(row) = rows.next()? {
                 chunk_rowids.push(row.get(0)?);
             }
         }
-        
+
         let _chunk_rows = tx.execute(
             "DELETE FROM memory_cards WHERE source_memory_id = ?1 OR card_id LIKE ?2",
             params![memory_id, chunk_pattern],
         )?;
-        
+
         if !chunk_rowids.is_empty() {
             let placeholders: Vec<String> = chunk_rowids.iter().map(|_| "?".to_string()).collect();
-            let sql = format!("DELETE FROM fts_memories WHERE rowid IN ({})", placeholders.join(","));
-            let params: Vec<&dyn rusqlite::types::ToSql> = chunk_rowids.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+            let sql =
+                format!("DELETE FROM fts_memories WHERE rowid IN ({})", placeholders.join(","));
+            let params: Vec<&dyn rusqlite::types::ToSql> =
+                chunk_rowids.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
             tx.execute(&sql, params.as_slice())?;
-            
+
             let sql2 = format!("DELETE FROM memories WHERE rowid IN ({})", placeholders.join(","));
             tx.execute(&sql2, params.as_slice())?;
         }
-
 
         tx.commit()?;
 
@@ -2322,8 +2350,11 @@ impl TenantStore {
             } else {
                 temporal_hits as f32 / query.temporal_terms.len() as f32
             };
-            let entity_coverage =
-                if query.entities.is_empty() { 0.0 } else { entity_hits as f32 / query.entities.len() as f32 };
+            let entity_coverage = if query.entities.is_empty() {
+                0.0
+            } else {
+                entity_hits as f32 / query.entities.len() as f32
+            };
 
             let type_boost = match card_type.as_str() {
                 "fact" => FACT_TYPE_BOOST,
@@ -2369,7 +2400,7 @@ impl TenantStore {
         entity_id: Option<&str>,
     ) -> Result<Vec<(String, f32)>> {
         let conn = self.get_conn()?;
-        
+
         let cleaned = query.replace(|c: char| !c.is_alphanumeric() && c != ' ', " ");
         let mut terms: Vec<String> = cleaned
             .split_whitespace()
@@ -2456,10 +2487,7 @@ impl TenantStore {
 
     // ── Graph methods (delegated here) ──
 
-    pub fn graph_upsert_memory_batch(
-        &self,
-        batch: &GraphEdgeBatch<'_>,
-    ) -> Result<()> {
+    pub fn graph_upsert_memory_batch(&self, batch: &GraphEdgeBatch<'_>) -> Result<()> {
         let mut conn = self.get_conn()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         {
@@ -2468,11 +2496,20 @@ impl TenantStore {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )?;
             for entry in batch {
-                let edge_id = format!("edge::{}::{}::{}", entry.memory_id, entry.subject, entry.predicate);
+                let edge_id =
+                    format!("edge::{}::{}::{}", entry.memory_id, entry.subject, entry.predicate);
                 let label = format!("{} {} {}", entry.subject, entry.predicate, entry.object);
                 let weight = crate::graph::EdgeType::from_str(entry.predicate).default_weight();
                 stmt.execute(params![
-                    edge_id, entry.subject, entry.object, entry.predicate, label, entry.status, entry.timestamp as i64, entry.memory_id, weight as f64,
+                    edge_id,
+                    entry.subject,
+                    entry.object,
+                    entry.predicate,
+                    label,
+                    entry.status,
+                    entry.timestamp as i64,
+                    entry.memory_id,
+                    weight as f64,
                 ])?;
             }
         }
@@ -2486,7 +2523,7 @@ impl TenantStore {
         _entity_scope: &str,
         memory_id: &str,
         subject: &str,
-        predicate: &str,   // becomes edge_type
+        predicate: &str, // becomes edge_type
         object: &str,
         timestamp_ms: u64,
     ) -> Result<()> {
@@ -2701,10 +2738,7 @@ impl TenantStore {
     /// Look up the highest-confidence, most-recent memory card for a given
     /// source memory_id. Returns the most recent `is_latest` card, or the
     /// most recent card of any kind if no `is_latest` row exists.
-    pub fn get_memory_card_by_source(
-        &self,
-        source_memory_id: &str,
-    ) -> Result<Option<MemoryCard>> {
+    pub fn get_memory_card_by_source(&self, source_memory_id: &str) -> Result<Option<MemoryCard>> {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT card_id, entity_id, user_id, source_memory_id, source_session_id,
@@ -2865,14 +2899,18 @@ impl TenantStore {
         Ok(set)
     }
 
-    pub fn invalidated_set_at_time(&self, point_in_time_ms: u64) -> Result<std::collections::HashSet<String>> {
+    pub fn invalidated_set_at_time(
+        &self,
+        point_in_time_ms: u64,
+    ) -> Result<std::collections::HashSet<String>> {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT memory_id FROM fact_versions 
              WHERE (valid_to_ms IS NOT NULL AND valid_to_ms <= ?1)
-                OR (COALESCE(valid_from_ms, 0) > ?1)"
+                OR (COALESCE(valid_from_ms, 0) > ?1)",
         )?;
-        let rows = stmt.query_map(params![point_in_time_ms as i64], |row| row.get::<_, String>(0))?;
+        let rows =
+            stmt.query_map(params![point_in_time_ms as i64], |row| row.get::<_, String>(0))?;
         let mut set = std::collections::HashSet::new();
         for r in rows {
             set.insert(r?);
@@ -2880,7 +2918,6 @@ impl TenantStore {
         Ok(set)
     }
 }
-
 
 fn dedupe_append<T: Clone + PartialEq + Eq + std::hash::Hash>(base: &[T], extra: &[T]) -> Vec<T> {
     let mut seen: std::collections::HashSet<&T> = base.iter().collect();
@@ -3002,11 +3039,14 @@ impl TenantStore {
 
             for row in rows {
                 let (card_id, lifecycle_json) = row?;
-                if let Ok(mut lifecycle) = serde_json::from_str::<crate::lifecycle::LifecycleMetadata>(&lifecycle_json) {
+                if let Ok(mut lifecycle) =
+                    serde_json::from_str::<crate::lifecycle::LifecycleMetadata>(&lifecycle_json)
+                {
                     if lifecycle.lifecycle_state != crate::lifecycle::LifecycleState::Expired
                         && matches!(
                             lifecycle.retention_class,
-                            crate::lifecycle::RetentionClass::Ephemeral | crate::lifecycle::RetentionClass::Working
+                            crate::lifecycle::RetentionClass::Ephemeral
+                                | crate::lifecycle::RetentionClass::Working
                         )
                     {
                         lifecycle.lifecycle_state = crate::lifecycle::LifecycleState::Expired;
@@ -3023,7 +3063,7 @@ impl TenantStore {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             {
                 let mut update_stmt = tx.prepare_cached(
-                    "UPDATE memory_cards SET lifecycle = ?1, updated_at_ms = ?2 WHERE card_id = ?3"
+                    "UPDATE memory_cards SET lifecycle = ?1, updated_at_ms = ?2 WHERE card_id = ?3",
                 )?;
                 for (card_id, updated_json) in updates {
                     update_stmt.execute(params![updated_json, now_ms as i64, card_id])?;
@@ -3128,15 +3168,13 @@ mod tests {
         let db_path = temp.path().join("tenant.db");
         let store = TenantStore::new(&db_path).unwrap();
 
-        let registrations1 = vec![
-            ("fact_key_1", 100, "mem-100", "Caroline", "prefers", "counseling")
-        ];
+        let registrations1 =
+            vec![("fact_key_1", 100, "mem-100", "Caroline", "prefers", "counseling")];
         let statuses1 = store.register_fact_versions_batch("Caroline", &registrations1).unwrap();
         assert_eq!(statuses1.len(), 1);
 
-        let registrations2 = vec![
-            ("fact_key_1", 200, "mem-200", "Caroline", "prefers", "coaching")
-        ];
+        let registrations2 =
+            vec![("fact_key_1", 200, "mem-200", "Caroline", "prefers", "coaching")];
         let statuses2 = store.register_fact_versions_batch("Caroline", &registrations2).unwrap();
         assert_eq!(statuses2.len(), 1);
 
@@ -3187,15 +3225,13 @@ mod tests {
         let db_path = temp.path().join("tenant.db");
         let store = TenantStore::new(&db_path).unwrap();
 
-        let registrations1 = vec![
-            ("pref_key_1", 100, "mem-pref-1", "Caroline", "prefers", "counseling")
-        ];
+        let registrations1 =
+            vec![("pref_key_1", 100, "mem-pref-1", "Caroline", "prefers", "counseling")];
         let statuses1 = store.register_fact_versions_batch("Caroline", &registrations1).unwrap();
         assert_eq!(statuses1.len(), 1);
 
-        let registrations2 = vec![
-            ("pref_key_1", 200, "mem-pref-2", "Caroline", "prefers", "coaching")
-        ];
+        let registrations2 =
+            vec![("pref_key_1", 200, "mem-pref-2", "Caroline", "prefers", "coaching")];
         let statuses2 = store.register_fact_versions_batch("Caroline", &registrations2).unwrap();
         assert_eq!(statuses2.len(), 1);
 
@@ -3248,7 +3284,7 @@ mod tests {
             updated_at_ms: 100,
         };
 
-        store.ingest_cards(&[card.clone()]).unwrap();
+        store.ingest_cards(std::slice::from_ref(&card)).unwrap();
 
         // Sweep at time 500 (card has not expired)
         let swept = store.expire_records(500).unwrap();

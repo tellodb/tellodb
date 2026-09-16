@@ -87,14 +87,8 @@ pub fn request_bearer_token(headers: &HeaderMap) -> Option<&str> {
     }
 }
 
-pub fn cors_allow_origins() -> Vec<HeaderValue> {
-    let configured = env::var("TEMPORAL_MEMORY_CORS_ALLOW_ORIGINS")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            env::var("TELLODB_CORS_ALLOW_ORIGINS").ok().filter(|value| !value.trim().is_empty())
-        })
-        .unwrap_or_else(|| "https://tellodb.com".to_string());
+pub fn parse_cors_allow_origins(raw: Option<&str>) -> Vec<HeaderValue> {
+    let configured = raw.map(str::trim).filter(|v| !v.is_empty()).unwrap_or("https://tellodb.com");
 
     let mut origins = configured
         .split(',')
@@ -113,6 +107,17 @@ pub fn cors_allow_origins() -> Vec<HeaderValue> {
     }
 
     origins
+}
+
+pub fn cors_allow_origins() -> Vec<HeaderValue> {
+    let configured = env::var("TEMPORAL_MEMORY_CORS_ALLOW_ORIGINS")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            env::var("TELLODB_CORS_ALLOW_ORIGINS").ok().filter(|value| !value.trim().is_empty())
+        });
+
+    parse_cors_allow_origins(configured.as_deref())
 }
 
 pub fn build_cors_layer() -> CorsLayer {
@@ -210,7 +215,7 @@ pub fn authorize_request(
 /// migration that lets an attacker-controlled value flow into SQL still fails.
 pub fn is_valid_user_id(user_id: &str) -> bool {
     let len = user_id.len();
-    if len < 8 || len > 128 {
+    if !(8..=128).contains(&len) {
         return false;
     }
     if !user_id.starts_with("usr_") {
@@ -502,22 +507,14 @@ mod tests {
 
     #[test]
     fn cors_allow_origins_default() {
-        std::env::remove_var("TEMPORAL_MEMORY_CORS_ALLOW_ORIGINS");
-        std::env::remove_var("TELLODB_CORS_ALLOW_ORIGINS");
-        let origins = cors_allow_origins();
+        let origins = parse_cors_allow_origins(None);
         assert_eq!(origins.len(), 1);
         assert_eq!(origins[0], "https://tellodb.com");
     }
 
     #[test]
     fn cors_allow_origins_from_env() {
-        std::env::remove_var("TEMPORAL_MEMORY_CORS_ALLOW_ORIGINS");
-        std::env::set_var(
-            "TELLODB_CORS_ALLOW_ORIGINS",
-            "http://localhost:3000,http://example.com",
-        );
-        let origins = cors_allow_origins();
-        std::env::remove_var("TELLODB_CORS_ALLOW_ORIGINS");
+        let origins = parse_cors_allow_origins(Some("http://localhost:3000,http://example.com"));
         assert_eq!(origins.len(), 2);
         assert_eq!(origins[0], "http://localhost:3000");
         assert_eq!(origins[1], "http://example.com");
@@ -525,23 +522,14 @@ mod tests {
 
     #[test]
     fn cors_allow_origins_empty_falls_back_to_default() {
-        std::env::remove_var("TEMPORAL_MEMORY_CORS_ALLOW_ORIGINS");
-        std::env::set_var("TELLODB_CORS_ALLOW_ORIGINS", "");
-        let origins = cors_allow_origins();
-        std::env::remove_var("TELLODB_CORS_ALLOW_ORIGINS");
+        let origins = parse_cors_allow_origins(Some(""));
         assert_eq!(origins.len(), 1);
         assert_eq!(origins[0], "https://tellodb.com");
     }
 
     #[test]
     fn cors_allow_origins_trims_trailing_slashes() {
-        std::env::remove_var("TEMPORAL_MEMORY_CORS_ALLOW_ORIGINS");
-        std::env::set_var(
-            "TELLODB_CORS_ALLOW_ORIGINS",
-            "http://localhost:3000/,http://example.com/",
-        );
-        let origins = cors_allow_origins();
-        std::env::remove_var("TELLODB_CORS_ALLOW_ORIGINS");
+        let origins = parse_cors_allow_origins(Some("http://localhost:3000/,http://example.com/"));
         assert_eq!(origins.len(), 2);
         assert_eq!(origins[0], "http://localhost:3000");
         assert_eq!(origins[1], "http://example.com");

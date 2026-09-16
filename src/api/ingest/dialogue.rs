@@ -110,8 +110,7 @@ pub fn collect_dialogue_messages_from_json(
 }
 
 pub fn parse_role_prefixed_line(line: &str) -> Option<(String, String)> {
-    let trimmed =
-        line.trim().trim_start_matches(['-', '*', '•', '>', ' ']);
+    let trimmed = line.trim().trim_start_matches(['-', '*', '•', '>', ' ']);
     if trimmed.is_empty() {
         return None;
     }

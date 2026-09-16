@@ -59,11 +59,7 @@ pub struct ResolutionConfig {
 
 impl Default for ResolutionConfig {
     fn default() -> Self {
-        Self {
-            fuzzy_threshold: 0.92,
-            embedding_threshold: 0.88,
-            max_candidates: 20,
-        }
+        Self { fuzzy_threshold: 0.92, embedding_threshold: 0.88, max_candidates: 20 }
     }
 }
 
@@ -95,6 +91,7 @@ impl MergeStatus {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s {
             "accepted" => Self::Accepted,
@@ -124,11 +121,8 @@ fn soundex_code(c: char) -> char {
 /// then encodes subsequent letters into digit codes, collapsing
 /// adjacent identical codes and padding/truncating to 4 chars.
 pub fn soundex_key(name: &str) -> String {
-    let lower: String = name
-        .chars()
-        .filter(|c| c.is_ascii_alphabetic())
-        .map(|c| c.to_ascii_lowercase())
-        .collect();
+    let lower: String =
+        name.chars().filter(|c| c.is_ascii_alphabetic()).map(|c| c.to_ascii_lowercase()).collect();
 
     if lower.is_empty() {
         return String::new();
@@ -205,10 +199,7 @@ pub fn resolve_name(
 ) -> EntityResolution {
     let trimmed = name.trim();
     if trimmed.len() < 2 {
-        return EntityResolution {
-            matched_name: None,
-            tier: ResolverTier::Exact,
-        };
+        return EntityResolution { matched_name: None, tier: ResolverTier::Exact };
     }
 
     let name_lower = trimmed.to_ascii_lowercase();
@@ -216,9 +207,7 @@ pub fn resolve_name(
     // Tier 1: Exact match against canonical name or any alias.
     for c in candidates {
         if c.name.to_ascii_lowercase() == name_lower
-            || c.aliases
-                .iter()
-                .any(|a| a.to_ascii_lowercase() == name_lower)
+            || c.aliases.iter().any(|a| a.to_ascii_lowercase() == name_lower)
         {
             return EntityResolution {
                 matched_name: Some(c.name.clone()),
@@ -291,10 +280,7 @@ pub fn resolve_name(
         }
     }
 
-    EntityResolution {
-        matched_name: None,
-        tier: ResolverTier::Exact,
-    }
+    EntityResolution { matched_name: None, tier: ResolverTier::Exact }
 }
 
 #[cfg(test)]
@@ -365,7 +351,8 @@ mod tests {
     #[test]
     fn resolve_exact_via_alias() {
         let candidates = vec![candidate_with_aliases("Sarah", &["the engineering lead"])];
-        let result = resolve_name("the engineering lead", &candidates, None, &ResolutionConfig::default());
+        let result =
+            resolve_name("the engineering lead", &candidates, None, &ResolutionConfig::default());
         assert_eq!(result.matched_name, Some("Sarah".to_string()));
         assert_eq!(result.tier, ResolverTier::Exact);
     }

@@ -193,9 +193,10 @@ pub fn kind_query_bonus(kind: MemoryKind, plan: &QueryPlan, obs: &ScorableObserv
     }
 
     if !plan.temporal_terms.is_empty()
-        && plan.temporal_terms.iter().any(|term| obs.lower.contains(term.as_str())) {
-            bonus += 0.05;
-        }
+        && plan.temporal_terms.iter().any(|term| obs.lower.contains(term.as_str()))
+    {
+        bonus += 0.05;
+    }
 
     bonus
 }
@@ -655,7 +656,9 @@ pub fn select_candidates_with_session_head(
         grouped.entry(session_key).or_default().push(candidate);
     }
 
-    let mut sessions = grouped.into_values().map(|mut items| {
+    let mut sessions = grouped
+        .into_values()
+        .map(|mut items| {
             items.sort_by(|a, b| {
                 b.final_score
                     .partial_cmp(&a.final_score)

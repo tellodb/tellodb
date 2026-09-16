@@ -4,8 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::lifecycle::LifecycleMetadata;
 
-#[derive(Debug, PartialEq, Clone, Copy)]
-#[derive(Default)]
+#[derive(Debug, PartialEq, Clone, Copy, Default)]
 pub enum MemoryKind {
     #[default]
     Conversational,
@@ -15,7 +14,6 @@ pub enum MemoryKind {
     SessionSummary,
     Fact,
 }
-
 
 impl MemoryKind {
     pub fn is_decay_exempt(&self) -> bool {

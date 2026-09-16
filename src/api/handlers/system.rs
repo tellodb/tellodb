@@ -82,6 +82,10 @@ pub async fn version_handler(
             engine_version: env!("CARGO_PKG_VERSION"),
             api_version: "v1",
             auth_required: state.auth.is_required(),
+            device: crate::semantic::SemanticInference::device_label_static(),
+            embedding_model: state.semantic.embedding_model_id().to_string(),
+            embedding_dim: state.semantic.embedding_dim(),
+            ranking_config: (*state.ranking_config).clone(),
         }),
     );
     record_usage_for_principal(&state, &principal, "version");

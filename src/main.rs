@@ -8,35 +8,8 @@ use tracing::{error, info, warn};
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-mod analytics;
-mod api;
-
-mod fts;
-mod graph;
-mod graph_inference;
-mod lifecycle;
-mod metrics;
-mod ml;
-mod platform;
-mod retrieval;
-mod runtime_paths;
-mod semantic;
-mod storage;
-mod vector_index;
-
-pub fn init_tracing_subscriber() {
-    use tracing_subscriber::{filter::EnvFilter, fmt, prelude::*, Registry};
-
-    let env_filter =
-        EnvFilter::builder().with_default_directive(tracing::Level::INFO.into()).from_env_lossy();
-
-    let fmt_layer =
-        fmt::layer().with_target(true).with_thread_ids(true).with_file(true).with_line_number(true);
-
-    let subscriber = Registry::default().with(env_filter).with(fmt_layer);
-
-    tracing::subscriber::set_global_default(subscriber).expect("Failed to set tracing subscriber");
-}
+use tellodb::init_tracing_subscriber;
+use tellodb::{analytics, api, ml, platform, runtime_paths, semantic, storage, vector_index};
 
 fn env_var_bool(name: &str) -> bool {
     std::env::var(name).ok().is_some_and(|v| {
@@ -207,7 +180,9 @@ async fn main() -> anyhow::Result<()> {
             let mut ticker = interval(Duration::from_secs(300)); // every 5 min
             loop {
                 ticker.tick().await;
-                let now_ms = match std::time::SystemTime::now().duration_since(std::time::SystemTime::UNIX_EPOCH) {
+                let now_ms = match std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                {
                     Ok(d) => d.as_millis() as u64,
                     Err(_) => continue,
                 };

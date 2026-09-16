@@ -62,8 +62,7 @@ pub struct MetricRecord {
     pub source: ExtractionSource,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum ExtractionSource {
     #[default]
     Deterministic,
@@ -80,7 +79,6 @@ impl ExtractionSource {
         }
     }
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AggregateResult {

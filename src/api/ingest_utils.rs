@@ -524,7 +524,7 @@ mod tests {
     fn test_extract_dialogue_messages_json_role_content() {
         let text = r#"{"role": "user", "content": "hello"}"#;
         let msgs = extract_dialogue_messages(text);
-        assert!(msgs.len() >= 1);
+        assert!(!msgs.is_empty());
         assert!(msgs.iter().any(|(r, c)| r == "user" && c == "hello"));
     }
 

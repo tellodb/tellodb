@@ -46,10 +46,7 @@ async fn rate_limit_middleware(
     Ok(next.run(req).await)
 }
 
-async fn request_timeout_middleware(
-    req: Request,
-    next: Next,
-) -> Result<Response, StatusCode> {
+async fn request_timeout_middleware(req: Request, next: Next) -> Result<Response, StatusCode> {
     let path = req.uri().path().to_string();
     // Health and version probes never time out.
     if path == "/health" || path == "/healthz" || path == "/version" || path == "/metrics" {
@@ -59,12 +56,7 @@ async fn request_timeout_middleware(
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(30);
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        next.run(req),
-    )
-    .await
-    {
+    match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), next.run(req)).await {
         Ok(resp) => Ok(resp),
         Err(_) => {
             tracing::warn!(path = %path, "request exceeded timeout");

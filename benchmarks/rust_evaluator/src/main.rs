@@ -11,6 +11,11 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod record;
+mod splits;
+use record::{IngestStats, QuestionRecord};
+use splits::Split;
+
 const DEFAULT_ENGINE_URL: &str = "http://127.0.0.1:3000";
 const DEFAULT_DATASET_PATH: &str = "benchmarks/LongMemEval/data/longmemeval_s_cleaned.json";
 const DEFAULT_LOCOMO_DATASET_PATH: &str = "benchmarks/LoCoMo/data/locomo10.json";
@@ -161,6 +166,13 @@ enum DatasetKind {
     Locomo,
 }
 
+#[derive(Copy, Clone, Debug, ValueEnum, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TimestampMode {
+    Wallclock,
+    Session,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct IngestTimings {
     pub embed: u64,
@@ -258,6 +270,29 @@ struct Cli {
     /// rate limit caps useful parallelism at ~4.
     #[arg(long, global = true, default_value_t = 4)]
     llm_concurrency: usize,
+
+    /// Frozen split to evaluate. Tune on `dev`; report paper numbers on `test`.
+    #[arg(long, global = true, value_enum, default_value_t = Split::Dev)]
+    split: Split,
+
+    /// Split manifest. Defaults to benchmarks/splits/<dataset file stem>.json.
+    #[arg(long, global = true)]
+    splits_file: Option<String>,
+
+    /// Required to run on the test split, so it is never used while tuning.
+    #[arg(long, global = true)]
+    i_know_this_is_test: bool,
+
+    /// Directory for JSON run records. Defaults to benchmarks/runs.
+    #[arg(long, global = true)]
+    runs_dir: Option<String>,
+
+    #[arg(long, global = true)]
+    no_run_record: bool,
+
+    /// How to assign timestamps during ingest: `wallclock` (default) or `session`.
+    #[arg(long, global = true, value_enum, default_value_t = TimestampMode::Wallclock)]
+    timestamps: TimestampMode,
 }
 
 #[derive(Subcommand, Debug)]
@@ -303,6 +338,21 @@ enum EvalMode {
 
         #[arg(long, default_value = DEFAULT_GROQ_JUDGE_MODEL)]
         groq_judge_model: String,
+    },
+    /// Generate the frozen dev/test split file for a dataset (run once, then commit it).
+    MakeSplits {
+        #[arg(long, default_value_t = 0.3)]
+        dev_fraction: f64,
+
+        #[arg(long, default_value_t = 20260916)]
+        seed: u64,
+
+        #[arg(long)]
+        force: bool,
+    },
+    /// Render a markdown table from run record JSON files.
+    Report {
+        files: Vec<String>,
     },
     AnalyzeGoldRanks {
         #[arg(long)]
@@ -398,6 +448,14 @@ struct QueryPayload<'a> {
     enable_neural_rerank: bool,
     include_evidence: Option<bool>,
     proof_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reference_time_ms: Option<u64>,
+}
+
+#[derive(Default, Copy, Clone, Debug)]
+struct IngestInstanceOutcome {
+    memories: u64,
+    parse_failures: u64,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -428,6 +486,7 @@ struct NumericExtraction {
 #[derive(Clone)]
 struct EvalConfig {
     dataset_kind: DatasetKind,
+    timestamps: TimestampMode,
     engine_url: String,
     engine_api_key: Option<String>,
     top_k: usize,
@@ -445,6 +504,10 @@ struct EvalConfig {
     dump_candidates_jsonl: Option<String>,
     dump_gold_ranks_jsonl: Option<String>,
     llm_concurrency: usize,
+    split: Split,
+    dataset_path: String,
+    /// Where to write the JSON run record; `None` disables it.
+    runs_dir: Option<std::path::PathBuf>,
 }
 
 #[derive(Default, Clone)]
@@ -518,7 +581,7 @@ struct AggregateTimings {
     scoped_primary_hits: u128,
 }
 
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, Debug, Serialize)]
 struct QueryTimings {
     route_ms: u64,
     embed_ms: u64,
@@ -568,6 +631,7 @@ async fn main() -> Result<()> {
 
     let config = EvalConfig {
         dataset_kind: cli.dataset_kind,
+        timestamps: cli.timestamps,
         engine_url: cli.engine_url,
         engine_api_key: cli.engine_api_key,
         top_k: cli.top_k,
@@ -584,12 +648,33 @@ async fn main() -> Result<()> {
         dump_candidates_jsonl: cli.dump_candidates_jsonl.clone(),
         dump_gold_ranks_jsonl: cli.dump_gold_ranks_jsonl.clone(),
         llm_concurrency: cli.llm_concurrency,
+        split: cli.split,
+        dataset_path: String::new(),
+        runs_dir: (!cli.no_run_record).then(|| {
+            cli.runs_dir.as_deref().map(std::path::PathBuf::from).unwrap_or_else(record::runs_dir)
+        }),
+    };
+
+    if cli.split == Split::Test && !cli.i_know_this_is_test {
+        anyhow::bail!(
+            "Refusing to run on the test split without --i-know-this-is-test. Tune on --split dev."
+        );
+    }
+    let load_split = |dataset_path: &str| -> Result<Vec<Instance>> {
+        let dataset = load_dataset(cli.dataset_kind, dataset_path)?;
+        let manifest_path = cli
+            .splits_file
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| splits::default_manifest_path(dataset_path));
+        splits::apply_split(cli.dataset_kind, dataset, cli.split, &manifest_path)
     };
 
     match cli.mode {
         EvalMode::Recall => {
             let dataset_path = resolve_dataset_path(cli.dataset_kind, cli.dataset.as_deref())?;
-            let dataset = load_dataset(cli.dataset_kind, &dataset_path)?;
+            let dataset = load_split(&dataset_path)?;
+            let config = EvalConfig { dataset_path, ..config };
             run_recall(&client, &dataset, cli.start_index, cli.limit, &config).await?
         }
         EvalMode::Llm {
@@ -602,7 +687,8 @@ async fn main() -> Result<()> {
             output_jsonl,
         } => {
             let dataset_path = resolve_dataset_path(cli.dataset_kind, cli.dataset.as_deref())?;
-            let dataset = load_dataset(cli.dataset_kind, &dataset_path)?;
+            let dataset = load_split(&dataset_path)?;
+            let config = EvalConfig { dataset_path, ..config };
             run_llm(
                 &client,
                 &dataset,
@@ -630,6 +716,7 @@ async fn main() -> Result<()> {
             let dataset = vec![smoke_instance()];
             let mut smoke_config = config.clone();
             smoke_config.dataset_kind = DatasetKind::Locomo;
+            smoke_config.runs_dir = None;
             run_llm(
                 &client,
                 &dataset,
@@ -646,6 +733,33 @@ async fn main() -> Result<()> {
             )
             .await?
         }
+        EvalMode::MakeSplits { dev_fraction, seed, force } => {
+            let dataset_path = resolve_dataset_path(cli.dataset_kind, cli.dataset.as_deref())?;
+            let dataset = load_dataset(cli.dataset_kind, &dataset_path)?;
+            let manifest = splits::build_manifest(
+                cli.dataset_kind,
+                &dataset_path,
+                &dataset,
+                dev_fraction,
+                seed,
+            );
+            let path = cli
+                .splits_file
+                .as_deref()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| splits::default_manifest_path(&dataset_path));
+            splits::write_manifest(&path, &manifest, force)?;
+            println!(
+                "Wrote {} ({} dev / {} test {}s)",
+                path.display(),
+                manifest.dev.len(),
+                manifest.test.len(),
+                manifest.unit
+            );
+        }
+        EvalMode::Report { files } => {
+            print!("{}", record::report(&files)?);
+        }
         EvalMode::AnalyzeGoldRanks { input, examples } => {
             analyze_gold_rank_dump(&input, examples)?;
         }
@@ -660,10 +774,9 @@ fn resolve_dataset_path(dataset_kind: DatasetKind, user_path: Option<&str>) -> R
     }
 
     let candidates: &[&str] = match dataset_kind {
-        DatasetKind::Longmemeval => &[
-            "../LongMemEval/data/longmemeval_s_cleaned.json",
-            DEFAULT_DATASET_PATH,
-        ],
+        DatasetKind::Longmemeval => {
+            &["../LongMemEval/data/longmemeval_s_cleaned.json", DEFAULT_DATASET_PATH]
+        }
         DatasetKind::Locomo => &[
             "../LoCoMo/data/locomo10.json",
             "../locomo/data/locomo10.json",
@@ -768,9 +881,8 @@ fn normalize_locomo_samples(samples: Vec<LocomoSample>) -> Vec<Instance> {
     let mut normalized = Vec::new();
 
     for (sample_idx, sample) in samples.into_iter().enumerate() {
-        let sample_id = sample
-            .sample_id
-            .unwrap_or_else(|| format!("locomo-sample-{}", sample_idx + 1));
+        let sample_id =
+            sample.sample_id.unwrap_or_else(|| format!("locomo-sample-{}", sample_idx + 1));
         let ordered_sessions = ordered_locomo_sessions(&sample.conversation);
         if ordered_sessions.is_empty() {
             continue;
@@ -874,15 +986,8 @@ fn ordered_locomo_sessions(
 
 fn parse_locomo_session_index(key: &str) -> Option<usize> {
     let rest = key.strip_prefix("session_")?;
-    let digits = rest
-        .chars()
-        .take_while(|ch| ch.is_ascii_digit())
-        .collect::<String>();
-    if digits.is_empty() {
-        None
-    } else {
-        digits.parse::<usize>().ok()
-    }
+    let digits = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect::<String>();
+    if digits.is_empty() { None } else { digits.parse::<usize>().ok() }
 }
 
 fn locomo_dialog_id_to_session_id(dialog_id: &str) -> Option<String> {
@@ -956,11 +1061,7 @@ async fn run_recall(
     println!("Engine URL: {}", config.engine_url);
     println!(
         "Engine auth: {}",
-        if config.engine_api_key.is_some() {
-            "x-api-key"
-        } else {
-            "disabled"
-        }
+        if config.engine_api_key.is_some() { "x-api-key" } else { "disabled" }
     );
     let available = dataset.len().saturating_sub(start_index);
     println!("Questions: {}", limit.min(available));
@@ -999,20 +1100,21 @@ async fn run_recall(
     let mut totals = EvalTotals::default();
     let max_questions = limit.min(available);
     let mut active_entity_id: Option<String> = None;
+    let started_ms = record::now_ms();
+    let mut rows: Vec<QuestionRecord> = Vec::with_capacity(max_questions);
+    let mut ingest_stats = IngestStats::default();
 
-    for (i, instance) in dataset
-        .iter()
-        .enumerate()
-        .skip(start_index)
-        .take(max_questions)
-    {
+    for (i, instance) in dataset.iter().enumerate().skip(start_index).take(max_questions) {
         let display_index = i - start_index;
         let entity_id = benchmark_entity_id(instance, i);
         let eval_question_id = evaluation_question_id(instance, i);
 
+        let question_type = instance.question_type.as_deref().unwrap_or("single-session-user");
+
         if instance.haystack_sessions.is_empty() {
             println!("Skipping empty haystack");
             totals.skipped += 1;
+            rows.push(errored_row(&eval_question_id, question_type));
             continue;
         }
 
@@ -1022,27 +1124,47 @@ async fn run_recall(
             0
         } else if active_entity_id.as_deref() != Some(entity_id.as_str()) {
             let ingest_start = Instant::now();
-            ingest_instance(client, config, &entity_id, instance).await?;
+            let outcome = ingest_instance(client, config, &entity_id, instance).await?;
             active_entity_id = Some(entity_id.clone());
-            ingest_start.elapsed().as_millis()
+            let elapsed = ingest_start.elapsed().as_millis();
+            ingest_stats.entities += 1;
+            ingest_stats.memories += outcome.memories;
+            ingest_stats.timestamp_parse_failures += outcome.parse_failures;
+            ingest_stats.wall_ms += elapsed as u64;
+            elapsed
         } else {
             0
         };
 
         let query_start = Instant::now();
-        let query = query_engine(client, config, &entity_id, &instance.question).await?;
+        let reference_time_ms = if config.timestamps == TimestampMode::Session {
+            instance.question_date.as_deref().and_then(parse_session_date_ms)
+        } else {
+            None
+        };
+        let query =
+            query_engine(client, config, &entity_id, &instance.question, reference_time_ms).await?;
         let query_ms = query_start.elapsed().as_millis();
 
         let pack_start = Instant::now();
         let retrieved_sessions = extract_top_sessions(&entity_id, &query.results, config.top_k);
-        let hit = instance
-            .answer_session_ids
-            .iter()
-            .any(|ans| retrieved_sessions.contains(ans));
-        let question_type = instance
-            .question_type
-            .as_deref()
-            .unwrap_or("single-session-user");
+        let (hit, hit_all, ndcg) = record::session_metrics(
+            &retrieved_sessions,
+            &instance.answer_session_ids,
+            config.top_k,
+        );
+        rows.push(QuestionRecord {
+            question_id: eval_question_id.clone(),
+            question_type: question_type.to_string(),
+            hit_any: hit,
+            hit_all,
+            ndcg,
+            answer_correct: None,
+            errored: false,
+            query_ms: query_ms as u64,
+            context_tokens: 0,
+            timings: query.timings,
+        });
         if let Some(writer) = candidate_dump_writer.as_mut() {
             write_candidate_dump(
                 writer,
@@ -1098,10 +1220,7 @@ async fn run_recall(
             println!("FAIL: evidence session not found in Top-{}", config.top_k);
             println!("  Question: {}", instance.question);
             println!("  Question Type: {}", question_type);
-            println!(
-                "  Expected Answer Sessions: {:?}",
-                instance.answer_session_ids
-            );
+            println!("  Expected Answer Sessions: {:?}", instance.answer_session_ids);
             println!("  Retrieved Sessions: {:?}", retrieved_sessions);
             println!(
                 "  timings: ingest={}ms | query={}ms (route={} embed={} ann={} rerank={} fts={} card={} pref={} graph={} session={} fuse={} hydrate={} visible={} other={} total={}) | pack={}ms",
@@ -1150,9 +1269,74 @@ async fn run_recall(
     }
 
     print_recall_summary(&totals, config.top_k, config.dataset_kind);
+    save_run_record(client, config, "recall", started_ms, &rows, &ingest_stats).await;
     Ok(())
 }
 
+fn errored_row(question_id: &str, question_type: &str) -> QuestionRecord {
+    QuestionRecord {
+        question_id: question_id.to_string(),
+        question_type: question_type.to_string(),
+        hit_any: false,
+        hit_all: false,
+        ndcg: 0.0,
+        answer_correct: Some(false),
+        errored: true,
+        query_ms: 0,
+        context_tokens: 0,
+        timings: QueryTimings::default(),
+    }
+}
+
+async fn save_run_record(
+    client: &Client,
+    config: &EvalConfig,
+    mode: &str,
+    started_ms: u64,
+    rows: &[QuestionRecord],
+    ingest: &IngestStats,
+) {
+    let Some(dir) = config.runs_dir.as_deref() else {
+        return;
+    };
+    let dataset_kind = match config.dataset_kind {
+        DatasetKind::Longmemeval => "longmemeval",
+        DatasetKind::Locomo => "locomo",
+    };
+    let ctx = record::RunContext {
+        mode,
+        dataset_kind,
+        dataset_path: &config.dataset_path,
+        split: config.split.as_str(),
+        top_k: config.top_k,
+        config: json!({
+            "ingest_concurrency": config.ingest_concurrency,
+            "dev_fast": config.dev_fast,
+            "enable_neural_rerank": config.enable_neural_rerank,
+            "enable_semantic_dedup": config.enable_semantic_dedup,
+            "enable_consolidation": config.enable_consolidation,
+            "reader_mode": format!("{:?}", config.reader_mode),
+            "con_context_cap_chars": config.con_context_cap_chars,
+            "max_chunks_per_session": config.max_chunks_per_session,
+            "reset_first": config.reset_first,
+            "skip_ingest": config.skip_ingest,
+            "llm_concurrency": config.llm_concurrency,
+            "timestamps": match config.timestamps {
+                TimestampMode::Wallclock => "wallclock",
+                TimestampMode::Session => "session",
+            },
+        }),
+        engine_url: &config.engine_url,
+        engine_api_key: config.engine_api_key.as_deref(),
+        started_ms,
+    };
+    match record::write_run_record(client, &ctx, rows, ingest, dir).await {
+        Ok(path) => println!("Run record: {}", path.display()),
+        Err(err) => eprintln!("Failed to write run record: {err:#}"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_llm(
     client: &Client,
     dataset: &[Instance],
@@ -1167,40 +1351,22 @@ async fn run_llm(
     groq_judge_model: &str,
     output_jsonl: Option<&str>,
 ) -> Result<()> {
-    let answer_model = if use_groq {
-        groq_model
-    } else {
-        openrouter_model
-    };
-    let judge_model = if use_groq_judge {
-        groq_judge_model
-    } else {
-        openrouter_judge_model
-    };
+    let answer_model = if use_groq { groq_model } else { openrouter_model };
+    let judge_model = if use_groq_judge { groq_judge_model } else { openrouter_judge_model };
 
     println!("Running memory end-to-end LLM benchmark");
     println!("Engine URL: {}", config.engine_url);
     println!(
         "Engine auth: {}",
-        if config.engine_api_key.is_some() {
-            "x-api-key"
-        } else {
-            "disabled"
-        }
+        if config.engine_api_key.is_some() { "x-api-key" } else { "disabled" }
     );
     let available = dataset.len().saturating_sub(start_index);
     println!("Questions: {}", limit.min(available));
     println!("Start index: {}", start_index);
     println!("Answer model: {}", answer_model);
-    println!(
-        "Answer provider: {}",
-        if use_groq { "Groq" } else { "OpenRouter" }
-    );
+    println!("Answer provider: {}", if use_groq { "Groq" } else { "OpenRouter" });
     println!("Judge model: {}", judge_model);
-    println!(
-        "Judge provider: {}",
-        if use_groq_judge { "Groq" } else { "OpenRouter" }
-    );
+    println!("Judge provider: {}", if use_groq_judge { "Groq" } else { "OpenRouter" });
     println!("Reader mode: {:?}", config.reader_mode);
     println!("Top-K sessions: {}", config.top_k);
     println!("Max chunks per session: {}", config.max_chunks_per_session);
@@ -1246,12 +1412,8 @@ async fn run_llm(
     let max_questions = limit.min(available);
 
     // 1) Group questions by entity, pre-ingest each unique entity once (in parallel).
-    let questions: Vec<(usize, &Instance)> = dataset
-        .iter()
-        .enumerate()
-        .skip(start_index)
-        .take(max_questions)
-        .collect();
+    let questions: Vec<(usize, &Instance)> =
+        dataset.iter().enumerate().skip(start_index).take(max_questions).collect();
 
     let mut entity_to_question_idx: HashMap<String, usize> = HashMap::new();
     for (idx, instance) in questions.iter() {
@@ -1265,24 +1427,28 @@ async fn run_llm(
         config.ingest_concurrency
     );
     let pre_ingest_start = Instant::now();
+    let started_ms = record::now_ms();
+    let mut ingest_stats = IngestStats::default();
     if config.skip_ingest {
         println!("[skip-ingest] Skipping pre-ingest of {} entity(ies).", unique_entities.len());
     } else {
-        let ingest_results: Vec<Result<()>> = futures::stream::iter(unique_entities.iter().cloned())
-            .map(|(entity_id, instance_idx)| async move {
-                let instance = &dataset[instance_idx];
-                ingest_instance(client, config, &entity_id, instance).await
-            })
-            .buffer_unordered(config.ingest_concurrency.max(1))
-            .collect()
-            .await;
+        let ingest_results: Vec<Result<IngestInstanceOutcome>> =
+            futures::stream::iter(unique_entities.iter().cloned())
+                .map(|(entity_id, instance_idx)| async move {
+                    let instance = &dataset[instance_idx];
+                    ingest_instance(client, config, &entity_id, instance).await
+                })
+                .buffer_unordered(config.ingest_concurrency.max(1))
+                .collect()
+                .await;
         for r in ingest_results {
-            r.context("Pre-ingest failed")?;
+            let outcome = r.context("Pre-ingest failed")?;
+            ingest_stats.memories += outcome.memories;
+            ingest_stats.timestamp_parse_failures += outcome.parse_failures;
         }
-        println!(
-            "Pre-ingest complete in {}ms",
-            pre_ingest_start.elapsed().as_millis()
-        );
+        ingest_stats.entities = unique_entities.len() as u64;
+        ingest_stats.wall_ms = pre_ingest_start.elapsed().as_millis() as u64;
+        println!("Pre-ingest complete in {}ms", pre_ingest_start.elapsed().as_millis());
     }
 
     // 2) Wrap writers and totals in shared state for parallel question processing.
@@ -1295,12 +1461,9 @@ async fn run_llm(
 
     // 3) Process questions in parallel.
     let llm_concurrency = config.llm_concurrency.max(1);
-    println!(
-        "Processing {} question(s) at LLM concurrency {}...",
-        max_questions, llm_concurrency
-    );
+    println!("Processing {} question(s) at LLM concurrency {}...", max_questions, llm_concurrency);
     let process_start = Instant::now();
-    let _results: Vec<Option<QuestionResult>> = futures::stream::iter(questions.iter().cloned())
+    let results: Vec<QuestionRecord> = futures::stream::iter(questions.iter().cloned())
         .map(|(i, instance)| {
             let client = client.clone();
             let config = config.clone();
@@ -1330,13 +1493,24 @@ async fn run_llm(
                 )
                 .await
                 {
-                    Ok(r) => Some(r),
+                    Ok(r) => QuestionRecord {
+                        question_id: r.question_id,
+                        question_type: r.question_type,
+                        hit_any: r.retrieval_hit,
+                        hit_all: r.hit_all,
+                        ndcg: r.ndcg,
+                        answer_correct: Some(r.answer_correct),
+                        errored: false,
+                        query_ms: r.query_ms as u64,
+                        context_tokens: r.context_tokens as u64,
+                        timings: r.query_timings,
+                    },
                     Err(e) => {
-                        eprintln!(
-                            "[{}] process_question_llm error: {:#}",
-                            eval_question_id, e
-                        );
-                        None
+                        eprintln!("[{}] process_question_llm error: {:#}", eval_question_id, e);
+                        errored_row(
+                            &eval_question_id,
+                            instance.question_type.as_deref().unwrap_or("single-session-user"),
+                        )
                     }
                 }
             }
@@ -1347,19 +1521,26 @@ async fn run_llm(
     let _elapsed = process_start.elapsed();
 
     // 4) Restore totals from the shared state.
-    let totals = totals
-        .lock()
-        .map(|g| g.clone())
-        .unwrap_or_else(|e| e.into_inner().clone());
+    let totals = totals.lock().map(|g| g.clone()).unwrap_or_else(|e| e.into_inner().clone());
 
     print_llm_summary(&totals, config.top_k, config.dataset_kind);
+    let errored = results.iter().filter(|r| r.errored).count();
+    if errored > 0 {
+        println!(
+            "WARNING: {errored} question(s) errored. The summary above excludes them; the run record counts them as failures."
+        );
+    }
+    save_run_record(&client, &config, "llm", started_ms, &results, &ingest_stats).await;
     Ok(())
 }
 
 #[allow(dead_code)]
 struct QuestionResult {
     question_id: String,
+    question_type: String,
     retrieval_hit: bool,
+    hit_all: bool,
+    ndcg: f64,
     answer_correct: bool,
     ingest_ms: u128,
     query_ms: u128,
@@ -1416,52 +1597,49 @@ async fn process_question_llm(
     let ingest_ms: u128 = 0;
 
     let query_start = Instant::now();
-    let query = query_engine(client, config, entity_id, &instance.question).await?;
+    let reference_time_ms = if config.timestamps == TimestampMode::Session {
+        instance.question_date.as_deref().and_then(parse_session_date_ms)
+    } else {
+        None
+    };
+    let query =
+        query_engine(client, config, entity_id, &instance.question, reference_time_ms).await?;
     let query_ms = query_start.elapsed().as_millis();
-    let question_type = instance
-        .question_type
-        .as_deref()
-        .unwrap_or("single-session-user");
+    let question_type = instance.question_type.as_deref().unwrap_or("single-session-user");
 
     let pack_start = Instant::now();
     let retrieved_sessions = extract_top_sessions(entity_id, &query.results, config.top_k);
-    let retrieval_hit = instance
-        .answer_session_ids
-        .iter()
-        .any(|ans| retrieved_sessions.contains(ans));
+    let (retrieval_hit, hit_all, ndcg) =
+        record::session_metrics(&retrieved_sessions, &instance.answer_session_ids, config.top_k);
     {
-        if let Ok(mut g) = candidate_dump_writer.lock() {
-            if let Some(writer) = g.as_mut() {
-                write_candidate_dump(
-                    writer,
-                    eval_question_id,
-                    instance,
-                    question_type,
-                    &retrieved_sessions,
-                    &query.results,
-                    config.top_k * 8,
-                )?;
-            }
+        if let Ok(mut g) = candidate_dump_writer.lock()
+            && let Some(writer) = g.as_mut()
+        {
+            write_candidate_dump(
+                writer,
+                eval_question_id,
+                instance,
+                question_type,
+                &retrieved_sessions,
+                &query.results,
+                config.top_k * 8,
+            )?;
         }
-        if let Ok(mut g) = gold_rank_writer.lock() {
-            if let Some(writer) = g.as_mut() {
-                write_gold_rank_dump(
-                    writer,
-                    eval_question_id,
-                    instance,
-                    question_type,
-                    &retrieved_sessions,
-                    &query.results,
-                )?;
-            }
+        if let Ok(mut g) = gold_rank_writer.lock()
+            && let Some(writer) = g.as_mut()
+        {
+            write_gold_rank_dump(
+                writer,
+                eval_question_id,
+                instance,
+                question_type,
+                &retrieved_sessions,
+                &query.results,
+            )?;
         }
     }
-    let packed_sessions = pack_top_sessions(
-        instance,
-        &query.results,
-        config.top_k,
-        config.max_chunks_per_session,
-    );
+    let packed_sessions =
+        pack_top_sessions(instance, &query.results, config.top_k, config.max_chunks_per_session);
     let pack_ms = pack_start.elapsed().as_millis();
 
     {
@@ -1494,18 +1672,18 @@ async fn process_question_llm(
     let answer_ms = answer_start.elapsed().as_millis();
 
     {
-        if let Ok(mut g) = output_writer.lock() {
-            if let Some(writer) = g.as_mut() {
-                writeln!(
-                    writer,
-                    "{}",
-                    json!({
-                        "question_id": eval_question_id,
-                        "hypothesis": prediction.clone(),
-                    })
-                )?;
-                writer.flush()?;
-            }
+        if let Ok(mut g) = output_writer.lock()
+            && let Some(writer) = g.as_mut()
+        {
+            writeln!(
+                writer,
+                "{}",
+                json!({
+                    "question_id": eval_question_id,
+                    "hypothesis": prediction.clone(),
+                })
+            )?;
+            writer.flush()?;
         }
     }
 
@@ -1519,16 +1697,10 @@ async fn process_question_llm(
         &prediction_for_judge,
         eval_question_id.ends_with("_abs"),
     );
-    let verdict = call_answer_model(
-        client,
-        &judge_prompt,
-        judge_model,
-        4096,
-        "none",
-        use_groq_judge,
-    )
-    .await
-    .with_context(|| format!("Failed to judge question {}", eval_question_id))?;
+    let verdict =
+        call_answer_model(client, &judge_prompt, judge_model, 4096, "none", use_groq_judge)
+            .await
+            .with_context(|| format!("Failed to judge question {}", eval_question_id))?;
     let judge_ms = judge_start.elapsed().as_millis();
 
     let answer_correct = parse_judge_verdict(&verdict);
@@ -1571,20 +1743,12 @@ async fn process_question_llm(
             g.timings.inner_hydrate_obs_ms += query.timings.hydrate_obs_ms as u128;
             g.timings.inner_trace_ms += query.timings.trace_ms as u128;
             g.timings.inner_query_total_ms += query.timings.total_ms as u128;
-            add_query_diagnostics(&mut g.timings, query.timings.clone());
+            add_query_diagnostics(&mut g.timings, query.timings);
         }
     }
 
-    let retrieval_symbol = if retrieval_hit {
-        "retrieval=pass"
-    } else {
-        "retrieval=fail"
-    };
-    let answer_symbol = if answer_correct {
-        "answer=pass"
-    } else {
-        "answer=fail"
-    };
+    let retrieval_symbol = if retrieval_hit { "retrieval=pass" } else { "retrieval=fail" };
+    let answer_symbol = if answer_correct { "answer=pass" } else { "answer=fail" };
     let context_tokens = packed_sessions
         .iter()
         .flat_map(|s| s.chunks.iter())
@@ -1668,7 +1832,10 @@ async fn process_question_llm(
 
     Ok(QuestionResult {
         question_id: eval_question_id.to_string(),
+        question_type: question_type.to_string(),
         retrieval_hit,
+        hit_all,
+        ndcg,
         answer_correct,
         ingest_ms,
         query_ms,
@@ -1706,18 +1873,12 @@ async fn reset_engine(client: &Client, config: &EvalConfig) -> Result<()> {
 
     for reset_path in reset_paths {
         let url = format!("{}{}", config.engine_url, reset_path);
-        let response = with_engine_auth(client.post(&url), config)
-            .json(&payload)
-            .send()
-            .await;
+        let response = with_engine_auth(client.post(&url), config).json(&payload).send().await;
 
         match response {
             Ok(response) if response.status().is_success() => {
                 let total_ms = header_u64(response.headers(), "x-tm-total-ms");
-                println!(
-                    "Engine reset complete via {} (engine_total={}ms)",
-                    reset_path, total_ms
-                );
+                println!("Engine reset complete via {} (engine_total={}ms)", reset_path, total_ms);
                 return Ok(());
             }
             Ok(response) => {
@@ -1736,30 +1897,125 @@ async fn reset_engine(client: &Client, config: &EvalConfig) -> Result<()> {
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Reset failed for unknown reason")))
 }
 
+pub fn parse_session_date_ms(raw: &str) -> Option<u64> {
+    use chrono::{NaiveDate, NaiveDateTime};
+
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("unknown") {
+        return None;
+    }
+
+    // Try LongMemEval formats:
+    // e.g. "2023/05/20 (Sat) 02:21", "2023/05/20 02:21"
+    for fmt in [
+        "%Y/%m/%d (%a) %H:%M",
+        "%Y/%m/%d (%a) %H:%M:%S",
+        "%Y/%m/%d %H:%M",
+        "%Y/%m/%d %H:%M:%S",
+        "%Y-%m-%d (%a) %H:%M",
+        "%Y-%m-%d (%a) %H:%M:%S",
+    ] {
+        if let Ok(dt) = NaiveDateTime::parse_from_str(trimmed, fmt) {
+            return Some(dt.and_utc().timestamp_millis().max(0) as u64);
+        }
+    }
+
+    // Try LoCoMo formats:
+    // e.g. "1:56 pm on 8 May, 2023" or "8:18 pm on 6 July, 2023"
+    for fmt in [
+        "%I:%M %P on %d %B, %Y",
+        "%I:%M %P on %e %B, %Y",
+        "%I:%M %p on %d %B, %Y",
+        "%I:%M %p on %e %B, %Y",
+        "%I:%M %P on %d %B %Y",
+        "%I:%M %P on %e %B %Y",
+        "%I:%M %p on %d %B %Y",
+        "%I:%M %p on %e %B %Y",
+        "%l:%M %P on %d %B, %Y",
+        "%l:%M %P on %e %B, %Y",
+        "%l:%M %p on %d %B, %Y",
+        "%l:%M %p on %e %B, %Y",
+        "%l:%M %P on %d %B %Y",
+        "%l:%M %P on %e %B %Y",
+        "%l:%M %p on %d %B %Y",
+        "%l:%M %p on %e %B %Y",
+    ] {
+        if let Ok(dt) = NaiveDateTime::parse_from_str(trimmed, fmt) {
+            return Some(dt.and_utc().timestamp_millis().max(0) as u64);
+        }
+    }
+
+    // Date-only formats
+    for fmt in [
+        "%d %B %Y",
+        "%e %B %Y",
+        "%d %B, %Y",
+        "%e %B, %Y",
+        "%B %d, %Y",
+        "%B %e, %Y",
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+    ] {
+        if let Ok(d) = NaiveDate::parse_from_str(trimmed, fmt)
+            && let Some(dt) = d.and_hms_opt(0, 0, 0)
+        {
+            return Some(dt.and_utc().timestamp_millis().max(0) as u64);
+        }
+    }
+
+    // Year-only (e.g. 2022) or Month Year (e.g. "June 2023")
+    if let Ok(year) = trimmed.parse::<i32>()
+        && (1970..=2100).contains(&year)
+        && let Some(d) = NaiveDate::from_ymd_opt(year, 1, 1)
+        && let Some(dt) = d.and_hms_opt(0, 0, 0)
+    {
+        return Some(dt.and_utc().timestamp_millis().max(0) as u64);
+    }
+    if let Ok(d) = NaiveDate::parse_from_str(&format!("1 {trimmed}"), "%d %B %Y")
+        && let Some(dt) = d.and_hms_opt(0, 0, 0)
+    {
+        return Some(dt.and_utc().timestamp_millis().max(0) as u64);
+    }
+
+    // Standard ISO / RFC3339 fallbacks
+    if let Ok(dt) = NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S") {
+        return Some(dt.and_utc().timestamp_millis().max(0) as u64);
+    }
+    if let Ok(dt) = NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S") {
+        return Some(dt.and_utc().timestamp_millis().max(0) as u64);
+    }
+
+    None
+}
+
 async fn ingest_instance(
     client: &Client,
     config: &EvalConfig,
     q_id: &str,
     instance: &Instance,
-) -> Result<()> {
+) -> Result<IngestInstanceOutcome> {
     println!("Ingesting {} sessions...", instance.haystack_sessions.len());
     let mut payloads = Vec::new();
     let session_cap = if config.dev_fast { 12 } else { usize::MAX };
     let turn_cap = if config.dev_fast { 4 } else { usize::MAX };
+    let mut parse_failures = 0u64;
+    let wall_now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
 
-    for (s_idx, session) in instance
-        .haystack_sessions
-        .iter()
-        .enumerate()
-        .take(session_cap)
-    {
+    for (s_idx, session) in instance.haystack_sessions.iter().enumerate().take(session_cap) {
         let session_id = &instance.haystack_session_ids[s_idx];
-        let session_date = instance
-            .haystack_dates
-            .get(s_idx)
-            .map(String::as_str)
-            .unwrap_or("unknown");
+        let session_date =
+            instance.haystack_dates.get(s_idx).map(String::as_str).unwrap_or("unknown");
         let session_focus = build_session_focus(session);
+
+        let parsed_session_ts = if config.timestamps == TimestampMode::Session {
+            let parsed = parse_session_date_ms(session_date);
+            if parsed.is_none() {
+                parse_failures += 1;
+            }
+            parsed
+        } else {
+            None
+        };
 
         for t_idx in 0..session.len().min(turn_cap) {
             let window_text =
@@ -1769,9 +2025,10 @@ async fn ingest_instance(
             }
 
             let memory_id = format!("{q_id}::{session_id}::{t_idx}");
-            let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64
-                + (s_idx as u64 * 1000)
-                + t_idx as u64;
+            let timestamp = match parsed_session_ts {
+                Some(base_ts) => base_ts + t_idx as u64,
+                None => wall_now + (s_idx as u64 * 1000) + t_idx as u64,
+            };
 
             let payload = IngestPayload {
                 entity_id: q_id,
@@ -1787,11 +2044,10 @@ async fn ingest_instance(
         }
     }
 
+    let memory_count = payloads.len() as u64;
     let ingest_tasks = payloads
         .chunks(DEFAULT_INGEST_BATCH_SIZE)
-        .map(|chunk| BatchIngestPayload {
-            items: chunk.to_vec(),
-        })
+        .map(|chunk| BatchIngestPayload { items: chunk.to_vec() })
         .map(|payload| {
             let url = format!("{}/ingest/batch", config.engine_url);
             let request_client = client.clone();
@@ -1875,7 +2131,7 @@ async fn ingest_instance(
         );
     }
 
-    Ok(())
+    Ok(IngestInstanceOutcome { memories: memory_count, parse_failures })
 }
 
 async fn query_engine(
@@ -1883,6 +2139,7 @@ async fn query_engine(
     config: &EvalConfig,
     q_id: &str,
     question: &str,
+    reference_time_ms: Option<u64>,
 ) -> Result<QueryResponse> {
     // println!("Querying engine...");
     let query_payload = QueryPayload {
@@ -1892,16 +2149,15 @@ async fn query_engine(
         enable_neural_rerank: config.enable_neural_rerank,
         include_evidence: Some(true),
         proof_mode: Some("light".to_string()),
+        reference_time_ms,
     };
 
-    let response = with_engine_auth(
-        client.post(format!("{}/query/semantic", config.engine_url)),
-        config,
-    )
-    .json(&query_payload)
-    .send()
-    .await
-    .context("Failed to query semantic endpoint")?;
+    let response =
+        with_engine_auth(client.post(format!("{}/query/semantic", config.engine_url)), config)
+            .json(&query_payload)
+            .send()
+            .await
+            .context("Failed to query semantic endpoint")?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -1910,10 +2166,8 @@ async fn query_engine(
     }
 
     let timings = parse_query_timings(response.headers());
-    let mut results = response
-        .json::<Vec<QueryResult>>()
-        .await
-        .context("Failed to decode query results")?;
+    let mut results =
+        response.json::<Vec<QueryResult>>().await.context("Failed to decode query results")?;
     for result in &mut results {
         if result.session_id.is_empty() {
             result.session_id = session_id_from_memory_id(&result.memory_id);
@@ -2005,11 +2259,7 @@ fn write_candidate_dump<W: Write>(
     results: &[QueryResult],
     limit: usize,
 ) -> Result<()> {
-    let gold: HashSet<&str> = instance
-        .answer_session_ids
-        .iter()
-        .map(String::as_str)
-        .collect();
+    let gold: HashSet<&str> = instance.answer_session_ids.iter().map(String::as_str).collect();
     let candidates = results
         .iter()
         .take(limit)
@@ -2148,7 +2398,8 @@ impl GoldRankBucketStats {
 }
 
 fn analyze_gold_rank_dump(input: &str, example_limit: usize) -> Result<()> {
-    let file = File::open(input).with_context(|| format!("Failed to open gold-rank dump: {input}"))?;
+    let file =
+        File::open(input).with_context(|| format!("Failed to open gold-rank dump: {input}"))?;
     let reader = BufReader::new(file);
     let mut overall = GoldRankBucketStats::default();
     let mut by_type: BTreeMap<String, GoldRankBucketStats> = BTreeMap::new();
@@ -2162,11 +2413,8 @@ fn analyze_gold_rank_dump(input: &str, example_limit: usize) -> Result<()> {
 
         let value: serde_json::Value = serde_json::from_str(&line)
             .with_context(|| format!("Invalid JSON on line {}", line_idx + 1))?;
-        let question_type = value
-            .get("question_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_string();
+        let question_type =
+            value.get("question_type").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
         let expected = value
             .get("expected_answer_sessions")
             .and_then(|v| v.as_array())
@@ -2208,10 +2456,11 @@ fn analyze_gold_rank_dump(input: &str, example_limit: usize) -> Result<()> {
         }
 
         overall.add_question(&best_bucket, expected, missing);
-        by_type
-            .entry(question_type.clone())
-            .or_default()
-            .add_question(&best_bucket, expected, missing);
+        by_type.entry(question_type.clone()).or_default().add_question(
+            &best_bucket,
+            expected,
+            missing,
+        );
 
         if best_bucket != "1-8" && examples.len() < example_limit {
             examples.push(format_gold_rank_example(&value, &best_bucket));
@@ -2242,11 +2491,7 @@ fn print_gold_rank_stats(label: &str, stats: &GoldRankBucketStats) {
     let top16 = top8 + stats.question_buckets.get("9-16").copied().unwrap_or(0);
     let top32 = top16 + stats.question_buckets.get("17-32").copied().unwrap_or(0);
     let pct = |count: usize| -> f64 {
-        if stats.questions == 0 {
-            0.0
-        } else {
-            count as f64 / stats.questions as f64 * 100.0
-        }
+        if stats.questions == 0 { 0.0 } else { count as f64 / stats.questions as f64 * 100.0 }
     };
 
     println!(
@@ -2258,14 +2503,8 @@ fn print_gold_rank_stats(label: &str, stats: &GoldRankBucketStats) {
         stats.missing_gold_sessions,
         stats.expected_gold_sessions
     );
-    println!(
-        "  question buckets: {}",
-        bucket_counts_line(&stats.question_buckets)
-    );
-    println!(
-        "  gold-session buckets: {}",
-        bucket_counts_line(&stats.gold_session_buckets)
-    );
+    println!("  question buckets: {}", bucket_counts_line(&stats.question_buckets));
+    println!("  gold-session buckets: {}", bucket_counts_line(&stats.gold_session_buckets));
 }
 
 fn bucket_counts_line(counts: &BTreeMap<String, usize>) -> String {
@@ -2299,16 +2538,13 @@ fn format_gold_rank_example(value: &serde_json::Value, bucket: &str) -> String {
         .get("retrieved_sessions")
         .and_then(|v| v.as_array())
         .map(|sessions| {
-            sessions
-                .iter()
-                .take(8)
-                .filter_map(|v| v.as_str())
-                .collect::<Vec<_>>()
-                .join(",")
+            sessions.iter().take(8).filter_map(|v| v.as_str()).collect::<Vec<_>>().join(",")
         })
         .unwrap_or_default();
 
-    format!("  {question_id} [{question_type}] best={bucket} gold={expected} retrieved_top8=[{retrieved}] q={question}")
+    format!(
+        "  {question_id} [{question_type}] best={bucket} gold={expected} retrieved_top8=[{retrieved}] q={question}"
+    )
 }
 
 fn lexical_overlap_count(query: &str, text: &str) -> usize {
@@ -2319,26 +2555,15 @@ fn lexical_overlap_count(query: &str, text: &str) -> usize {
         .map(|term| term.to_string())
         .collect::<HashSet<_>>();
     let lower = text.to_ascii_lowercase();
-    query_terms
-        .into_iter()
-        .filter(|term| lower.contains(term.as_str()))
-        .count()
+    query_terms.into_iter().filter(|term| lower.contains(term.as_str())).count()
 }
 
 fn entity_overlap_count(query: &str, text: &str) -> usize {
     let lower = text.to_ascii_lowercase();
     query
         .split_whitespace()
-        .filter(|word| {
-            word.chars()
-                .next()
-                .map(|ch| ch.is_ascii_uppercase())
-                .unwrap_or(false)
-        })
-        .map(|word| {
-            word.trim_matches(|c: char| !c.is_ascii_alphanumeric())
-                .to_ascii_lowercase()
-        })
+        .filter(|word| word.chars().next().map(|ch| ch.is_ascii_uppercase()).unwrap_or(false))
+        .map(|word| word.trim_matches(|c: char| !c.is_ascii_alphanumeric()).to_ascii_lowercase())
         .filter(|word| word.len() > 2 && lower.contains(word.as_str()))
         .collect::<HashSet<_>>()
         .len()
@@ -2452,12 +2677,7 @@ fn pack_top_sessions(
             .get(&session_id)
             .cloned()
             .unwrap_or_else(|| ("unknown".to_string(), String::new()));
-        packed.push(PackedSession {
-            session_id,
-            session_date,
-            session_focus,
-            chunks,
-        });
+        packed.push(PackedSession { session_id, session_date, session_focus, chunks });
     }
 
     packed
@@ -2471,20 +2691,13 @@ fn build_session_meta(instance: &Instance) -> HashMap<String, (String, String)> 
         .zip(instance.haystack_sessions.iter())
         .zip(instance.haystack_dates.iter())
     {
-        meta.insert(
-            session_id.clone(),
-            (session_date.clone(), build_session_focus(session)),
-        );
+        meta.insert(session_id.clone(), (session_date.clone(), build_session_focus(session)));
     }
     meta
 }
 
 fn turn_index_from_memory_id(memory_id: &str) -> usize {
-    memory_id
-        .rsplit("::")
-        .next()
-        .and_then(|part| part.parse::<usize>().ok())
-        .unwrap_or(0)
+    memory_id.rsplit("::").next().and_then(|part| part.parse::<usize>().ok()).unwrap_or(0)
 }
 
 fn build_enriched_window(
@@ -2536,11 +2749,7 @@ fn build_session_focus(session: &[Turn]) -> String {
         }
     }
 
-    let source = if user_lines.is_empty() {
-        all_lines
-    } else {
-        user_lines
-    };
+    let source = if user_lines.is_empty() { all_lines } else { user_lines };
     truncate_chars(&source.join(" | "), 320)
 }
 
@@ -2569,7 +2778,8 @@ async fn generate_answer(
                 .replace("{question_date}", question_date)
                 .replace("{question}", &instance.question);
             let answer =
-                call_answer_model(client, &prompt, model, max_answer_tokens, "high", use_groq).await?;
+                call_answer_model(client, &prompt, model, max_answer_tokens, "high", use_groq)
+                    .await?;
             (context, answer)
         }
         ReaderMode::Con => {
@@ -2586,7 +2796,8 @@ async fn generate_answer(
                 .replace("{question_date}", question_date)
                 .replace("{question}", &instance.question);
             let answer =
-                call_answer_model(client, &prompt, model, max_answer_tokens, "high", use_groq).await?;
+                call_answer_model(client, &prompt, model, max_answer_tokens, "high", use_groq)
+                    .await?;
             (context, answer)
         }
         ReaderMode::ConSeparate => {
@@ -2598,9 +2809,8 @@ async fn generate_answer(
                     .replace("{session_content}", &session_content)
                     .replace("{question_date}", question_date)
                     .replace("{question}", &instance.question);
-                let note =
-                    call_answer_model(client, &prompt, model, 300, "high", use_groq).await?;
-                if !note.trim().is_empty() && note.trim().to_ascii_lowercase() != "empty" {
+                let note = call_answer_model(client, &prompt, model, 300, "high", use_groq).await?;
+                if !note.trim().is_empty() && !note.trim().eq_ignore_ascii_case("empty") {
                     notes.push(format!(
                         "Session ID: {}\nSession Date: {}\nNotes: {}",
                         session.session_id,
@@ -2619,7 +2829,8 @@ async fn generate_answer(
                     .replace("{question_date}", question_date)
                     .replace("{question}", &instance.question);
                 let answer =
-                    call_answer_model(client, &prompt, model, max_answer_tokens, "high", use_groq).await?;
+                    call_answer_model(client, &prompt, model, max_answer_tokens, "high", use_groq)
+                        .await?;
                 (context, answer)
             } else {
                 let notes_text = notes.join("\n\n---\n\n");
@@ -2630,7 +2841,8 @@ async fn generate_answer(
                     .replace("{question_date}", question_date)
                     .replace("{question}", &instance.question);
                 let answer =
-                    call_answer_model(client, &prompt, model, max_answer_tokens, "high", use_groq).await?;
+                    call_answer_model(client, &prompt, model, max_answer_tokens, "high", use_groq)
+                        .await?;
                 (notes_text, answer)
             }
         }
@@ -2641,7 +2853,7 @@ async fn generate_answer(
                 .replace("{question_date}", question_date)
                 .replace("{question}", &instance.question);
             let notes = call_answer_model(client, &prompt, model, 512, "high", use_groq).await?;
-            if notes.trim().is_empty() || notes.trim().to_ascii_lowercase() == "empty" {
+            if notes.trim().is_empty() || notes.trim().eq_ignore_ascii_case("empty") {
                 (context, "I don't know".to_string())
             } else {
                 let answer_prompt = CON_SEPARATE_ANSWER_PROMPT
@@ -2650,16 +2862,22 @@ async fn generate_answer(
                     .replace("{notes}", &notes)
                     .replace("{question_date}", question_date)
                     .replace("{question}", &instance.question);
-                let answer =
-                    call_answer_model(client, &answer_prompt, model, max_answer_tokens, "high", use_groq)
-                        .await?;
+                let answer = call_answer_model(
+                    client,
+                    &answer_prompt,
+                    model,
+                    max_answer_tokens,
+                    "high",
+                    use_groq,
+                )
+                .await?;
                 (notes, answer)
             }
         }
     };
 
-    if intent == AnswerIntent::NumericAggregation {
-        if let Some(deterministic_answer) = derive_deterministic_numeric_answer(
+    if intent == AnswerIntent::NumericAggregation
+        && let Some(deterministic_answer) = derive_deterministic_numeric_answer(
             client,
             model,
             &instance.question,
@@ -2667,28 +2885,22 @@ async fn generate_answer(
             use_groq,
         )
         .await?
-        {
-            let deterministic_check = verify_answer_candidate(
-                client,
-                model,
-                &instance.question,
-                &evidence_text,
-                &deterministic_answer,
-                use_groq,
-            )
-            .await?;
-            if deterministic_check == "PASS" {
-                answer = deterministic_answer;
-            } else if is_idk_answer(&answer) {
-                answer = deterministic_answer;
-            }
+    {
+        let deterministic_check = verify_answer_candidate(
+            client,
+            model,
+            &instance.question,
+            &evidence_text,
+            &deterministic_answer,
+            use_groq,
+        )
+        .await?;
+        if deterministic_check == "PASS" || is_idk_answer(&answer) {
+            answer = deterministic_answer;
         }
     }
 
-    if matches!(
-        intent,
-        AnswerIntent::NumericAggregation | AnswerIntent::TemporalAggregation
-    ) {
+    if matches!(intent, AnswerIntent::NumericAggregation | AnswerIntent::TemporalAggregation) {
         let verdict = verify_answer_candidate(
             client,
             model,
@@ -2774,9 +2986,8 @@ async fn derive_deterministic_numeric_answer(
     evidence: &str,
     use_groq: bool,
 ) -> Result<Option<String>> {
-    let prompt = NUMERIC_EXTRACTION_PROMPT
-        .replace("{question}", question)
-        .replace("{evidence}", evidence);
+    let prompt =
+        NUMERIC_EXTRACTION_PROMPT.replace("{question}", question).replace("{evidence}", evidence);
     let extraction_text = call_answer_model(client, &prompt, model, 2048, "none", use_groq).await?;
     let mut cleaned_extraction = extraction_text.to_string();
     while let Some(start_idx) = cleaned_extraction.find("<think>") {
@@ -2825,11 +3036,7 @@ async fn derive_deterministic_numeric_answer(
         _ => return Ok(None),
     };
 
-    Ok(Some(format_numeric_answer(
-        computed,
-        &extraction.unit,
-        question,
-    )))
+    Ok(Some(format_numeric_answer(computed, &extraction.unit, question)))
 }
 
 async fn verify_answer_candidate(
@@ -2858,7 +3065,7 @@ async fn verify_answer_candidate(
             break;
         }
     }
-    let trimmed = cleaned_verdict.trim().trim_end_matches(|c: char| c == '.' || c == '!' || c == '?').trim();
+    let trimmed = cleaned_verdict.trim().trim_end_matches(['.', '!', '?']).trim();
     Ok(trimmed.to_string())
 }
 
@@ -3112,11 +3319,7 @@ fn render_session_context(packed_sessions: &[PackedSession]) -> String {
         .iter()
         .enumerate()
         .map(|(idx, session)| {
-            format!(
-                "### Session {}\n{}",
-                idx + 1,
-                render_single_session(session)
-            )
+            format!("### Session {}\n{}", idx + 1, render_single_session(session))
         })
         .collect::<Vec<_>>()
         .join("\n\n")
@@ -3145,17 +3348,11 @@ fn benchmark_entity_id(instance: &Instance, idx: usize) -> String {
     if let Some(entity_id) = instance.entity_id.clone() {
         return entity_id;
     }
-    instance
-        .question_id
-        .clone()
-        .unwrap_or_else(|| format!("q{idx}"))
+    instance.question_id.clone().unwrap_or_else(|| format!("q{idx}"))
 }
 
 fn evaluation_question_id(instance: &Instance, idx: usize) -> String {
-    instance
-        .question_id
-        .clone()
-        .unwrap_or_else(|| format!("q{idx}"))
+    instance.question_id.clone().unwrap_or_else(|| format!("q{idx}"))
 }
 
 fn session_id_for_result(result: &QueryResult) -> String {
@@ -3167,11 +3364,7 @@ fn session_id_for_result(result: &QueryResult) -> String {
 
 fn session_id_from_memory_id(memory_id: &str) -> String {
     let parts: Vec<&str> = memory_id.split("::").collect();
-    if parts.len() > 1 {
-        parts[1].to_string()
-    } else {
-        String::new()
-    }
+    if parts.len() > 1 { parts[1].to_string() } else { String::new() }
 }
 
 fn ground_truth(instance: &Instance) -> String {
@@ -3254,11 +3447,8 @@ fn parse_judge_verdict(verdict: &str) -> bool {
     let mut cleaned = verdict.to_string();
     while let Some(start_idx) = cleaned.find("<think>") {
         if let Some(end_idx) = cleaned.find("</think>") {
-            cleaned = format!(
-                "{}{}",
-                &cleaned[..start_idx],
-                &cleaned[end_idx + "</think>".len()..]
-            );
+            cleaned =
+                format!("{}{}", &cleaned[..start_idx], &cleaned[end_idx + "</think>".len()..]);
         } else {
             cleaned = cleaned[..start_idx].to_string();
             break;
@@ -3312,11 +3502,21 @@ fn parse_judge_verdict(verdict: &str) -> bool {
     }
 
     // Check for sentences containing yes/correct/true
-    if cleaned_lower.contains("yes") || cleaned_lower.contains("correct") || cleaned_lower.contains("true") {
-        if cleaned_lower.contains("not correct") || cleaned_lower.contains("incorrect") || cleaned_lower.contains(" not ") {
+    if cleaned_lower.contains("yes")
+        || cleaned_lower.contains("correct")
+        || cleaned_lower.contains("true")
+    {
+        if cleaned_lower.contains("not correct")
+            || cleaned_lower.contains("incorrect")
+            || cleaned_lower.contains(" not ")
+        {
             return false;
         }
-        if cleaned_lower.starts_with("no") && (cleaned_lower.len() == 2 || cleaned_lower.chars().nth(2).unwrap().is_ascii_whitespace() || cleaned_lower.chars().nth(2).unwrap() == ',') {
+        if cleaned_lower.starts_with("no")
+            && (cleaned_lower.len() == 2
+                || cleaned_lower.chars().nth(2).unwrap().is_ascii_whitespace()
+                || cleaned_lower.chars().nth(2).unwrap() == ',')
+        {
             return false;
         }
         return true;
@@ -3336,15 +3536,9 @@ async fn call_openrouter(
         .context("OPENROUTER_API_KEY must be set for llm mode")?;
     let requested_max_tokens = effective_openrouter_max_tokens(model, max_tokens);
 
-    let body = openrouter_request(
-        client,
-        &api_key,
-        prompt,
-        model,
-        requested_max_tokens,
-        reasoning_effort,
-    )
-    .await?;
+    let body =
+        openrouter_request(client, &api_key, prompt, model, requested_max_tokens, reasoning_effort)
+            .await?;
 
     if let Some(text) = extract_openrouter_text(&body) {
         return Ok(text);
@@ -3394,15 +3588,7 @@ async fn call_groq(
 ) -> Result<String> {
     let api_key =
         std::env::var("GROQ_API_KEY").context("GROQ_API_KEY must be set for --use-groq")?;
-    let body = groq_request(
-        client,
-        &api_key,
-        prompt,
-        model,
-        max_tokens,
-        reasoning_effort,
-    )
-    .await?;
+    let body = groq_request(client, &api_key, prompt, model, max_tokens, reasoning_effort).await?;
 
     if let Some(text) = extract_openrouter_text(&body) {
         return Ok(text);
@@ -3424,10 +3610,7 @@ async fn groq_request(
 ) -> Result<serde_json::Value> {
     let mut request_body = serde_json::Map::new();
     request_body.insert("model".to_string(), json!(model));
-    request_body.insert(
-        "messages".to_string(),
-        json!([{ "role": "user", "content": prompt }]),
-    );
+    request_body.insert("messages".to_string(), json!([{ "role": "user", "content": prompt }]));
     request_body.insert("temperature".to_string(), json!(0.0));
     request_body.insert("top_p".to_string(), json!(1.0));
     request_body.insert("stream".to_string(), json!(false));
@@ -3439,21 +3622,13 @@ async fn groq_request(
     let url = "https://api.groq.com/openai/v1/chat/completions".to_string();
 
     for attempt in 1..=OPENROUTER_MAX_ATTEMPTS {
-        let response = client
-            .post(&url)
-            .bearer_auth(api_key)
-            .json(&request_value)
-            .send()
-            .await;
+        let response = client.post(&url).bearer_auth(api_key).json(&request_value).send().await;
 
         match response {
             Ok(response) => {
                 let status = response.status();
                 if status.is_success() {
-                    return response
-                        .json()
-                        .await
-                        .context("Failed to decode Groq response");
+                    return response.json().await.context("Failed to decode Groq response");
                 }
 
                 let body = response.text().await.unwrap_or_default();
@@ -3484,10 +3659,7 @@ async fn groq_request(
         }
     }
 
-    anyhow::bail!(
-        "Groq request failed after {} attempts",
-        OPENROUTER_MAX_ATTEMPTS
-    )
+    anyhow::bail!("Groq request failed after {} attempts", OPENROUTER_MAX_ATTEMPTS)
 }
 
 async fn openrouter_request(
@@ -3501,10 +3673,7 @@ async fn openrouter_request(
     let reasoning_payload = reasoning_payload_for_model(model, reasoning_effort);
     let mut request_body = serde_json::Map::new();
     request_body.insert("model".to_string(), json!(model));
-    request_body.insert(
-        "messages".to_string(),
-        json!([{ "role": "user", "content": prompt }]),
-    );
+    request_body.insert("messages".to_string(), json!([{ "role": "user", "content": prompt }]));
     request_body.insert("temperature".to_string(), json!(0.0));
     request_body.insert("max_tokens".to_string(), json!(max_tokens));
     if !reasoning_payload.is_null() {
@@ -3515,21 +3684,13 @@ async fn openrouter_request(
         .unwrap_or_else(|_| "https://openrouter.ai/api/v1/chat/completions".to_string());
 
     for attempt in 1..=OPENROUTER_MAX_ATTEMPTS {
-        let response = client
-            .post(&url)
-            .bearer_auth(api_key)
-            .json(&request_value)
-            .send()
-            .await;
+        let response = client.post(&url).bearer_auth(api_key).json(&request_value).send().await;
 
         match response {
             Ok(response) => {
                 let status = response.status();
                 if status.is_success() {
-                    return response
-                        .json()
-                        .await
-                        .context("Failed to decode OpenRouter response");
+                    return response.json().await.context("Failed to decode OpenRouter response");
                 }
 
                 let body = response.text().await.unwrap_or_default();
@@ -3560,10 +3721,7 @@ async fn openrouter_request(
         }
     }
 
-    anyhow::bail!(
-        "OpenRouter request failed after {} attempts",
-        OPENROUTER_MAX_ATTEMPTS
-    )
+    anyhow::bail!("OpenRouter request failed after {} attempts", OPENROUTER_MAX_ATTEMPTS)
 }
 
 fn is_retryable_openrouter_status(status: reqwest::StatusCode) -> bool {
@@ -3590,11 +3748,7 @@ fn is_minimax_m2_model(model: &str) -> bool {
 }
 
 fn effective_openrouter_max_tokens(model: &str, requested_max_tokens: usize) -> usize {
-    if is_minimax_m2_model(model) {
-        requested_max_tokens.max(1024)
-    } else {
-        requested_max_tokens
-    }
+    if is_minimax_m2_model(model) { requested_max_tokens.max(1024) } else { requested_max_tokens }
 }
 
 fn retry_openrouter_max_tokens(model: &str, requested_max_tokens: usize) -> usize {
@@ -3634,11 +3788,7 @@ fn reasoning_payload_for_model(model: &str, reasoning_effort: &str) -> serde_jso
     }
 
     let normalized_effort = if model.contains("gpt-5") {
-        if reasoning_effort == "none" {
-            "minimal"
-        } else {
-            reasoning_effort
-        }
+        if reasoning_effort == "none" { "minimal" } else { reasoning_effort }
     } else {
         reasoning_effort
     };
@@ -3749,11 +3899,7 @@ fn strip_model_reasoning(text: &str) -> String {
     loop {
         match (result.find("<think>"), result.find("</think>")) {
             (Some(start), Some(end)) if end >= start => {
-                result = format!(
-                    "{}{}",
-                    &result[..start],
-                    &result[end + "</think>".len()..]
-                );
+                result = format!("{}{}", &result[..start], &result[end + "</think>".len()..]);
             }
             (Some(start), None) => {
                 result = result[..start].to_string();
@@ -3813,21 +3959,20 @@ fn strip_model_reasoning(text: &str) -> String {
     let candidate = clean_lines.join("\n").trim().to_string();
     if !candidate.is_empty() && !is_reasoning_text(&candidate) {
         // If still long, try extracting the last sentence.
-        if candidate.len() > 80 {
-            if let Some(last_sentence) = extract_last_sentence(&candidate) {
-                if !is_reasoning_text(&last_sentence) {
-                    return last_sentence;
-                }
-            }
+        if candidate.len() > 80
+            && let Some(last_sentence) = extract_last_sentence(&candidate)
+            && !is_reasoning_text(&last_sentence)
+        {
+            return last_sentence;
         }
         return candidate;
     }
 
     // 5. Fallback: extract last sentence from original trimmed text.
-    if let Some(last) = extract_last_sentence(trimmed) {
-        if !is_reasoning_text(&last) {
-            return last;
-        }
+    if let Some(last) = extract_last_sentence(trimmed)
+        && !is_reasoning_text(&last)
+    {
+        return last;
     }
 
     trimmed.to_string()
@@ -3884,7 +4029,7 @@ fn is_reasoning_text(text: &str) -> bool {
         return true;
     }
     // If it has a reasoning preamble pattern like "We are asked: ..."
-    let first_sentence_end = lower.find(|c: char| c == '.' || c == '\n');
+    let first_sentence_end = lower.find(['.', '\n']);
     if let Some(end) = first_sentence_end {
         let first_sentence = &lower[..=end];
         if first_sentence.starts_with("we need")
@@ -3923,30 +4068,17 @@ fn extract_last_sentence(text: &str) -> Option<String> {
     None
 }
 
-
-
 fn value_to_openrouter_text(value: Option<&serde_json::Value>) -> Option<String> {
     match value? {
         serde_json::Value::String(text) => {
             let trimmed = text.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
+            if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
         }
         serde_json::Value::Array(parts) => {
-            let joined = parts
-                .iter()
-                .filter_map(openrouter_content_part_text)
-                .collect::<Vec<_>>()
-                .join("");
+            let joined =
+                parts.iter().filter_map(openrouter_content_part_text).collect::<Vec<_>>().join("");
             let trimmed = joined.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
+            if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
         }
         _ => None,
     }
@@ -4009,6 +4141,7 @@ fn print_llm_summary(totals: &EvalTotals, top_k: usize, dataset_kind: DatasetKin
     println!("============================================================");
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_llm_diagnostics(
     totals: &mut EvalTotals,
     retrieval_hit: bool,
@@ -4043,7 +4176,8 @@ fn record_llm_diagnostics(
 
 fn is_idk_answer(prediction: &str) -> bool {
     let normalized = prediction.trim().to_ascii_lowercase();
-    let cleaned = normalized.trim_end_matches(|c: char| c.is_ascii_punctuation()).trim().to_string();
+    let cleaned =
+        normalized.trim_end_matches(|c: char| c.is_ascii_punctuation()).trim().to_string();
     cleaned == "i don't know"
         || cleaned == "i do not know"
         || cleaned == "idk"
@@ -4088,11 +4222,7 @@ fn print_speed_quality_summary(totals: &EvalTotals) {
     let context_p50 = percentile(&totals.quality.context_token_samples, 50);
     let context_p95 = percentile(&totals.quality.context_token_samples, 95);
     let total_avg_ms = totals.timings.total_ms as f64 / totals.evaluated as f64;
-    let throughput_qph = if total_avg_ms <= 0.0 {
-        0.0
-    } else {
-        3_600_000.0 / total_avg_ms
-    };
+    let throughput_qph = if total_avg_ms <= 0.0 { 0.0 } else { 3_600_000.0 / total_avg_ms };
     let total_time = totals.timings.total_ms.max(1) as f64;
 
     println!();
@@ -4134,10 +4264,7 @@ fn print_speed_quality_summary(totals: &EvalTotals) {
         "P50/P95 (ms): query={}/{} | answer={}/{} | judge={}/{} | total={}/{}",
         query_p50, query_p95, answer_p50, answer_p95, judge_p50, judge_p95, total_p50, total_p95
     );
-    println!(
-        "Estimated throughput: {:.1} questions/hour end-to-end",
-        throughput_qph
-    );
+    println!("Estimated throughput: {:.1} questions/hour end-to-end", throughput_qph);
     println!(
         "Packed context (est tok): avg={} | p50={} | p95={}",
         context_avg, context_p50, context_p95
@@ -4196,10 +4323,7 @@ fn print_dataset_breakdown(
 
     let mut recall_row = format!("{:<20}", format!("Recall@{}", top_k));
     for category in &categories {
-        recall_row.push_str(&format!(
-            " {:>12.1}%",
-            category_metric(totals, category, false)
-        ));
+        recall_row.push_str(&format!(" {:>12.1}%", category_metric(totals, category, false)));
     }
     recall_row.push_str(&format!(
         " {:>10.1}%",
@@ -4210,10 +4334,7 @@ fn print_dataset_breakdown(
     if include_accuracy {
         let mut accuracy_row = format!("{:<20}", "Answer Accuracy");
         for category in &categories {
-            accuracy_row.push_str(&format!(
-                " {:>12.1}%",
-                category_metric(totals, category, true)
-            ));
+            accuracy_row.push_str(&format!(" {:>12.1}%", category_metric(totals, category, true)));
         }
         accuracy_row.push_str(&format!(
             " {:>10.1}%",
@@ -4237,20 +4358,12 @@ fn category_metric(totals: &EvalTotals, label: &str, answer_metric: bool) -> f64
     if stats.evaluated == 0 {
         return 0.0;
     }
-    let numerator = if answer_metric {
-        stats.answer_correct
-    } else {
-        stats.retrieval_correct
-    };
+    let numerator = if answer_metric { stats.answer_correct } else { stats.retrieval_correct };
     numerator as f64 / stats.evaluated as f64 * 100.0
 }
 
 fn category_count(totals: &EvalTotals, label: &str) -> usize {
-    totals
-        .category_stats
-        .get(label)
-        .map(|stats| stats.evaluated)
-        .unwrap_or(0)
+    totals.category_stats.get(label).map(|stats| stats.evaluated).unwrap_or(0)
 }
 
 fn print_timing_summary(timings: &AggregateTimings, evaluated: usize) {
@@ -4292,22 +4405,19 @@ fn print_timing_summary(timings: &AggregateTimings, evaluated: usize) {
             + timings.inner_fuse_ms
             + timings.inner_hydrate_ms)
             / denom,
-        timings
-            .inner_query_total_ms
-            .saturating_sub(
-                timings.inner_route_ms
-                    + timings.inner_embed_ms
-                    + timings.inner_ann_ms
-                    + timings.inner_rerank_ms
-                    + timings.inner_fts_ms
-                    + timings.inner_card_ms
-                    + timings.inner_preference_ms
-                    + timings.inner_graph_ms
-                    + timings.inner_session_ms
-                    + timings.inner_fuse_ms
-                    + timings.inner_hydrate_ms
-            )
-            / denom,
+        timings.inner_query_total_ms.saturating_sub(
+            timings.inner_route_ms
+                + timings.inner_embed_ms
+                + timings.inner_ann_ms
+                + timings.inner_rerank_ms
+                + timings.inner_fts_ms
+                + timings.inner_card_ms
+                + timings.inner_preference_ms
+                + timings.inner_graph_ms
+                + timings.inner_session_ms
+                + timings.inner_fuse_ms
+                + timings.inner_hydrate_ms
+        ) / denom,
         timings.inner_query_total_ms / denom,
     );
     println!(
@@ -4329,10 +4439,7 @@ mod tests {
 
     #[test]
     fn locomo_dialog_ids_map_to_session_ids() {
-        assert_eq!(
-            locomo_dialog_id_to_session_id("D12:7").as_deref(),
-            Some("session_12")
-        );
+        assert_eq!(locomo_dialog_id_to_session_id("D12:7").as_deref(), Some("session_12"));
         assert_eq!(locomo_dialog_id_to_session_id("bad"), None);
     }
 
@@ -4392,5 +4499,32 @@ mod tests {
         assert_eq!(normalized[0].haystack_session_ids.len(), 2);
     }
 
+    #[test]
+    fn test_parse_session_date_ms() {
+        // LongMemEval format
+        let lme = parse_session_date_ms("2023/05/20 (Sat) 02:21");
+        assert!(lme.is_some());
+        // 2023-05-20 02:21:00 UTC = 1684549260000 ms
+        assert_eq!(lme.unwrap(), 1684549260000);
 
+        // LoCoMo format
+        let loc = parse_session_date_ms("1:56 pm on 8 May, 2023");
+        assert!(loc.is_some());
+        // 2023-05-08 13:56:00 UTC = 1683554160000 ms
+        assert_eq!(loc.unwrap(), 1683554160000);
+
+        let loc2 = parse_session_date_ms("8:18 pm on 6 July, 2023");
+        assert!(loc2.is_some());
+        // 2023-07-06 20:18:00 UTC = 1688674680000 ms
+        assert_eq!(loc2.unwrap(), 1688674680000);
+
+        // Date only
+        let date_only = parse_session_date_ms("7 May 2023");
+        assert!(date_only.is_some());
+
+        // Invalid / unknown
+        assert_eq!(parse_session_date_ms("unknown"), None);
+        assert_eq!(parse_session_date_ms(""), None);
+        assert_eq!(parse_session_date_ms("not a date"), None);
+    }
 }

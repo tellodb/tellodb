@@ -23,7 +23,6 @@ mod tests {
             .any(|query| query.contains("bought purchased acquired")));
     }
 
-
     #[test]
     fn inference_plan_adds_archetype_expansion_terms() {
         let plan = build_query_plan(

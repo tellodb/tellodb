@@ -1,13 +1,13 @@
 use anyhow::Result;
-use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions, TextRerank, RerankInitOptions, RerankerModel};
+use fastembed::{
+    EmbeddingModel, RerankInitOptions, RerankerModel, TextEmbedding, TextInitOptions, TextRerank,
+};
 use ort::ep::CUDA;
 
 use lru::LruCache;
 use parking_lot::Mutex;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-
-
 
 /// Default number of embedding executors. Each holds a copy of the embed
 /// model in memory; for BGE-small-en-v1.5 (~130MB) this is fine. Override with
@@ -46,7 +46,9 @@ struct SemanticExecutor {
 
 impl SemanticInference {
     pub async fn new() -> Result<Self> {
-        let embedding_model_id = "BAAI/bge-small-en-v1.5".to_string();
+        let embedding_model_id = std::env::var("TEMPORAL_MEMORY_EMBEDDING_MODEL")
+            .or_else(|_| std::env::var("TELLODB_EMBEDDING_MODEL"))
+            .unwrap_or_else(|_| "BAAI/bge-small-en-v1.5".to_string());
         let embedding_dim = embedding_dimensions_for_model(&embedding_model_id);
 
         // Use GPU if TEMPORAL_MEMORY_DEVICE=gpu or cuda is set.
@@ -54,7 +56,13 @@ impl SemanticInference {
         let use_gpu = device_env == "gpu" || device_env == "cuda";
         let use_coreml = device_env == "coreml" || device_env == "mps" || device_env == "mac";
 
-        let device_label: &'static str = if use_gpu { "CUDA" } else if use_coreml { "CoreML" } else { "CPU" };
+        let device_label: &'static str = if use_gpu {
+            "CUDA"
+        } else if use_coreml {
+            "CoreML"
+        } else {
+            "CPU"
+        };
 
         let default_n_embed = if use_gpu || use_coreml { 1 } else { DEFAULT_EMBED_EXECUTORS };
         let default_n_rerank = if use_gpu || use_coreml { 1 } else { DEFAULT_RERANK_EXECUTORS };
@@ -159,7 +167,6 @@ impl SemanticInference {
         &self.executors[idx % self.executors.len()]
     }
 
-
     pub fn generate_embedding(&self, text: &str) -> Result<Vec<f32>> {
         let executor = self.next_executor();
         if let Some(ref model) = executor.fast_embedding {
@@ -175,6 +182,7 @@ impl SemanticInference {
         self.generate_embedding(text)
     }
 
+    #[allow(dead_code)]
     pub async fn generate_query_embedding_async(&self, text: String) -> Result<Vec<f32>> {
         let executor = self.next_executor_arc();
         tokio::task::spawn_blocking(move || {
@@ -205,6 +213,7 @@ impl SemanticInference {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn embed_batch_async(&self, texts: Vec<String>) -> Vec<Vec<f32>> {
         if texts.is_empty() {
             return Vec::new();
@@ -260,7 +269,7 @@ impl SemanticInference {
         }
 
         // Split into chunks aligned with executor count.
-        let chunk_size = (texts.len() + n_exec - 1) / n_exec;
+        let chunk_size = texts.len().div_ceil(n_exec);
         let mut chunks: Vec<Vec<String>> = Vec::with_capacity(n_exec);
         for c in texts.chunks(chunk_size) {
             chunks.push(c.to_vec());
@@ -434,7 +443,7 @@ fn split_for_rerank(texts: &[String], n: usize) -> Vec<(usize, Vec<String>)> {
         return vec![(0, texts.to_vec())];
     }
     let n = n.min(texts.len());
-    let chunk_size = (texts.len() + n - 1) / n;
+    let chunk_size = texts.len().div_ceil(n);
     let mut out = Vec::with_capacity(n);
     for (i, chunk) in texts.chunks(chunk_size).enumerate() {
         out.push((i * chunk_size, chunk.to_vec()));
@@ -458,6 +467,26 @@ fn rerank_cache_key(q: &str, texts: &[String]) -> u64 {
 
 fn info_msg(msg: &str) {
     eprintln!("[semantic] {msg}");
+}
+
+fn embedding_dimensions_for_model(id: &str) -> usize {
+    if let Ok(dim) = std::env::var("TEMPORAL_MEMORY_EMBEDDING_DIM") {
+        if let Ok(d) = dim.parse::<usize>() {
+            return d;
+        }
+    }
+    match id {
+        s if s.contains("bge-small") => 384,
+        s if s.contains("bge-base") => 768,
+        s if s.contains("bge-large") => 1024,
+        s if s.contains("Qwen3-Embedding-0.6B") => 1024,
+        s if s.contains("MiniLM-L6") => 384,
+        s if s.contains("MiniLM-L12") => 384,
+        s if s.contains("e5-small") => 384,
+        s if s.contains("e5-base") => 768,
+        s if s.contains("e5-large") => 1024,
+        _ => 384,
+    }
 }
 
 #[cfg(test)]
@@ -509,25 +538,5 @@ mod tests {
         assert_eq!(out[1].0, 5);
         assert_eq!(out[2].0, 10);
         assert_eq!(out[3].0, 15);
-    }
-}
-
-fn embedding_dimensions_for_model(id: &str) -> usize {
-    if let Ok(dim) = std::env::var("TEMPORAL_MEMORY_EMBEDDING_DIM") {
-        if let Ok(d) = dim.parse::<usize>() {
-            return d;
-        }
-    }
-    match id {
-        s if s.contains("bge-small") => 384,
-        s if s.contains("bge-base") => 768,
-        s if s.contains("bge-large") => 1024,
-        s if s.contains("Qwen3-Embedding-0.6B") => 1024,
-        s if s.contains("MiniLM-L6") => 384,
-        s if s.contains("MiniLM-L12") => 384,
-        s if s.contains("e5-small") => 384,
-        s if s.contains("e5-base") => 768,
-        s if s.contains("e5-large") => 1024,
-        _ => 384,
     }
 }
