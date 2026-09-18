@@ -22,6 +22,9 @@ pub struct QueryPlan {
     /// Inferred fact_key for direct fact lookup pre-synthesized paths.
     /// Populated from `infer_query_fact_key(query)` in the planner.
     pub fact_key: Option<String>,
+    /// The question asks for the present value ("where do I live now?"), so
+    /// newer evidence and non-superseded facts should outrank older ones.
+    pub prefers_latest: bool,
 }
 
 #[derive(Debug, Clone)]

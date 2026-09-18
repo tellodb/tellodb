@@ -1,5 +1,4 @@
 use crate::api::types::IngestPayload;
-use crate::api::utils::split_memory_id;
 
 pub fn chunk_markdown(text: &str) -> Vec<String> {
     let mut sections = Vec::new();
@@ -161,12 +160,9 @@ pub fn infer_content_type(payload: &IngestPayload) -> String {
 }
 
 pub fn build_chunk_memory_id(payload: &IngestPayload, idx: usize) -> String {
-    if let Some((entity, session, turn_index)) = split_memory_id(&payload.memory_id) {
-        let next_turn = turn_index.saturating_mul(100).saturating_add(idx);
-        format!("{entity}::{session}::{next_turn}")
-    } else {
-        format!("{}::ct{}", payload.memory_id, idx)
-    }
+    // Chunks used to be numbered `turn*100 + idx`, which reused real turn ids
+    // (chunk 1 of turn 0 overwrote turn 1).
+    crate::api::utils::derived_memory_id(&payload.memory_id, &format!("c{idx}"))
 }
 
 pub fn expand_payload_for_content_type(payload: &IngestPayload) -> Vec<IngestPayload> {
@@ -226,7 +222,29 @@ mod tests {
         let expanded = expand_payload_for_content_type(&payload_long);
         assert!(expanded.len() > 1);
         assert_eq!(expanded[0].source_memory_id, Some("user::sess::0".to_string()));
-        assert_eq!(expanded[0].memory_id, "user::sess::0");
-        assert_eq!(expanded[1].memory_id, "user::sess::1");
+        assert_eq!(expanded[0].memory_id, "user::sess::0::c0");
+        assert_eq!(expanded[1].memory_id, "user::sess::0::c1");
+    }
+
+    #[test]
+    fn chunk_ids_never_reuse_other_turn_ids() {
+        let long_text = "A. ".repeat(600);
+        let chunk_ids: Vec<String> = (0..3)
+            .flat_map(|turn| {
+                expand_payload_for_content_type(&IngestPayload {
+                    entity_id: "user".to_string(),
+                    memory_id: format!("user::sess::{turn}"),
+                    textual_content: long_text.clone(),
+                    content_type: Some("plain".to_string()),
+                    ..Default::default()
+                })
+            })
+            .map(|p| p.memory_id)
+            .collect();
+        let unique: std::collections::HashSet<_> = chunk_ids.iter().collect();
+        assert_eq!(unique.len(), chunk_ids.len());
+        assert!(chunk_ids
+            .iter()
+            .all(|id| !["user::sess::1", "user::sess::2"].contains(&id.as_str())));
     }
 }

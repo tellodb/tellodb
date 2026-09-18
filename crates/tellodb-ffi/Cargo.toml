@@ -1,0 +1,17 @@
+[package]
+name = "tellodb-ffi"
+version = "0.1.0"
+edition = "2021"
+description = "C ABI for embedding tellodb (used by the Python and Node bindings)"
+
+[lib]
+name = "tellodb"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+tellodb = { path = "../.." }
+serde_json = "1.0.149"
+anyhow = "1.0.102"
+
+[features]
+bundled-models = ["tellodb/bundled-models"]

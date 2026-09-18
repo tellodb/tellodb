@@ -3202,6 +3202,7 @@ dependencies = [
  "axum",
  "criterion",
  "fastembed",
+ "half",
  "lru",
  "mimalloc",
  "num_cpus",
@@ -3228,6 +3229,15 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "usearch",
+]
+
+[[package]]
+name = "tellodb-ffi"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
+ "tellodb",
 ]
 
 [[package]]

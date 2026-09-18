@@ -98,6 +98,8 @@ pub struct EvidenceCard {
     pub created_at_ms: u64,
     #[serde(skip)]
     pub entity_id: String,
+    #[serde(skip)]
+    pub source_turn_index: usize,
 }
 
 #[derive(Serialize)]
@@ -125,6 +127,19 @@ pub struct VersionResponse {
     pub embedding_model: String,
     pub embedding_dim: usize,
     pub ranking_config: RankingConfig,
+    pub rerank: String,
+    pub rerank_policy: &'static str,
+    pub rerank_margin: f32,
+    pub rerank_top: usize,
+    pub embed_max_tokens: usize,
+    pub embed_text: &'static str,
+    pub query_instruction: String,
+    /// Structures turned off with `TELLODB_DISABLE`.
+    pub disabled_structures: Vec<&'static str>,
+    pub context_window: u32,
+    pub embed_batch: usize,
+    pub embed_cache_hits: u64,
+    pub embed_cache_misses: u64,
 }
 
 #[derive(Serialize)]
@@ -142,8 +157,17 @@ pub struct WarmupResponse {
 #[derive(Deserialize, Clone, Default)]
 pub struct IngestPayload {
     pub entity_id: String,
+    /// Opaque, unique id. Session and turn are read from the explicit fields
+    /// below; parsing `entity::session::turn` ids is only a fallback.
     pub memory_id: String,
+    /// Event time of the memory (ms since epoch).
     pub timestamp: u64,
+    /// Conversation/session this memory belongs to.
+    pub session_id: Option<String>,
+    /// Position within the session.
+    pub turn_index: Option<u32>,
+    /// Speaker, e.g. `user` or `assistant`.
+    pub role: Option<String>,
     pub textual_content: String,
     pub relations: Vec<(String, String, String)>,
     /// Optional memory type. Defaults to Conversational.
@@ -220,6 +244,23 @@ pub struct BucketedResult {
     pub stddev: f64,
 }
 
+/// How a fact stopped being current.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WhyStale {
+    pub fact_key: String,
+    /// The value this memory states.
+    pub stale_value: String,
+    /// The value that holds now, if any.
+    pub current_value: Option<String>,
+    /// Memory that replaced this value.
+    pub superseded_by: String,
+    pub superseded_at_ms: Option<u64>,
+    pub valid_from_ms: u64,
+    pub valid_to_ms: Option<u64>,
+    /// Memories stating this same value, newest first.
+    pub evidence: Vec<String>,
+}
+
 #[derive(Serialize, Clone, Debug)]
 pub struct QueryResult {
     pub memory_id: String,
@@ -239,6 +280,9 @@ pub struct QueryResult {
     pub conflict_flag: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub superseded_by: Option<String>,
+    /// Why this fact is no longer current (absent while it is).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub why_stale: Option<WhyStale>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stability_score: Option<f32>,
 }
@@ -366,8 +410,6 @@ pub struct MemoryInspectResponse {
     pub card: Option<crate::storage::MemoryCard>,
     pub ledger_turn: Option<crate::storage::LedgerTurn>,
     pub lifecycle: Option<crate::lifecycle::LifecycleMetadata>,
-    pub artifacts: Vec<crate::storage::MemoryArtifact>,
-    pub artifact_versions: Vec<crate::lifecycle::ArtifactVersionRecord>,
     pub deletion_tombstones: Vec<crate::lifecycle::DeletionTombstone>,
     pub turn_window: Vec<ProofTurn>,
 }
@@ -454,21 +496,14 @@ pub struct StorageStatsResponse {
     pub edge_count: usize,
     pub memory_count: usize,
     pub metric_count: usize,
-    pub ledger_turn_count: usize,
-    pub memory_artifact_count: usize,
-    pub temporal_event_count: usize,
-    pub shadow_question_count: usize,
-    pub facet_posting_count: usize,
-    pub mem_cell_count: usize,
-    pub mem_scene_count: usize,
-    pub profile_fact_count: usize,
     pub session_router_count: usize,
     pub fact_version_count: usize,
-    pub card_relation_count: usize,
     pub memory_link_count: usize,
     pub alias_count: usize,
     pub preference_count: usize,
     pub core_profile_count: usize,
     pub deletion_tombstone_count: usize,
+    /// Bytes in pages holding data (excludes the free list left by deletes).
+    pub used_bytes: usize,
     pub storage_bytes: usize,
 }

@@ -21,7 +21,7 @@ impl MemoryKind {
     }
 }
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone, Default)]
 pub struct AgentObservation {
     pub entity_id: String,
     pub textual_content: String,
@@ -29,6 +29,13 @@ pub struct AgentObservation {
     pub kind: MemoryKind,
     pub content_hash: String,
     pub created_at_ms: u64,
+    /// Session the memory belongs to ("" if unknown).
+    pub session_id: String,
+    pub turn_index: u32,
+    pub role: String,
+    /// Source memory for derived records (chunks, companions, cards); `None`
+    /// for memories ingested as sent.
+    pub parent_memory_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -100,136 +107,6 @@ pub struct LedgerTurn {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct MemoryArtifact {
-    pub artifact_id: String,
-    pub artifact_type: String,
-    pub entity_id: String,
-    pub source_turn_ids: Vec<String>,
-    pub source_memory_ids: Vec<String>,
-    pub source_session_ids: Vec<String>,
-    pub compiler_name: String,
-    pub compiler_version: String,
-    pub embedding_model: Option<String>,
-    pub embedding_dim: Option<usize>,
-    pub index_namespace: Option<String>,
-    pub lifecycle: Option<LifecycleMetadata>,
-    pub created_at_ms: u64,
-    pub updated_at_ms: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct TemporalEvent {
-    pub event_id: String,
-    pub entity_id: String,
-    pub source_session_id: String,
-    pub source_memory_id: String,
-    pub source_turn_index: usize,
-    pub subject: String,
-    pub relation: String,
-    pub object: Option<String>,
-    pub participants: Vec<String>,
-    pub place: Option<String>,
-    pub document_time_ms: u64,
-    pub event_time_ms: Option<u64>,
-    pub event_time_range_ms: Option<(u64, u64)>,
-    pub event_time_granularity: String,
-    pub actor_entities: Vec<String>,
-    pub object_entities: Vec<String>,
-    pub event_type: String,
-    pub is_inferred_time: bool,
-    pub event_text: String,
-    pub confidence: f32,
-    pub lifecycle: Option<LifecycleMetadata>,
-    pub created_at_ms: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ShadowQuestion {
-    pub shadow_id: String,
-    pub entity_id: String,
-    pub source_session_id: String,
-    pub source_memory_id: String,
-    pub source_card_id: Option<String>,
-    pub question_text: String,
-    pub answer_type: String,
-    pub entities: Vec<String>,
-    pub facets: Vec<String>,
-    pub confidence: f32,
-    pub created_at_ms: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct FacetPosting {
-    pub entity_id: String,
-    pub facet_type: String,
-    pub facet_value: String,
-    pub target_id: String,
-    pub target_type: String,
-    pub session_id: String,
-    pub memory_id: Option<String>,
-    pub card_id: Option<String>,
-    pub event_id: Option<String>,
-    pub turn_id: Option<String>,
-    pub weight: f32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct MemCell {
-    pub cell_id: String,
-    pub entity_id: String,
-    pub source_session_id: String,
-    pub source_turn_ids: Vec<String>,
-    pub cell_text: String,
-    pub cell_type: String,
-    pub subjects: Vec<String>,
-    pub objects: Vec<String>,
-    pub activities: Vec<String>,
-    pub places: Vec<String>,
-    pub document_time_ms: u64,
-    pub event_time_ms: Option<u64>,
-    pub confidence: f32,
-    pub saliency: f32,
-    pub lifecycle: Option<LifecycleMetadata>,
-    pub created_at_ms: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct MemSceneRecord {
-    pub scene_id: String,
-    pub entity_id: String,
-    pub scene_title: String,
-    pub scene_summary: String,
-    pub source_cell_ids: Vec<String>,
-    pub source_session_ids: Vec<String>,
-    pub entities: Vec<String>,
-    pub activities: Vec<String>,
-    pub objects: Vec<String>,
-    pub places: Vec<String>,
-    pub time_range_ms: Option<(u64, u64)>,
-    pub scene_type: String,
-    pub saliency: f32,
-    pub lifecycle: Option<LifecycleMetadata>,
-    pub created_at_ms: u64,
-    pub updated_at_ms: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ProfileFact {
-    pub profile_fact_id: String,
-    pub entity_id: String,
-    pub category: String,
-    pub value: String,
-    pub source_session_id: String,
-    pub source_memory_id: String,
-    pub source_card_id: Option<String>,
-    pub confidence: f32,
-    pub document_time_ms: u64,
-    pub is_latest: bool,
-    pub lifecycle: Option<LifecycleMetadata>,
-    pub created_at_ms: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionCandidateTrace {
     pub session_id: String,
     pub final_score: f32,
@@ -276,37 +153,59 @@ pub struct SessionRouterSearchHit {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct TemporalEventSearchHit {
-    pub event_id: String,
-    pub source_memory_id: String,
-    pub source_session_id: String,
-    pub score: f32,
-    pub lexical_hits: usize,
-    pub temporal_hits: usize,
-    pub entity_hits: usize,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ShadowQuestionSearchHit {
-    pub shadow_id: String,
-    pub source_memory_id: String,
-    pub source_session_id: String,
-    pub score: f32,
-    pub lexical_hits: usize,
-    pub entity_hits: usize,
-}
-
-#[derive(Debug, Clone, PartialEq)]
 pub struct DeletedObservation {
     pub vector_id: Option<u64>,
+    /// Vectors of chunk memories removed along with the parent.
+    pub chunk_vector_ids: Vec<u64>,
     pub entity_id: String,
     pub tombstone: Option<crate::lifecycle::DeletionTombstone>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum FactVersionStatus {
-    Current { superseded: Option<(u64, String)> },
-    Stale { current: (u64, String) },
+    Current {
+        superseded: Option<(u64, String)>,
+    },
+    Stale {
+        current: (u64, String),
+    },
+    /// The memory restated a value that an existing version already holds; it
+    /// was recorded as evidence for that version instead of starting a new one.
+    Confirmed {
+        version: (u64, String),
+    },
+}
+
+/// One version in a fact's history.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FactHistoryEntry {
+    /// The memory that stated this value (the source turn where there is one).
+    pub memory_id: String,
+    pub object: String,
+    pub is_current: bool,
+    pub valid_from_ms: u64,
+    /// When the next version took over; `None` while this one holds.
+    pub valid_to_ms: Option<u64>,
+    /// Memories stating this same value, newest first.
+    pub evidence: Vec<String>,
+}
+
+/// A fact version as stored, for explaining a result's currency.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FactVersionRow {
+    pub fact_key: String,
+    pub entity_id: String,
+    pub object: String,
+    pub is_current: bool,
+    pub valid_from_ms: u64,
+    pub valid_to_ms: Option<u64>,
+    /// The version that replaced this one, when it is no longer current.
+    pub superseded_by: Option<String>,
+    pub superseded_at_ms: Option<u64>,
+    /// Value of the version that is current now.
+    pub current_object: Option<String>,
+    /// Memories that state this version's value, newest first.
+    pub evidence: Vec<String>,
 }
 
 pub(crate) fn build_session_router_text(record: &SessionRouterRecord) -> String {
@@ -368,18 +267,6 @@ pub struct GraphEdgeEntry<'a> {
     pub status: &'a str,
     pub ref_info: Option<(&'a str, &'a str)>,
     pub timestamp: u64,
-}
-
-#[derive(Clone)]
-pub struct CombinedIngestUpsertInput<'a> {
-    pub cards: &'a [MemoryCard],
-    pub artifacts: &'a [MemoryArtifact],
-    pub events: &'a [TemporalEvent],
-    pub shadow_questions: &'a [ShadowQuestion],
-    pub facet_postings: &'a [FacetPosting],
-    pub mem_cells: &'a [MemCell],
-    pub mem_scenes: &'a [MemSceneRecord],
-    pub profile_facts: &'a [ProfileFact],
 }
 
 pub struct MemoryCardSearchInput<'a> {

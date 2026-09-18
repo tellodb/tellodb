@@ -27,6 +27,10 @@ pub struct QuestionRecord {
     /// Every gold session in the top-k sessions (LongMemEval recall_all).
     pub hit_all: bool,
     pub ndcg: f64,
+    /// Has at least one gold evidence session. Abstention questions have
+    /// none, so retrieval recall is undefined for them and they are excluded
+    /// from recall/nDCG (they still count for answer accuracy).
+    pub answerable: bool,
     /// `None` in recall-only runs.
     pub answer_correct: Option<bool>,
     /// The question failed with an error; counted as incorrect, never dropped.
@@ -42,6 +46,29 @@ pub struct IngestStats {
     pub memories: u64,
     pub wall_ms: u64,
     pub timestamp_parse_failures: u64,
+    /// Summed `x-tm-ingest-counts` (expanded, embedded, per derived structure).
+    pub counts: BTreeMap<String, u64>,
+    /// Database bytes per memory sent, one sample per ingested entity.
+    pub db_bytes_per_memory: Vec<f64>,
+}
+
+impl IngestStats {
+    pub fn add_counts(&mut self, counts: &BTreeMap<String, u64>) {
+        for (k, v) in counts {
+            *self.counts.entry(k.clone()).or_default() += v;
+        }
+    }
+}
+
+/// Parses `k=v,k=v` from the engine's `x-tm-ingest-counts` header.
+pub fn parse_counts_header(value: &str) -> BTreeMap<String, u64> {
+    value
+        .split(',')
+        .filter_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            Some((k.trim().to_string(), v.trim().parse().ok()?))
+        })
+        .collect()
 }
 
 pub struct RunContext<'a> {
@@ -49,6 +76,7 @@ pub struct RunContext<'a> {
     pub dataset_kind: &'a str,
     pub dataset_path: &'a str,
     pub split: &'a str,
+    pub tier: &'a str,
     pub top_k: usize,
     pub config: Value,
     pub engine_url: &'a str,
@@ -142,9 +170,16 @@ fn quality_block(rows: &[&QuestionRecord]) -> Value {
         "errored": rows.iter().filter(|r| r.errored).count(),
         // Errored questions count as failures everywhere: dropping them would
         // silently inflate every metric.
-        "recall_any": mean_with_ci(&bools(rows, |r| Some(r.hit_any && !r.errored))),
-        "recall_all": mean_with_ci(&bools(rows, |r| Some(r.hit_all && !r.errored))),
-        "ndcg": mean_with_ci(&rows.iter().map(|r| if r.errored { 0.0 } else { r.ndcg }).collect::<Vec<_>>()),
+        "unanswerable": rows.iter().filter(|r| !r.answerable).count(),
+        "recall_any": mean_with_ci(&bools(rows, |r| r.answerable.then_some(r.hit_any && !r.errored))),
+        "recall_all": mean_with_ci(&bools(rows, |r| r.answerable.then_some(r.hit_all && !r.errored))),
+        "ndcg": mean_with_ci(
+            &rows
+                .iter()
+                .filter(|r| r.answerable)
+                .map(|r| if r.errored { 0.0 } else { r.ndcg })
+                .collect::<Vec<_>>(),
+        ),
         "accuracy": mean_with_ci(&bools(rows, |r| {
             if r.errored { Some(false) } else { r.answer_correct }
         })),
@@ -153,7 +188,7 @@ fn quality_block(rows: &[&QuestionRecord]) -> Value {
 
 fn stage_latencies(rows: &[&QuestionRecord]) -> Value {
     type Getter = fn(&QueryTimings) -> u64;
-    let stages: [(&str, Getter); 15] = [
+    let stages: [(&str, Getter); 19] = [
         ("planning", |t| t.planning_ms),
         ("route", |t| t.route_ms),
         ("embed", |t| t.embed_ms),
@@ -163,6 +198,10 @@ fn stage_latencies(rows: &[&QuestionRecord]) -> Value {
         ("rerank", |t| t.rerank_ms),
         ("preference", |t| t.preference_ms),
         ("graph", |t| t.graph_ms),
+        ("graph_seeds_wall", |t| t.graph_seeds_wall_us / 1000),
+        ("graph_links", |t| t.graph_links_us / 1000),
+        ("graph_edges", |t| t.graph_edges_us / 1000),
+        ("graph_entities", |t| t.graph_entities_us / 1000),
         ("session", |t| t.session_ms),
         ("fuse", |t| t.fuse_ms),
         ("hydrate", |t| t.hydrate_ms),
@@ -190,7 +229,7 @@ fn command_line(cmd: &str, args: &[&str]) -> Option<String> {
     (output.status.success() && !text.is_empty()).then_some(text)
 }
 
-fn host_info() -> Value {
+fn host_info(tier: &str) -> Value {
     let cpu = command_line("sysctl", &["-n", "machdep.cpu.brand_string"]).or_else(|| {
         fs::read_to_string("/proc/cpuinfo").ok().and_then(|info| {
             info.lines()
@@ -200,6 +239,7 @@ fn host_info() -> Value {
         })
     });
     json!({
+        "tier": tier,
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
         "logical_cpus": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
@@ -265,6 +305,7 @@ pub async fn write_run_record(
     let record = json!({
         "schema": 1,
         "mode": ctx.mode,
+        "tier": ctx.tier,
         "started_ms": ctx.started_ms,
         "finished_ms": finished_ms,
         "git": {
@@ -281,7 +322,7 @@ pub async fn write_run_record(
         "top_k": ctx.top_k,
         "config": ctx.config,
         "engine": engine_info(client, ctx.engine_url, ctx.engine_api_key).await,
-        "host": host_info(),
+        "host": host_info(ctx.tier),
         "metrics": {
             "overall": quality_block(&all),
             "per_type": per_type,
@@ -290,11 +331,20 @@ pub async fn write_run_record(
                 "stages": stage_latencies(&all),
             },
             "context_tokens": latency_summary(&context_tokens),
+            "rerank_reasons": rerank_reasons(&ok),
+            "rerank_applied_rate": if ok.is_empty() { 0.0 } else {
+                ok.iter().filter(|r| r.timings.rerank_applied).count() as f64 / ok.len() as f64
+            },
             "ingest": {
                 "entities": ingest.entities,
                 "memories": ingest.memories,
                 "wall_ms": ingest.wall_ms,
                 "timestamp_parse_failures": ingest.timestamp_parse_failures,
+                "counts": ingest.counts,
+                "embedded_per_memory": ingest.counts.get("embedded").map(|e| {
+                    if ingest.memories > 0 { *e as f64 / ingest.memories as f64 } else { 0.0 }
+                }),
+                "db_bytes_per_memory": mean(&ingest.db_bytes_per_memory),
                 "memories_per_sec": if ingest.wall_ms > 0 {
                     ingest.memories as f64 * 1000.0 / ingest.wall_ms as f64
                 } else { 0.0 },
@@ -318,8 +368,8 @@ pub async fn write_run_record(
 /// Render a markdown comparison table from run record files.
 pub fn report(paths: &[String]) -> Result<String> {
     let mut out = String::from(
-        "| run | commit | dataset | split | n | err | recall_any (95% CI) | recall_all | nDCG | accuracy (95% CI) | query p50/p95/p99 ms | ingest mem/s |\n\
-         |---|---|---|---|---|---|---|---|---|---|---|---|\n",
+        "| run | tier | commit | dataset | split | n | err | recall_any (95% CI) | recall_all | nDCG | accuracy (95% CI) | query p50/p95/p99 ms | ingest mem/s |\n\
+         |---|---|---|---|---|---|---|---|---|---|---|---|---|\n",
     );
     let fmt_ci = |v: &Value| -> String {
         match (v["mean"].as_f64(), v["ci95"].as_array()) {
@@ -341,9 +391,11 @@ pub fn report(paths: &[String]) -> Result<String> {
         let q = &m["latency_ms"]["query_client"];
         let commit = r["git"]["commit"].as_str().map(|c| &c[..c.len().min(8)]).unwrap_or("?");
         let dirty = if r["git"]["dirty"].as_bool().unwrap_or(false) { "*" } else { "" };
+        let tier = r["tier"].as_str().or_else(|| r["host"]["tier"].as_str()).unwrap_or("–");
         out.push_str(&format!(
-            "| {} | {}{} | {} | {} | {} | {} | {} | {} | {} | {} | {}/{}/{} | {:.1} |\n",
+            "| {} | {} | {}{} | {} | {} | {} | {} | {} | {} | {} | {} | {}/{}/{} | {:.1} |\n",
             Path::new(path).file_stem().map(|s| s.to_string_lossy()).unwrap_or_default(),
+            tier,
             commit,
             dirty,
             r["dataset"]["kind"].as_str().unwrap_or("?"),
@@ -360,7 +412,184 @@ pub fn report(paths: &[String]) -> Result<String> {
             m["ingest"]["memories_per_sec"].as_f64().unwrap_or(0.0),
         ));
     }
+
+    out.push_str("\n### Query Latency Breakdown (Mean ms)\n\n");
+    out.push_str("| run | tier | plan | route | embed | ann | fts | cards | rerank | pref | graph | session | fuse | hydr | total |\n");
+    out.push_str("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
+    for path in paths {
+        let data = fs::read_to_string(path).with_context(|| format!("Failed to read {path}"))?;
+        let r: Value = serde_json::from_str(&data).with_context(|| format!("Bad record {path}"))?;
+        let tier = r["tier"].as_str().or_else(|| r["host"]["tier"].as_str()).unwrap_or("–");
+        let st = &r["metrics"]["latency_ms"]["stages"];
+        let stage_mean = |name: &str| -> String {
+            st[name]["mean"].as_f64().map_or("–".into(), |m| format!("{:.1}", m))
+        };
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            Path::new(path).file_stem().map(|s| s.to_string_lossy()).unwrap_or_default(),
+            tier,
+            stage_mean("planning"),
+            stage_mean("route"),
+            stage_mean("embed"),
+            stage_mean("ann"),
+            stage_mean("fts"),
+            stage_mean("cards"),
+            stage_mean("rerank"),
+            stage_mean("preference"),
+            stage_mean("graph"),
+            stage_mean("session"),
+            stage_mean("fuse"),
+            stage_mean("hydrate"),
+            stage_mean("engine_total"),
+        ));
+    }
+
     Ok(out)
+}
+
+/// Paired bootstrap 95% CI of `mean(b - a)` over aligned samples.
+pub fn paired_delta_ci(a: &[f64], b: &[f64]) -> Option<(f64, f64, f64)> {
+    if a.is_empty() || a.len() != b.len() {
+        return None;
+    }
+    let diffs: Vec<f64> = a.iter().zip(b).map(|(x, y)| y - x).collect();
+    let v = mean_with_ci(&diffs);
+    let ci = v["ci95"].as_array()?;
+    Some((v["mean"].as_f64()?, ci[0].as_f64()?, ci[1].as_f64()?))
+}
+
+/// Per-question `(recall_any, ndcg)` of answerable questions, by question id.
+fn question_scores(record: &Value) -> BTreeMap<String, (f64, f64)> {
+    record["questions"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter(|q| q["answerable"].as_bool().unwrap_or(true))
+                .filter_map(|q| {
+                    let errored = q["errored"].as_bool().unwrap_or(false);
+                    let hit = q["hit_any"].as_bool().unwrap_or(false) && !errored;
+                    let ndcg = if errored { 0.0 } else { q["ndcg"].as_f64().unwrap_or(0.0) };
+                    Some((q["question_id"].as_str()?.to_string(), (f64::from(u8::from(hit)), ndcg)))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A run's label: the configuration directory it was written to (the sweep
+/// scripts name directories after the configuration), else its disabled
+/// structures.
+fn ablation_label(path: &str, record: &Value) -> String {
+    if let Some(dir) = Path::new(path).parent().and_then(|p| p.file_name()) {
+        let dir = dir.to_string_lossy();
+        if !dir.is_empty() && dir != "runs" && !dir.chars().all(|c| c.is_ascii_digit() || c == '_') {
+            return dir.into_owned();
+        }
+    }
+    let disabled: Vec<&str> = record["engine"]["disabled_structures"]
+        .as_array()
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    if disabled.is_empty() {
+        "(none)".to_string()
+    } else {
+        format!("-{}", disabled.join(",-"))
+    }
+}
+
+/// Markdown table of each run's change against `baseline`: paired deltas on
+/// the questions both runs answered, plus ingest and latency cost changes.
+/// "keep?" is `drop` when both quality deltas' CIs contain zero.
+pub fn ablation_report(baseline: &str, runs: &[String]) -> Result<String> {
+    let load = |path: &str| -> Result<Value> {
+        let text = fs::read_to_string(path).with_context(|| format!("reading {path}"))?;
+        serde_json::from_str(&text).with_context(|| format!("parsing {path}"))
+    };
+    let base = load(baseline)?;
+    let base_scores = question_scores(&base);
+    let ingest = |r: &Value, key: &str| r["metrics"]["ingest"][key].as_f64();
+    let p95 = |r: &Value| r["metrics"]["latency_ms"]["query_client"]["p95"].as_f64();
+    let pct = |new: Option<f64>, old: Option<f64>| match (new, old) {
+        (Some(n), Some(o)) if o.abs() > f64::EPSILON => format!("{:+.1}%", (n - o) / o * 100.0),
+        _ => "–".to_string(),
+    };
+    let fmt_delta = |d: Option<(f64, f64, f64)>| match d {
+        Some((m, lo, hi)) => format!("{:+.1} ({:+.1}…{:+.1})", m * 100.0, lo * 100.0, hi * 100.0),
+        None => "–".to_string(),
+    };
+
+    let mut out = format!(
+        "Baseline: `{}` {} — recall_any {:.1}, nDCG {:.1}, ingest {:.1} mem/s, {:.0} B/mem, {:.2} embedded/mem, query p95 {} ms\n\n",
+        baseline,
+        ablation_label(baseline, &base),
+        base["metrics"]["overall"]["recall_any"]["mean"].as_f64().unwrap_or(0.0) * 100.0,
+        base["metrics"]["overall"]["ndcg"]["mean"].as_f64().unwrap_or(0.0) * 100.0,
+        ingest(&base, "memories_per_sec").unwrap_or(0.0),
+        ingest(&base, "db_bytes_per_memory").unwrap_or(0.0),
+        ingest(&base, "embedded_per_memory").unwrap_or(0.0),
+        p95(&base).map(|v| v.to_string()).unwrap_or_else(|| "–".into()),
+    );
+    out.push_str(
+        "| config | n paired | Δ recall_any (95% CI) | Δ nDCG (95% CI) | Δ ingest mem/s | Δ bytes/mem | Δ embedded/mem | Δ query p95 | rerank rate | keep? |\n\
+         |---|---|---|---|---|---|---|---|---|---|\n",
+    );
+    for path in runs {
+        let run = load(path)?;
+        let scores = question_scores(&run);
+        let (mut a_hit, mut b_hit, mut a_ndcg, mut b_ndcg) = (vec![], vec![], vec![], vec![]);
+        for (qid, (hit, ndcg)) in &base_scores {
+            if let Some((run_hit, run_ndcg)) = scores.get(qid) {
+                a_hit.push(*hit);
+                b_hit.push(*run_hit);
+                a_ndcg.push(*ndcg);
+                b_ndcg.push(*run_ndcg);
+            }
+        }
+        let d_hit = paired_delta_ci(&a_hit, &b_hit);
+        let d_ndcg = paired_delta_ci(&a_ndcg, &b_ndcg);
+        let spans_zero =
+            |d: Option<(f64, f64, f64)>| d.is_some_and(|(_, lo, hi)| lo <= 0.0 && hi >= 0.0);
+        let verdict = if spans_zero(d_hit) && spans_zero(d_ndcg) { "drop" } else { "keep" };
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {:.0}% | {} |\n",
+            ablation_label(path, &run),
+            a_hit.len(),
+            fmt_delta(d_hit),
+            fmt_delta(d_ndcg),
+            pct(ingest(&run, "memories_per_sec"), ingest(&base, "memories_per_sec")),
+            pct(ingest(&run, "db_bytes_per_memory"), ingest(&base, "db_bytes_per_memory")),
+            pct(ingest(&run, "embedded_per_memory"), ingest(&base, "embedded_per_memory")),
+            pct(p95(&run), p95(&base)),
+            run["metrics"]["rerank_applied_rate"].as_f64().unwrap_or(0.0) * 100.0,
+            verdict,
+        ));
+    }
+    Ok(out)
+}
+
+/// Share of questions per engine rerank decision.
+fn rerank_reasons(rows: &[&QuestionRecord]) -> Value {
+    const NAMES: [&str; 8] = [
+        "disabled",
+        "too_few_candidates",
+        "heuristic_applied",
+        "heuristic_skipped",
+        "always",
+        "gate_uncertain",
+        "gate_confident",
+        "requested",
+    ];
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for row in rows {
+        let name = NAMES.get(row.timings.rerank_reason as usize).copied().unwrap_or("unknown");
+        *counts.entry(name).or_default() += 1;
+    }
+    let total = rows.len().max(1) as f64;
+    Value::Object(counts.into_iter().map(|(k, v)| (k.to_string(), json!(v as f64 / total))).collect())
+}
+
+fn mean(values: &[f64]) -> Option<f64> {
+    (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
 }
 
 #[cfg(test)]
@@ -395,6 +624,17 @@ mod tests {
         assert!((mean - 0.25).abs() < 1e-9);
         assert!(ci[0].as_f64().unwrap() < mean && mean < ci[1].as_f64().unwrap());
         assert_eq!(mean_with_ci(&values), v, "bootstrap must be deterministic");
+    }
+
+    #[test]
+    fn paired_delta_detects_consistent_change() {
+        let a: Vec<f64> = (0..100).map(|i| f64::from(u8::from(i % 2 == 0))).collect();
+        let same = paired_delta_ci(&a, &a).unwrap();
+        assert!(same.1 <= 0.0 && same.2 >= 0.0);
+        let better: Vec<f64> = a.iter().map(|_| 1.0).collect();
+        let (mean, lo, _) = paired_delta_ci(&a, &better).unwrap();
+        assert!((mean - 0.5).abs() < 1e-9 && lo > 0.0);
+        assert!(paired_delta_ci(&a, &a[..10]).is_none());
     }
 
     #[test]

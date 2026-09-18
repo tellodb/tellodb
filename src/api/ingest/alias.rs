@@ -1,5 +1,3 @@
-use crate::api::EngineState;
-
 use axum::http::StatusCode;
 
 pub fn extract_aliases_from_text(text: &str, known_entities: &[String]) -> Vec<(String, String)> {
@@ -30,29 +28,22 @@ pub fn extract_aliases_from_text(text: &str, known_entities: &[String]) -> Vec<(
 
     for entity in known_entities {
         let entity_lower = entity.to_ascii_lowercase();
+        let char_count = entity_lower.chars().count();
 
-        if entity.len() >= 5 {
-            let short = &entity_lower[..3];
-            if lower.contains(short) {
-                let collisions = known_entities
-                    .iter()
-                    .filter(|e| e.to_ascii_lowercase().starts_with(short))
-                    .count();
-                if collisions <= MAX_PREFIX_COLLISIONS {
-                    add_alias(short.to_string(), entity.clone());
-                }
+        // Prefix aliases are counted in characters: slicing by bytes panicked
+        // on names like "Zoë" (and a panic aborts the server in release).
+        for (min_chars, prefix_chars) in [(5, 3), (6, 4)] {
+            if char_count < min_chars {
+                continue;
             }
-        }
-
-        if entity.len() >= 6 {
-            let short4 = &entity_lower[..4];
-            if lower.contains(short4) {
+            let prefix: String = entity_lower.chars().take(prefix_chars).collect();
+            if lower.contains(&prefix) {
                 let collisions = known_entities
                     .iter()
-                    .filter(|e| e.to_ascii_lowercase().starts_with(short4))
+                    .filter(|e| e.to_ascii_lowercase().starts_with(&prefix))
                     .count();
                 if collisions <= MAX_PREFIX_COLLISIONS {
-                    add_alias(short4.to_string(), entity.clone());
+                    add_alias(prefix, entity.clone());
                 }
             }
         }
@@ -115,13 +106,12 @@ pub fn extract_aliases_from_text(text: &str, known_entities: &[String]) -> Vec<(
 }
 
 pub fn is_semantic_duplicate(
-    state: &EngineState,
+    vectors: &crate::vector_index::VectorIndex,
     entity_id: &str,
     embedding: &[f32],
     threshold: f32,
 ) -> Result<bool, StatusCode> {
-    let candidates = state
-        .vector_index
+    let candidates = vectors
         .search(Some(entity_id), embedding, 5)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -132,4 +122,20 @@ pub fn is_semantic_duplicate(
         }
     }
     Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_ascii_entity_names_do_not_panic() {
+        let aliases = extract_aliases_from_text(
+            "Zoë Smith and José went hiking with 北京朋友",
+            &["Zoë Smith".to_string(), "José Álvarez".to_string(), "北京朋友们".to_string()],
+        );
+        assert!(aliases
+            .iter()
+            .any(|(alias, canonical)| alias == "zoë" && canonical == "Zoë Smith"));
+    }
 }

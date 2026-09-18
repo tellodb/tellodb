@@ -10,7 +10,7 @@ const FTS_DIR: &str = "fts_tantivy";
 const PLATFORM_DB_FILE: &str = "platform.db";
 const ANALYTICS_DB_FILE: &str = "analytics.db";
 const VECTOR_INDEX_FILE: &str = "vector.hnsw";
-const EMBEDDING_CACHE_FILE: &str = "embedding_cache.redb";
+const EMBEDDING_CACHE_FILE: &str = "embedding_cache.sqlite";
 
 #[derive(Debug, Clone)]
 pub struct RuntimePaths {
@@ -45,12 +45,23 @@ impl RuntimePaths {
         } else {
             env::current_dir().context("failed to read current working directory")?.join(root)
         };
+        Ok(Self::with_root(root, explicit_root))
+    }
 
-        let hf_home = root.join("hf-home");
+    /// Paths under an explicit data root (model caches still honour
+    /// `HF_HOME` / `XDG_CACHE_HOME`).
+    pub fn from_root(root: PathBuf) -> Self {
+        Self::with_root(root, true)
+    }
+
+    fn with_root(root: PathBuf, explicit_root: bool) -> Self {
+        let hf_home =
+            env::var("HF_HOME").map(PathBuf::from).unwrap_or_else(|_| root.join("hf-home"));
         let hf_hub_cache = hf_home.join("hub");
-        let xdg_cache_home = root.join("cache");
+        let xdg_cache_home =
+            env::var("XDG_CACHE_HOME").map(PathBuf::from).unwrap_or_else(|_| root.join("cache"));
 
-        Ok(Self {
+        Self {
             temporal_db: root.join(TEMPORAL_DB_FILE),
             graph_db: root.join(GRAPH_DB_FILE),
             fts_dir: root.join(FTS_DIR),
@@ -63,7 +74,7 @@ impl RuntimePaths {
             hf_home,
             hf_hub_cache,
             xdg_cache_home,
-        })
+        }
     }
 
     pub fn ensure_dirs(&self) -> Result<()> {
@@ -306,7 +317,7 @@ mod tests {
             let _lock = lock_env();
             set_tellodb_dir("/tmp/cache_test")
         };
-        assert_eq!(paths.embedding_cache(), Path::new("/tmp/cache_test/embedding_cache.redb"));
+        assert_eq!(paths.embedding_cache(), Path::new("/tmp/cache_test/embedding_cache.sqlite"));
     }
 
     #[test]
@@ -437,7 +448,7 @@ mod tests {
         assert!(debug.contains("platform.db"));
         assert!(debug.contains("analytics.db"));
         assert!(debug.contains("vector.hnsw"));
-        assert!(debug.contains("embedding_cache.redb"));
+        assert!(debug.contains("embedding_cache.sqlite"));
         assert!(debug.contains("hf-home"));
         assert!(debug.contains("cache"));
     }

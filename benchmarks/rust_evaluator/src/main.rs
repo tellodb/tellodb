@@ -168,9 +168,37 @@ enum DatasetKind {
 
 #[derive(Copy, Clone, Debug, ValueEnum, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+pub enum ClientContext {
+    /// Legacy: a 3-turn window with session id/date/focus headers per turn.
+    Window,
+    /// Raw turn text with explicit session, turn and role; the engine decides
+    /// what context to embed.
+    Off,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum TimestampMode {
     Wallclock,
     Session,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EvalTier {
+    Smoke,
+    Dev,
+    Paper,
+}
+
+impl std::fmt::Display for EvalTier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EvalTier::Smoke => write!(f, "smoke"),
+            EvalTier::Dev => write!(f, "dev"),
+            EvalTier::Paper => write!(f, "paper"),
+        }
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -205,6 +233,9 @@ struct Cli {
 
     #[arg(long, global = true, env = "TELLODB_API_KEY")]
     engine_api_key: Option<String>,
+
+    #[arg(long, global = true, value_enum, default_value_t = EvalTier::Dev)]
+    tier: EvalTier,
 
     #[arg(long, global = true)]
     dataset: Option<String>,
@@ -290,6 +321,16 @@ struct Cli {
     #[arg(long, global = true)]
     no_run_record: bool,
 
+    /// Also wipe the engine's persistent embedding cache on --reset-first.
+    /// Off by default: cached vectors are identical for identical text, and
+    /// recomputing them dominates benchmark time.
+    #[arg(long, global = true)]
+    clear_embedding_cache: bool,
+
+    /// What the evaluator sends per turn (see `ClientContext`).
+    #[arg(long, global = true, value_enum, default_value_t = ClientContext::Window)]
+    client_context: ClientContext,
+
     /// How to assign timestamps during ingest: `wallclock` (default) or `session`.
     #[arg(long, global = true, value_enum, default_value_t = TimestampMode::Wallclock)]
     timestamps: TimestampMode,
@@ -352,6 +393,12 @@ enum EvalMode {
     },
     /// Render a markdown table from run record JSON files.
     Report {
+        files: Vec<String>,
+    },
+    /// Paired deltas of ablation runs against a baseline run record.
+    AblationReport {
+        #[arg(long)]
+        baseline: String,
         files: Vec<String>,
     },
     AnalyzeGoldRanks {
@@ -428,6 +475,10 @@ struct IngestPayload<'a> {
     entity_id: &'a str,
     memory_id: String,
     timestamp: u64,
+    session_id: &'a str,
+    turn_index: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role: Option<&'a str>,
     textual_content: String,
     relations: Vec<(&'a str, &'a str, &'a str)>,
     enable_semantic_dedup: bool,
@@ -450,12 +501,18 @@ struct QueryPayload<'a> {
     proof_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reference_time_ms: Option<u64>,
+    /// A question asked at time T can only use memories known by T, so the
+    /// question date doubles as the as-of time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    point_in_time_ms: Option<u64>,
 }
 
-#[derive(Default, Copy, Clone, Debug)]
+#[derive(Default, Clone, Debug)]
 struct IngestInstanceOutcome {
     memories: u64,
     parse_failures: u64,
+    counts: std::collections::BTreeMap<String, u64>,
+    db_bytes: Option<u64>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -487,6 +544,9 @@ struct NumericExtraction {
 struct EvalConfig {
     dataset_kind: DatasetKind,
     timestamps: TimestampMode,
+    tier: EvalTier,
+    clear_embedding_cache: bool,
+    client_context: ClientContext,
     engine_url: String,
     engine_api_key: Option<String>,
     top_k: usize,
@@ -513,6 +573,8 @@ struct EvalConfig {
 #[derive(Default, Clone)]
 struct EvalTotals {
     retrieval_correct: usize,
+    /// Questions without gold evidence sessions (abstention); excluded from recall.
+    unanswerable: usize,
     answer_correct: usize,
     skipped: usize,
     evaluated: usize,
@@ -582,30 +644,43 @@ struct AggregateTimings {
 }
 
 #[derive(Default, Clone, Copy, Debug, Serialize)]
-struct QueryTimings {
-    route_ms: u64,
-    embed_ms: u64,
-    ann_ms: u64,
-    rerank_ms: u64,
-    fts_ms: u64,
-    card_ms: u64,
-    fuse_ms: u64,
-    hydrate_ms: u64,
-    session_ms: u64,
-    preference_ms: u64,
-    graph_ms: u64,
-    planning_ms: u64,
-    hydrate_obs_ms: u64,
-    trace_ms: u64,
-    total_ms: u64,
-    routed_sessions: u64,
-    memory_card_hits: u64,
-    temporal_event_hits: u64,
-    shadow_question_hits: u64,
-    facet_posting_hits: u64,
-    mem_scene_hits: u64,
-    scoped_ann_attempts: u64,
-    scoped_primary_hits: u64,
+pub struct QueryTimings {
+    pub route_ms: u64,
+    pub embed_ms: u64,
+    pub ann_ms: u64,
+    pub rerank_ms: u64,
+    pub fts_ms: u64,
+    pub card_ms: u64,
+    pub fuse_ms: u64,
+    pub hydrate_ms: u64,
+    pub session_ms: u64,
+    pub preference_ms: u64,
+    pub graph_ms: u64,
+    #[serde(default)]
+    pub graph_links_us: u64,
+    #[serde(default)]
+    pub graph_edges_us: u64,
+    #[serde(default)]
+    pub graph_seeds_wall_us: u64,
+    #[serde(default)]
+    pub graph_entities_us: u64,
+    #[serde(default)]
+    pub graph_expanded: u64,
+    pub planning_ms: u64,
+    pub hydrate_obs_ms: u64,
+    pub trace_ms: u64,
+    pub total_ms: u64,
+    pub routed_sessions: u64,
+    pub memory_card_hits: u64,
+    pub temporal_event_hits: u64,
+    pub shadow_question_hits: u64,
+    pub facet_posting_hits: u64,
+    pub mem_scene_hits: u64,
+    pub scoped_ann_attempts: u64,
+    pub scoped_primary_hits: u64,
+    pub rerank_applied: bool,
+    /// Engine `RerankDecision` code (see `x-tm-rerank-reason`).
+    pub rerank_reason: u64,
 }
 
 struct QueryResponse {
@@ -632,6 +707,9 @@ async fn main() -> Result<()> {
     let config = EvalConfig {
         dataset_kind: cli.dataset_kind,
         timestamps: cli.timestamps,
+        tier: cli.tier,
+        clear_embedding_cache: cli.clear_embedding_cache,
+        client_context: cli.client_context,
         engine_url: cli.engine_url,
         engine_api_key: cli.engine_api_key,
         top_k: cli.top_k,
@@ -759,6 +837,9 @@ async fn main() -> Result<()> {
         }
         EvalMode::Report { files } => {
             print!("{}", record::report(&files)?);
+        }
+        EvalMode::AblationReport { baseline, files } => {
+            print!("{}", record::ablation_report(&baseline, &files)?);
         }
         EvalMode::AnalyzeGoldRanks { input, examples } => {
             analyze_gold_rank_dump(&input, examples)?;
@@ -1130,6 +1211,10 @@ async fn run_recall(
             ingest_stats.entities += 1;
             ingest_stats.memories += outcome.memories;
             ingest_stats.timestamp_parse_failures += outcome.parse_failures;
+            ingest_stats.add_counts(&outcome.counts);
+            if let (Some(bytes), true) = (outcome.db_bytes, outcome.memories > 0) {
+                ingest_stats.db_bytes_per_memory.push(bytes as f64 / outcome.memories as f64);
+            }
             ingest_stats.wall_ms += elapsed as u64;
             elapsed
         } else {
@@ -1159,6 +1244,7 @@ async fn run_recall(
             hit_any: hit,
             hit_all,
             ndcg,
+            answerable: !instance.answer_session_ids.is_empty(),
             answer_correct: None,
             errored: false,
             query_ms: query_ms as u64,
@@ -1208,6 +1294,11 @@ async fn run_recall(
         totals.timings.inner_query_total_ms += query.timings.total_ms as u128;
         add_query_diagnostics(&mut totals.timings, query.timings);
 
+        if instance.answer_session_ids.is_empty() {
+            // No gold session to retrieve: recall is undefined, not a miss.
+            totals.unanswerable += 1;
+            continue;
+        }
         if hit {
             totals.retrieval_correct += 1;
         } else {
@@ -1280,6 +1371,7 @@ fn errored_row(question_id: &str, question_type: &str) -> QuestionRecord {
         hit_any: false,
         hit_all: false,
         ndcg: 0.0,
+        answerable: true,
         answer_correct: Some(false),
         errored: true,
         query_ms: 0,
@@ -1303,13 +1395,17 @@ async fn save_run_record(
         DatasetKind::Longmemeval => "longmemeval",
         DatasetKind::Locomo => "locomo",
     };
+    let tier_str = config.tier.to_string();
     let ctx = record::RunContext {
         mode,
         dataset_kind,
         dataset_path: &config.dataset_path,
         split: config.split.as_str(),
+        tier: &tier_str,
         top_k: config.top_k,
         config: json!({
+            "tier": &tier_str,
+            "client_context": format!("{:?}", config.client_context).to_lowercase(),
             "ingest_concurrency": config.ingest_concurrency,
             "dev_fast": config.dev_fast,
             "enable_neural_rerank": config.enable_neural_rerank,
@@ -1445,6 +1541,7 @@ async fn run_llm(
             let outcome = r.context("Pre-ingest failed")?;
             ingest_stats.memories += outcome.memories;
             ingest_stats.timestamp_parse_failures += outcome.parse_failures;
+            ingest_stats.add_counts(&outcome.counts);
         }
         ingest_stats.entities = unique_entities.len() as u64;
         ingest_stats.wall_ms = pre_ingest_start.elapsed().as_millis() as u64;
@@ -1499,6 +1596,7 @@ async fn run_llm(
                         hit_any: r.retrieval_hit,
                         hit_all: r.hit_all,
                         ndcg: r.ndcg,
+                        answerable: r.answerable,
                         answer_correct: Some(r.answer_correct),
                         errored: false,
                         query_ms: r.query_ms as u64,
@@ -1541,6 +1639,7 @@ struct QuestionResult {
     retrieval_hit: bool,
     hit_all: bool,
     ndcg: f64,
+    answerable: bool,
     answer_correct: bool,
     ingest_ms: u128,
     query_ms: u128,
@@ -1836,6 +1935,7 @@ async fn process_question_llm(
         retrieval_hit,
         hit_all,
         ndcg,
+        answerable: !instance.answer_session_ids.is_empty(),
         answer_correct,
         ingest_ms,
         query_ms,
@@ -1866,7 +1966,7 @@ async fn reset_engine(client: &Client, config: &EvalConfig) -> Result<()> {
     println!("Resetting engine state...");
     let payload = json!({
         "confirm": RESET_CONFIRM_PHRASE,
-        "clear_embedding_cache": true,
+        "clear_embedding_cache": config.clear_embedding_cache,
     });
     let reset_paths = ["/admin/reset", "/v1/admin/reset"];
     let mut last_error = None;
@@ -1995,6 +2095,7 @@ async fn ingest_instance(
     instance: &Instance,
 ) -> Result<IngestInstanceOutcome> {
     println!("Ingesting {} sessions...", instance.haystack_sessions.len());
+    let bytes_before = storage_bytes(client, config).await;
     let mut payloads = Vec::new();
     let session_cap = if config.dev_fast { 12 } else { usize::MAX };
     let turn_cap = if config.dev_fast { 4 } else { usize::MAX };
@@ -2018,8 +2119,12 @@ async fn ingest_instance(
         };
 
         for t_idx in 0..session.len().min(turn_cap) {
-            let window_text =
-                build_enriched_window(session_id, session_date, &session_focus, session, t_idx);
+            let window_text = match config.client_context {
+                ClientContext::Window => {
+                    build_enriched_window(session_id, session_date, &session_focus, session, t_idx)
+                }
+                ClientContext::Off => normalize_text(&json_value_to_text(&session[t_idx].content)),
+            };
             if window_text.is_empty() {
                 continue;
             }
@@ -2034,6 +2139,9 @@ async fn ingest_instance(
                 entity_id: q_id,
                 memory_id,
                 timestamp,
+                session_id,
+                turn_index: t_idx as u32,
+                role: Some(session[t_idx].role.as_str()),
                 textual_content: window_text,
                 relations: vec![("", "BELONGS_TO", q_id)],
                 enable_semantic_dedup: config.enable_semantic_dedup,
@@ -2070,12 +2178,17 @@ async fn ingest_instance(
                     derived_ner: header_u64(headers, "x-tm-ner-ms"),
                     total: header_u64(headers, "x-tm-total-ms"),
                 };
+                let counts = headers
+                    .get("x-tm-ingest-counts")
+                    .and_then(|v| v.to_str().ok())
+                    .map(record::parse_counts_header)
+                    .unwrap_or_default();
                 if !response.status().is_success() {
                     let status = response.status();
                     let body = response.text().await.unwrap_or_default();
                     anyhow::bail!("Batch ingest failed with HTTP {status}: {body}");
                 }
-                Ok(timings)
+                Ok((timings, counts))
             }
         })
         .collect::<Vec<_>>();
@@ -2087,8 +2200,12 @@ async fn ingest_instance(
     let mut ingest_stream =
         futures::stream::iter(ingest_tasks).buffer_unordered(config.ingest_concurrency);
 
+    let mut counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
     while let Some(result) = ingest_stream.next().await {
-        let t = result?;
+        let (t, batch_counts) = result?;
+        for (k, v) in batch_counts {
+            *counts.entry(k).or_default() += v;
+        }
         total_diag.embed += t.embed;
         total_diag.derived_embed += t.derived_embed;
         total_diag.derived_ner += t.derived_ner;
@@ -2131,7 +2248,11 @@ async fn ingest_instance(
         );
     }
 
-    Ok(IngestInstanceOutcome { memories: memory_count, parse_failures })
+    let db_bytes = match (bytes_before, storage_bytes(client, config).await) {
+        (Some(before), Some(after)) => Some(after.saturating_sub(before)),
+        _ => None,
+    };
+    Ok(IngestInstanceOutcome { memories: memory_count, parse_failures, counts, db_bytes })
 }
 
 async fn query_engine(
@@ -2150,6 +2271,7 @@ async fn query_engine(
         include_evidence: Some(true),
         proof_mode: Some("light".to_string()),
         reference_time_ms,
+        point_in_time_ms: reference_time_ms,
     };
 
     let response =
@@ -2180,12 +2302,32 @@ async fn query_engine(
     Ok(QueryResponse { results, timings })
 }
 
+/// Bytes in use in the engine's default tenant database, if the key may read it.
+async fn storage_bytes(client: &Client, config: &EvalConfig) -> Option<u64> {
+    let url = format!("{}/admin/clusters/default/storage-stats", config.engine_url);
+    let mut request = client.get(&url);
+    if let Some(api_key) = config.engine_api_key.as_deref() {
+        request = request.header("x-api-key", api_key);
+    }
+    let response = request.send().await.ok()?.error_for_status().ok()?;
+    let body: serde_json::Value = response.json().await.ok()?;
+    body.get("used_bytes")?.as_u64()
+}
+
 fn header_u64(headers: &reqwest::header::HeaderMap, name: &str) -> u64 {
     headers
         .get(name)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0)
+}
+
+fn header_bool(headers: &reqwest::header::HeaderMap, name: &str) -> bool {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 fn parse_query_timings(headers: &reqwest::header::HeaderMap) -> QueryTimings {
@@ -2200,6 +2342,11 @@ fn parse_query_timings(headers: &reqwest::header::HeaderMap) -> QueryTimings {
         hydrate_ms: header_u64(headers, "x-tm-hydrate-ms"),
         preference_ms: header_u64(headers, "x-tm-preference-ms"),
         graph_ms: header_u64(headers, "x-tm-graph-bridge-ms"),
+        graph_links_us: header_u64(headers, "x-tm-graph-links-us"),
+        graph_edges_us: header_u64(headers, "x-tm-graph-edges-us"),
+        graph_seeds_wall_us: header_u64(headers, "x-tm-graph-seeds-wall-us"),
+        graph_entities_us: header_u64(headers, "x-tm-graph-entities-us"),
+        graph_expanded: header_u64(headers, "x-tm-graph-expanded"),
         session_ms: header_u64(headers, "x-tm-session-ms"),
         planning_ms: header_u64(headers, "x-tm-planning-ms"),
         hydrate_obs_ms: header_u64(headers, "x-tm-hydrate-obs-ms"),
@@ -2213,6 +2360,8 @@ fn parse_query_timings(headers: &reqwest::header::HeaderMap) -> QueryTimings {
         mem_scene_hits: header_u64(headers, "x-tm-mem-scene-hits"),
         scoped_ann_attempts: header_u64(headers, "x-tm-scoped-ann-attempts"),
         scoped_primary_hits: header_u64(headers, "x-tm-scoped-primary-hits"),
+        rerank_applied: header_bool(headers, "x-tm-rerank-applied"),
+        rerank_reason: header_u64(headers, "x-tm-rerank-reason"),
     }
 }
 
@@ -2697,7 +2846,7 @@ fn build_session_meta(instance: &Instance) -> HashMap<String, (String, String)> 
 }
 
 fn turn_index_from_memory_id(memory_id: &str) -> usize {
-    memory_id.rsplit("::").next().and_then(|part| part.parse::<usize>().ok()).unwrap_or(0)
+    memory_id.split("::").nth(2).and_then(|part| part.parse::<usize>().ok()).unwrap_or(0)
 }
 
 fn build_enriched_window(
@@ -4113,8 +4262,15 @@ fn print_recall_summary(totals: &EvalTotals, top_k: usize, dataset_kind: Dataset
     if totals.evaluated == 0 {
         println!("No evaluable questions");
     } else {
-        let recall = totals.retrieval_correct as f64 / totals.evaluated as f64 * 100.0;
+        let answerable = totals.evaluated.saturating_sub(totals.unanswerable).max(1);
+        let recall = totals.retrieval_correct as f64 / answerable as f64 * 100.0;
         println!("Recall@{top_k}: {recall:.1}%");
+        if totals.unanswerable > 0 {
+            println!(
+                "Unanswerable (no gold session, excluded from recall): {}",
+                totals.unanswerable
+            );
+        }
         print_timing_summary(&totals.timings, totals.evaluated);
         println!("Evaluated: {}", totals.evaluated);
         println!("Skipped: {}", totals.skipped);

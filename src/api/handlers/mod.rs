@@ -1,3 +1,4 @@
+pub mod facts;
 pub mod ingest;
 pub mod mcp;
 pub mod platform;
@@ -14,6 +15,7 @@ use axum::{
 };
 use tower_http::limit::RequestBodyLimitLayer;
 
+use self::facts::{current_fact_handler, fact_history_handler};
 use self::ingest::{batch_ingest_handler, ingest_handler};
 use self::mcp::mcp_handler;
 use self::platform::{
@@ -23,7 +25,7 @@ use self::platform::{
 };
 use self::query::{
     analytics_query_handler, graph_export_handler, graph_query_handler, graph_walk_handler,
-    query_handler, temporal_query_handler,
+    query_handler,
 };
 use self::system::{
     admin_inject_api_key_handler, admin_revoke_api_key_handler, cluster_graph_handler,
@@ -42,14 +44,31 @@ async fn rate_limit_middleware(
     if path == "/health" || path == "/healthz" || path == "/version" || path == "/metrics" {
         return Ok(next.run(req).await);
     }
-    auth::check_rate_limit(&state, req.headers())?;
+    let peer = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|info| info.0);
+    auth::check_rate_limit(&state, req.headers(), peer)?;
     Ok(next.run(req).await)
 }
 
 async fn request_timeout_middleware(req: Request, next: Next) -> Result<Response, StatusCode> {
     let path = req.uri().path().to_string();
-    // Health and version probes never time out.
-    if path == "/health" || path == "/healthz" || path == "/version" || path == "/metrics" {
+    // Health probes never time out. Ingest and reset are exempt too: the
+    // timeout drops the response but not the blocking work behind it, so a
+    // timed-out ingest kept running while the client retried it.
+    const UNTIMED: [&str; 9] = [
+        "/health",
+        "/healthz",
+        "/version",
+        "/metrics",
+        "/ingest",
+        "/ingest/batch",
+        "/batch-ingest",
+        "/reset",
+        "/admin/reset",
+    ];
+    if UNTIMED.contains(&path.as_str()) || path == "/v1/admin/reset" {
         return Ok(next.run(req).await);
     }
     let timeout_secs: u64 = std::env::var("TELLODB_REQUEST_TIMEOUT_SECS")
@@ -100,7 +119,8 @@ pub fn build_api(state: EngineState) -> Router {
         .route("/graph/walk", post(graph_walk_handler))
         .route("/graph/export", post(graph_export_handler))
         .route("/analytics/query", post(analytics_query_handler))
-        .route("/temporal/query", get(temporal_query_handler))
+        .route("/facts/current", get(current_fact_handler))
+        .route("/facts/history", get(fact_history_handler))
         .layer(middleware::from_fn_with_state(state.clone(), rate_limit_middleware));
 
     Router::new()

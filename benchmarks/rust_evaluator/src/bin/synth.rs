@@ -298,6 +298,14 @@ struct AccumulatingFact {
     session_id: String,
 }
 
+/// (attribute name, value history, current-value questions, as-of questions)
+/// with one question per phrasing set.
+type AttributeQuestions<'a> = (&'a str, &'a [TemporalFact], [&'a str; 2], [&'a str; 2]);
+
+fn favorite_values_history(history: &[(String, TemporalFact)]) -> Vec<TemporalFact> {
+    history.iter().map(|(_, fact)| fact.clone()).collect()
+}
+
 fn format_date(dt: NaiveDateTime) -> String {
     dt.format("%Y/%m/%d (%a) %H:%M").to_string()
 }
@@ -625,63 +633,89 @@ fn main() -> Result<()> {
         let evaluation_now_dt = current_dt + Duration::days(2);
         let evaluation_now_str = format_date(evaluation_now_dt);
 
-        // 1. Current-value question (e.g. residence)
-        if let Some(latest_res) = residence_history.last() {
-            let question = if phrasing == PhrasingSet::Train {
-                *rng.choose(&[
-                    "Where do I currently live?",
-                    "What city do I live in right now?",
-                    "What is my current home location?",
-                ])
-            } else {
-                *rng.choose(&[
-                    "What is my current place of residence?",
-                    "Where am I currently residing?",
-                    "Which city do I call home at present?",
-                ])
+        // 1-2. Current-value and value-as-of questions for every tracked
+        // attribute. As-of questions target a random update in the chain, not
+        // always the first one.
+        let attributes: [AttributeQuestions; 6] = [
+            (
+                "residence",
+                &residence_history,
+                ["What city do I live in right now?", "Where am I currently residing?"],
+                ["Where was I living as of {date}?", "Where did I reside around {date}?"],
+            ),
+            (
+                "employer",
+                &employer_history,
+                ["Where do I work these days?", "Which company employs me at present?"],
+                ["Where was I working as of {date}?", "Who was my employer around {date}?"],
+            ),
+            (
+                "job_title",
+                &job_history,
+                ["What is my job title right now?", "What role do I currently hold?"],
+                ["What was my job title as of {date}?", "What role did I have around {date}?"],
+            ),
+            (
+                "pet",
+                &pet_history,
+                ["What pet do I have now?", "Which animal currently lives with me?"],
+                ["What pet did I have as of {date}?", "Which animal lived with me around {date}?"],
+            ),
+            (
+                "partner",
+                &partner_history,
+                ["Who is my partner now?", "Who am I currently with?"],
+                ["Who was my partner as of {date}?", "Who was I with around {date}?"],
+            ),
+            (
+                "favorite",
+                &favorite_values_history(&_favorite_history),
+                ["What is my favorite {item} right now?", "Which {item} do I currently like best?"],
+                [
+                    "What was my favorite {item} as of {date}?",
+                    "Which {item} did I like best around {date}?",
+                ],
+            ),
+        ];
+        let phrasing_idx = usize::from(phrasing != PhrasingSet::Train);
+        for (attribute, history, current_qs, as_of_qs) in attributes {
+            let Some(latest) = history.last() else {
+                continue;
             };
-
             instances.push(Instance {
-                question_id: Some(format!("synth_{}_current_val", entity_id)),
+                question_id: Some(format!("synth_{}_{}_current_val", entity_id, attribute)),
                 entity_id: Some(entity_id.clone()),
                 question_type: Some("current-value".to_string()),
                 question_date: Some(evaluation_now_str.clone()),
-                question: question.to_string(),
+                question: current_qs[phrasing_idx].replace("{item}", fav_item),
                 haystack_dates: haystack_dates.clone(),
                 haystack_sessions: haystack_sessions.clone(),
                 haystack_session_ids: haystack_session_ids.clone(),
-                answer_session_ids: vec![latest_res.session_id.clone()],
-                answer: Some(serde_json::Value::String(latest_res.value.clone())),
+                answer_session_ids: vec![latest.session_id.clone()],
+                answer: Some(serde_json::Value::String(latest.value.clone())),
             });
-        }
 
-        // 2. Value-as-of-date question (if residence was updated, pick the prior value)
-        if residence_history.len() > 1 {
-            let prior = &residence_history[0];
-            let next_update = &residence_history[1];
-            // Midpoint date between prior and next update
-            let mid_secs = (next_update.parsed_date - prior.parsed_date).num_seconds() / 2;
-            let query_target_dt = prior.parsed_date + Duration::seconds(mid_secs);
-            let query_target_str = query_target_dt.format("%Y/%m/%d").to_string();
-
-            let question = if phrasing == PhrasingSet::Train {
-                format!("Where was I living as of {}?", query_target_str)
-            } else {
-                format!("Where did I reside around {}?", query_target_str)
-            };
-
-            instances.push(Instance {
-                question_id: Some(format!("synth_{}_value_as_of", entity_id)),
-                entity_id: Some(entity_id.clone()),
-                question_type: Some("value-as-of-date".to_string()),
-                question_date: Some(format_date(query_target_dt)),
-                question,
-                haystack_dates: haystack_dates.clone(),
-                haystack_sessions: haystack_sessions.clone(),
-                haystack_session_ids: haystack_session_ids.clone(),
-                answer_session_ids: vec![prior.session_id.clone()],
-                answer: Some(serde_json::Value::String(prior.value.clone())),
-            });
+            if history.len() > 1 {
+                let idx = rng.range(0, history.len() - 1);
+                let (prior, next_update) = (&history[idx], &history[idx + 1]);
+                let mid_secs = (next_update.parsed_date - prior.parsed_date).num_seconds() / 2;
+                let query_target_dt = prior.parsed_date + Duration::seconds(mid_secs);
+                let date = query_target_dt.format("%Y/%m/%d").to_string();
+                instances.push(Instance {
+                    question_id: Some(format!("synth_{}_{}_value_as_of", entity_id, attribute)),
+                    entity_id: Some(entity_id.clone()),
+                    question_type: Some("value-as-of-date".to_string()),
+                    question_date: Some(format_date(query_target_dt)),
+                    question: as_of_qs[phrasing_idx]
+                        .replace("{date}", &date)
+                        .replace("{item}", fav_item),
+                    haystack_dates: haystack_dates.clone(),
+                    haystack_sessions: haystack_sessions.clone(),
+                    haystack_session_ids: haystack_session_ids.clone(),
+                    answer_session_ids: vec![prior.session_id.clone()],
+                    answer: Some(serde_json::Value::String(prior.value.clone())),
+                });
+            }
         }
 
         // 3. Count-over-time question (e.g. accumulating items)

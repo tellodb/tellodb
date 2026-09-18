@@ -9,7 +9,7 @@ use tempfile::tempdir;
 use tellodb::api::ingest_utils::{infer_fact_key, split_atomic_claims};
 use tellodb::retrieval::rrf_fuse;
 use tellodb::storage::TenantStore;
-use tellodb::vector_index::VectorIndex;
+use tellodb::vector_index::{Quantization, VectorConfig, VectorIndex};
 
 // Deterministic PRNG for generating benchmark data
 struct BenchRng(u64);
@@ -100,79 +100,41 @@ fn bench_vector_index(c: &mut Criterion) {
 
     let dim = 384;
     let mut rng = BenchRng::new(12345);
+    let query = rng.random_vector(dim);
 
-    for &total_vectors in &[10_000, 100_000] {
-        let index = VectorIndex::new(dim, total_vectors + 5000, 16, 128, 256, None)
-            .expect("Failed to create VectorIndex");
-
-        // Populate index distributed across entities
-        let entity_counts = [1, 100, 10_000];
-        let mut entity_id_pool = Vec::new();
-        for &num_entities in &entity_counts {
-            for e in 0..num_entities {
-                entity_id_pool.push(format!("entity_{:05}", e));
+    // Scoped search on one entity of `segment` vectors, next to 50k vectors of
+    // other entities (which a per-entity segment never touches). 50k crosses
+    // the default flat threshold, so it measures a per-entity HNSW segment.
+    for &segment in &[1_000usize, 10_000, 50_000] {
+        for quantization in
+            [Quantization::F32, Quantization::F16, Quantization::I8, Quantization::Binary]
+        {
+            let config = VectorConfig { quantization, ..VectorConfig::new(dim) };
+            let index = VectorIndex::in_memory(config);
+            let target: Vec<(u64, Vec<f32>)> =
+                (0..segment).map(|i| (i as u64, rng.random_vector(dim))).collect();
+            index.insert_batch("target", &target).expect("insert target");
+            for other in 0..50 {
+                let rows: Vec<(u64, Vec<f32>)> = (0..1_000)
+                    .map(|i| ((1_000_000 + other * 1_000 + i) as u64, rng.random_vector(dim)))
+                    .collect();
+                index.insert_batch(&format!("other_{other}"), &rows).expect("insert other");
             }
-        }
-
-        let mut items = Vec::with_capacity(total_vectors);
-        for i in 0..total_vectors {
-            let entity_id = format!("entity_{:05}", i % 100);
-            let vec = rng.random_vector(dim);
-            items.push((i as u64, entity_id, vec));
-        }
-
-        // Insert in batches of 256
-        for chunk in items.chunks(256) {
-            let batch: Vec<(u64, Vec<f32>)> =
-                chunk.iter().map(|(id, _, v)| (*id, v.clone())).collect();
-            index.insert_batch(&chunk[0].1, &batch).expect("Failed to insert batch");
-        }
-
-        // Benchmark insert_batch
-        let batch_to_insert: Vec<(u64, Vec<f32>)> =
-            (0..100).map(|i| ((total_vectors + i) as u64, rng.random_vector(dim))).collect();
-        group.bench_with_input(
-            BenchmarkId::new("insert_batch_100", total_vectors),
-            &total_vectors,
-            |b, _| {
-                b.iter(|| {
-                    let _ = index.insert_batch("bench_entity", black_box(&batch_to_insert));
-                });
-            },
-        );
-
-        // Benchmark search: unscoped, and scoped with 1, 100, and 10k entities
-        let query = rng.random_vector(dim);
-
-        group.bench_with_input(
-            BenchmarkId::new("search_unscoped", total_vectors),
-            &total_vectors,
-            |b, _| {
-                b.iter(|| {
-                    let res = index.search(None, black_box(&query), 20).unwrap();
-                    black_box(res);
-                });
-            },
-        );
-
-        for &num_entities in &[1, 100, 10_000] {
-            if num_entities > total_vectors {
-                continue;
-            }
-            let target_eid = "entity_00000";
-            let bench_id = format!("search_scoped_{}_entities", num_entities);
+            index.search(Some("target"), &query, 10).expect("load segment");
             group.bench_with_input(
-                BenchmarkId::new(bench_id, total_vectors),
-                &total_vectors,
-                |b, _| {
-                    b.iter(|| {
-                        let res = index.search(Some(target_eid), black_box(&query), 20).unwrap();
-                        black_box(res);
-                    });
-                },
+                BenchmarkId::new(format!("search_scoped_{}", quantization.name()), segment),
+                &segment,
+                |b, _| b.iter(|| black_box(index.search(Some("target"), black_box(&query), 10))),
             );
         }
     }
+
+    let index = VectorIndex::in_memory(VectorConfig::new(dim));
+    let batch: Vec<(u64, Vec<f32>)> = (0..100).map(|i| (i, rng.random_vector(dim))).collect();
+    index.insert_batch("e", &batch).expect("insert");
+    group.bench_function("insert_batch_100_loaded", |b| {
+        b.iter(|| index.insert_batch("e", black_box(&batch)).expect("insert"))
+    });
     group.finish();
 }
 
@@ -371,6 +333,8 @@ fn bench_models(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(5));
     group.sample_size(10);
 
+    // Measure model inference, not cache lookups.
+    std::env::set_var("TELLODB_EMBED_CACHE", "off");
     let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
     let semantic = rt.block_on(async {
         tellodb::semantic::SemanticInference::new().await.expect("Failed to init SemanticInference")
@@ -390,20 +354,23 @@ fn bench_models(c: &mut Criterion) {
         let input_slice = &text_refs[..batch_size];
         group.bench_with_input(BenchmarkId::new("embed_batch", batch_size), &batch_size, |b, _| {
             b.iter(|| {
-                let embs = semantic.embed_batch(black_box(input_slice));
+                let embs = semantic.embed_texts(black_box(input_slice)).unwrap();
                 black_box(embs);
             });
         });
     }
 
-    group.bench_function("rerank_32_pairs", |b| {
-        let query = "What is agent memory architecture?";
-        b.iter(|| {
-            let scores =
-                semantic.predict_scores_batch(black_box(query), black_box(&sample_texts)).unwrap();
-            black_box(scores);
+    if semantic.is_rerank_enabled() {
+        group.bench_function("rerank_32_pairs", |b| {
+            let query = "What is agent memory architecture?";
+            b.iter(|| {
+                let scores = semantic
+                    .predict_scores_batch(black_box(query), black_box(&sample_texts))
+                    .unwrap();
+                black_box(scores);
+            });
         });
-    });
+    }
 
     group.finish();
 }

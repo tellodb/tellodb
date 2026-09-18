@@ -187,6 +187,11 @@ pub fn insert_f32_header(headers: &mut HeaderMap, name: &str, value: f32) {
     }
 }
 
+/// Cosine similarity from a usearch cosine distance (`1 - cos`).
+pub fn cosine_similarity_from_distance(distance: f32) -> f32 {
+    (1.0 - distance).clamp(-1.0, 1.0)
+}
+
 pub fn parse_kind(s: Option<&str>) -> MemoryKind {
     match s.map(|s| s.to_ascii_lowercase()).as_deref() {
         Some("decision") => MemoryKind::Decision,
@@ -215,36 +220,33 @@ pub fn apply_time_decay(base_score: f32, age_in_days: f32, half_life_days: f32, 
     base_score * final_multiplier
 }
 
-pub fn decay_policy(kind: MemoryKind) -> (f32, f32, Option<f32>) {
+/// `(half_life_days, floor)` for ranking decay by memory kind.
+pub fn decay_policy(kind: MemoryKind) -> (f32, f32) {
     match kind {
-        MemoryKind::Conversational => (30.0, DECAY_FLOOR, Some(90.0)),
-        MemoryKind::Lesson => (90.0, DECAY_FLOOR, Some(365.0)),
-        MemoryKind::Fact => (180.0, DECAY_FLOOR, Some(730.0)),
-        MemoryKind::SessionSummary => (14.0, DECAY_FLOOR, Some(60.0)),
-        MemoryKind::Decision | MemoryKind::Preference => (365.0, DECAY_FLOOR, None),
+        MemoryKind::Conversational => (30.0, DECAY_FLOOR),
+        MemoryKind::Lesson => (90.0, DECAY_FLOOR),
+        MemoryKind::Fact => (180.0, DECAY_FLOOR),
+        MemoryKind::SessionSummary => (14.0, DECAY_FLOOR),
+        MemoryKind::Decision | MemoryKind::Preference => (365.0, DECAY_FLOOR),
     }
 }
 
+/// Ranks older memories lower, never below the kind's floor. Age never
+/// excludes a memory: an imported three-year-old conversation must stay
+/// findable. Removing memories is retention's job (`lifecycle`), measured
+/// from when they were stored.
 pub fn apply_decay_with_policy(
     base_score: f32,
     created_at_ms: u64,
     kind: MemoryKind,
     now_ms: u64,
-) -> Option<f32> {
+) -> f32 {
     if kind.is_decay_exempt() {
-        return Some(base_score);
+        return base_score;
     }
-
     let age_days = (now_ms.saturating_sub(created_at_ms)) as f32 / MILLIS_PER_DAY as f32;
-    let (half_life_days, floor, ttl_days) = decay_policy(kind);
-
-    if let Some(ttl) = ttl_days {
-        if age_days > ttl {
-            return None;
-        }
-    }
-
-    Some(apply_time_decay(base_score, age_days, half_life_days, floor))
+    let (half_life_days, floor) = decay_policy(kind);
+    apply_time_decay(base_score, age_days, half_life_days, floor)
 }
 
 pub fn session_id_from_memory_id(memory_id: &str) -> Option<String> {
@@ -254,8 +256,37 @@ pub fn session_id_from_memory_id(memory_id: &str) -> Option<String> {
     Some(session.to_string())
 }
 
+/// Turn index of `entity::session::turn[::tag...]` (0 if absent). Derived
+/// records carry their source turn followed by a tag segment.
 pub fn turn_index_from_memory_id(memory_id: &str) -> usize {
-    memory_id.rsplit("::").next().and_then(|part| part.parse::<usize>().ok()).unwrap_or(0)
+    memory_id.split("::").nth(2).and_then(|part| part.parse::<usize>().ok()).unwrap_or(0)
+}
+
+/// Id of a record derived from `parent` (chunk, companion, card, ...). The
+/// tag lives in its own `::` segment, so derived ids can never collide with
+/// source turns or with records derived from other turns, and every record
+/// derived from a memory shares the `"{parent}::"` prefix (used for cascading
+/// deletes).
+pub fn derived_memory_id(parent: &str, tag: &str) -> String {
+    format!("{parent}::{tag}")
+}
+
+/// Fills `session_id`/`turn_index` from a structured `entity::session::turn`
+/// memory id when the client did not send them explicitly.
+pub fn normalize_payload_identity(payload: &mut crate::api::types::IngestPayload) {
+    // Fall back to parsing `entity::session::turn` only for ids that follow
+    // that convention; opaque ids (UUIDs) carry identity in explicit fields.
+    let mut parts = payload.memory_id.split("::");
+    let follows_convention = parts.next() == Some(payload.entity_id.as_str());
+    let parsed_session = parts.next().filter(|s| follows_convention && !s.is_empty());
+    let parsed_turn =
+        parts.next().filter(|_| follows_convention).and_then(|t| t.parse::<u32>().ok());
+    if payload.session_id.as_deref().map_or(true, str::is_empty) {
+        payload.session_id = parsed_session.map(str::to_string);
+    }
+    if payload.turn_index.is_none() {
+        payload.turn_index = parsed_turn;
+    }
 }
 
 pub fn split_memory_id(memory_id: &str) -> Option<(&str, &str, usize)> {
@@ -354,10 +385,12 @@ pub fn extract_temporal_terms(query: &str) -> Vec<String> {
 }
 
 /// Parse a (start_ms, end_ms) temporal window from natural language query text.
+/// Accepts an optional `reference_time_ms` to anchor relative temporal terms like
+/// "yesterday", "today", "last week", "last month", "past 3 days".
 /// Returns `None` if no specific temporal window can be extracted.
 /// Examples that parse: "October 2023", "May 1 2022", "last week of October 2023",
-/// "March 2023", "summer 2022".
-pub fn parse_temporal_window(query: &str) -> Option<(u64, u64)> {
+/// "March 2023", "summer 2022", "2024/05/12", "yesterday", "last week".
+pub fn parse_temporal_window(query: &str, reference_time_ms: Option<u64>) -> Option<(u64, u64)> {
     use std::collections::HashMap;
 
     let month_map: HashMap<&str, u32> = [
@@ -402,6 +435,27 @@ pub fn parse_temporal_window(query: &str) -> Option<(u64, u64)> {
     let lower = query.to_ascii_lowercase();
     let tokens: Vec<&str> = lower.split_whitespace().collect();
 
+    // Check for formatted dates YYYY/MM/DD or YYYY-MM-DD
+    for token in &tokens {
+        let clean =
+            token.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '/' && c != '-');
+        let parts: Vec<&str> = clean.split(['/', '-']).collect();
+        if parts.len() == 3 {
+            if let (Ok(y), Ok(m), Ok(d)) =
+                (parts[0].parse::<i32>(), parts[1].parse::<u32>(), parts[2].parse::<u32>())
+            {
+                if (MIN_YEAR..=MAX_YEAR).contains(&y)
+                    && (1..=12).contains(&m)
+                    && (1..=MAX_DAY_OF_MONTH).contains(&d)
+                {
+                    let d = d.min(days_in_month(y, m));
+                    let start_ms = month_to_ms(y, m, d);
+                    return Some((start_ms, start_ms + MILLIS_PER_DAY));
+                }
+            }
+        }
+    }
+
     // Extract year (4-digit)
     let year: Option<i32> = tokens.iter().find_map(|t| {
         let digits: String = t.chars().filter(|c| c.is_ascii_digit()).collect();
@@ -412,64 +466,124 @@ pub fn parse_temporal_window(query: &str) -> Option<(u64, u64)> {
         }
     });
 
-    let year = year?; // No year → can't build a reliable window
+    if let Some(year) = year {
+        // Check for season first
+        for (season, (start_month, end_month)) in &season_map {
+            if lower.contains(season) {
+                let start_ms = month_to_ms(year, *start_month, 1);
+                let end_ms = if *end_month < *start_month {
+                    // winter wraps: Dec-Feb
+                    month_to_ms(year + 1, *end_month, days_in_month(year + 1, *end_month))
+                } else {
+                    month_to_ms(year, *end_month, days_in_month(year, *end_month))
+                };
+                return Some((start_ms, end_ms + MILLIS_PER_DAY));
+            }
+        }
 
-    // Check for season first
-    for (season, (start_month, end_month)) in &season_map {
-        if lower.contains(season) {
-            let start_ms = month_to_ms(year, *start_month, 1);
-            let end_ms = if *end_month < *start_month {
-                // winter wraps: Dec-Feb
-                month_to_ms(year + 1, *end_month, days_in_month(year + 1, *end_month))
+        // Look for a month name
+        let mut found_month: Option<u32> = None;
+        for (name, month_num) in &month_map {
+            if lower.contains(name) {
+                found_month = Some(*month_num);
+                break;
+            }
+        }
+
+        if let Some(month) = found_month {
+            // Check for "last week of <month> <year>"
+            let is_last_week = lower.contains("last week");
+            // Check for "first week of <month> <year>"
+            let is_first_week = lower.contains("first week");
+            // Check for a specific day number
+            let day: Option<u32> = tokens.iter().find_map(|t| {
+                let digits: String = t.chars().filter(|c| c.is_ascii_digit()).collect();
+                if digits.len() <= 2 {
+                    digits.parse::<u32>().ok().filter(|&d| (1..=MAX_DAY_OF_MONTH).contains(&d))
+                } else {
+                    None
+                }
+            });
+
+            let dom = days_in_month(year, month);
+
+            let (start_ms, end_ms) = if is_last_week {
+                let last_day = dom;
+                let first_day = last_day.saturating_sub(LAST_WEEK_DAY_OFFSET).max(1);
+                (
+                    month_to_ms(year, month, first_day),
+                    month_to_ms(year, month, last_day) + MILLIS_PER_DAY,
+                )
+            } else if is_first_week {
+                (
+                    month_to_ms(year, month, 1),
+                    month_to_ms(year, month, FIRST_WEEK_END_DAY) + MILLIS_PER_DAY,
+                )
+            } else if let Some(day) = day {
+                let d = day.min(dom);
+                (month_to_ms(year, month, d), month_to_ms(year, month, d) + MILLIS_PER_DAY)
             } else {
-                month_to_ms(year, *end_month, days_in_month(year, *end_month))
+                // Whole month
+                (month_to_ms(year, month, 1), month_to_ms(year, month, dom) + MILLIS_PER_DAY)
             };
-            return Some((start_ms, end_ms + MILLIS_PER_DAY));
+
+            return Some((start_ms, end_ms));
         }
     }
 
-    // Look for a month name
-    let mut found_month: Option<u32> = None;
-    for (name, month_num) in &month_map {
-        if lower.contains(name) {
-            found_month = Some(*month_num);
-            break;
-        }
-    }
-
-    let month = found_month?;
-
-    // Check for "last week of <month> <year>"
-    let is_last_week = lower.contains("last week");
-    // Check for "first week of <month> <year>"
-    let is_first_week = lower.contains("first week");
-    // Check for a specific day number
-    let day: Option<u32> = tokens.iter().find_map(|t| {
-        let digits: String = t.chars().filter(|c| c.is_ascii_digit()).collect();
-        if digits.len() <= 2 {
-            digits.parse::<u32>().ok().filter(|&d| (1..=MAX_DAY_OF_MONTH).contains(&d))
-        } else {
-            None
-        }
+    // Relative temporal terms anchored to reference_time_ms (or current wall-clock time)
+    let ref_ms = reference_time_ms.unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
     });
 
-    let dom = days_in_month(year, month);
+    if lower.contains("yesterday") {
+        let ref_day_start = (ref_ms / MILLIS_PER_DAY) * MILLIS_PER_DAY;
+        return Some((ref_day_start.saturating_sub(MILLIS_PER_DAY), ref_day_start));
+    }
+    if lower.contains("today") {
+        let ref_day_start = (ref_ms / MILLIS_PER_DAY) * MILLIS_PER_DAY;
+        return Some((ref_day_start, ref_day_start + MILLIS_PER_DAY));
+    }
+    if lower.contains("last week") || lower.contains("past week") {
+        return Some((ref_ms.saturating_sub(7 * MILLIS_PER_DAY), ref_ms));
+    }
+    if lower.contains("this week") {
+        let ref_day_start = (ref_ms / MILLIS_PER_DAY) * MILLIS_PER_DAY;
+        return Some((
+            ref_day_start.saturating_sub(6 * MILLIS_PER_DAY),
+            ref_day_start + MILLIS_PER_DAY,
+        ));
+    }
+    if lower.contains("last month") || lower.contains("past month") {
+        return Some((ref_ms.saturating_sub(30 * MILLIS_PER_DAY), ref_ms));
+    }
+    if lower.contains("this month") {
+        return Some((ref_ms.saturating_sub(30 * MILLIS_PER_DAY), ref_ms + MILLIS_PER_DAY));
+    }
+    if lower.contains("last year") || lower.contains("past year") {
+        return Some((ref_ms.saturating_sub(365 * MILLIS_PER_DAY), ref_ms));
+    }
 
-    let (start_ms, end_ms) = if is_last_week {
-        let last_day = dom;
-        let first_day = last_day.saturating_sub(LAST_WEEK_DAY_OFFSET).max(1);
-        (month_to_ms(year, month, first_day), month_to_ms(year, month, last_day) + MILLIS_PER_DAY)
-    } else if is_first_week {
-        (month_to_ms(year, month, 1), month_to_ms(year, month, FIRST_WEEK_END_DAY) + MILLIS_PER_DAY)
-    } else if let Some(day) = day {
-        let d = day.min(dom);
-        (month_to_ms(year, month, d), month_to_ms(year, month, d) + MILLIS_PER_DAY)
-    } else {
-        // Whole month
-        (month_to_ms(year, month, 1), month_to_ms(year, month, dom) + MILLIS_PER_DAY)
-    };
+    // Pattern: "(last|past) <N> (days|weeks|months)"
+    for i in 0..tokens.len().saturating_sub(2) {
+        if tokens[i] == "last" || tokens[i] == "past" {
+            if let Ok(n) = tokens[i + 1].parse::<u64>() {
+                let unit = tokens[i + 2].trim_matches(|c: char| !c.is_alphabetic());
+                if unit.starts_with("day") {
+                    return Some((ref_ms.saturating_sub(n * MILLIS_PER_DAY), ref_ms));
+                } else if unit.starts_with("week") {
+                    return Some((ref_ms.saturating_sub(n * 7 * MILLIS_PER_DAY), ref_ms));
+                } else if unit.starts_with("month") {
+                    return Some((ref_ms.saturating_sub(n * 30 * MILLIS_PER_DAY), ref_ms));
+                }
+            }
+        }
+    }
 
-    Some((start_ms, end_ms))
+    None
 }
 
 fn month_to_ms(year: i32, month: u32, day: u32) -> u64 {
@@ -700,6 +814,39 @@ pub fn extract_named_phrases(lines: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    fn identity_payload(entity: &str, memory_id: &str) -> crate::api::types::IngestPayload {
+        crate::api::types::IngestPayload {
+            entity_id: entity.into(),
+            memory_id: memory_id.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn identity_parsed_only_from_conventional_ids() {
+        let mut p = identity_payload("alice", "alice::s1::3");
+        normalize_payload_identity(&mut p);
+        assert_eq!((p.session_id.as_deref(), p.turn_index), (Some("s1"), Some(3)));
+
+        let mut p = identity_payload("alice", "0b7c5e0e-3f1a-4d2b-9c61-2a7d8f0e4b11");
+        normalize_payload_identity(&mut p);
+        assert_eq!((p.session_id, p.turn_index), (None, None));
+
+        // An id that merely contains `::` must not be mistaken for a session.
+        let mut p = identity_payload("alice", "doc::chapter1::2");
+        normalize_payload_identity(&mut p);
+        assert_eq!((p.session_id, p.turn_index), (None, None));
+    }
+
+    #[test]
+    fn explicit_identity_wins_over_parsed() {
+        let mut p = identity_payload("alice", "alice::s1::3");
+        p.session_id = Some("chat-42".into());
+        p.turn_index = Some(9);
+        normalize_payload_identity(&mut p);
+        assert_eq!((p.session_id.as_deref(), p.turn_index), (Some("chat-42"), Some(9)));
+    }
+
     use super::*;
     use std::time::Instant;
 
@@ -762,77 +909,59 @@ mod tests {
 
     #[test]
     fn decay_policy_conversational() {
-        let (half_life, floor, ttl) = decay_policy(MemoryKind::Conversational);
+        let (half_life, floor) = decay_policy(MemoryKind::Conversational);
         assert!((half_life - 30.0).abs() < f32::EPSILON);
         assert!((floor - 0.35).abs() < f32::EPSILON);
-        assert_eq!(ttl, Some(90.0));
     }
 
     #[test]
     fn decay_policy_lesson() {
-        let (half_life, floor, ttl) = decay_policy(MemoryKind::Lesson);
+        let (half_life, floor) = decay_policy(MemoryKind::Lesson);
         assert!((half_life - 90.0).abs() < f32::EPSILON);
         assert!((floor - 0.35).abs() < f32::EPSILON);
-        assert_eq!(ttl, Some(365.0));
     }
 
     #[test]
     fn decay_policy_fact() {
-        let (half_life, floor, ttl) = decay_policy(MemoryKind::Fact);
+        let (half_life, floor) = decay_policy(MemoryKind::Fact);
         assert!((half_life - 180.0).abs() < f32::EPSILON);
         assert!((floor - 0.35).abs() < f32::EPSILON);
-        assert_eq!(ttl, Some(730.0));
     }
 
     #[test]
     fn decay_policy_session_summary() {
-        let (half_life, floor, ttl) = decay_policy(MemoryKind::SessionSummary);
+        let (half_life, floor) = decay_policy(MemoryKind::SessionSummary);
         assert!((half_life - 14.0).abs() < f32::EPSILON);
         assert!((floor - 0.35).abs() < f32::EPSILON);
-        assert_eq!(ttl, Some(60.0));
     }
 
     #[test]
     fn decay_policy_decision() {
-        let (half_life, floor, ttl) = decay_policy(MemoryKind::Decision);
+        let (half_life, floor) = decay_policy(MemoryKind::Decision);
         assert!((half_life - 365.0).abs() < f32::EPSILON);
         assert!((floor - 0.35).abs() < f32::EPSILON);
-        assert_eq!(ttl, None);
     }
 
     #[test]
     fn decay_policy_preference() {
-        let (half_life, floor, ttl) = decay_policy(MemoryKind::Preference);
+        let (half_life, floor) = decay_policy(MemoryKind::Preference);
         assert!((half_life - 365.0).abs() < f32::EPSILON);
         assert!((floor - 0.35).abs() < f32::EPSILON);
-        assert_eq!(ttl, None);
     }
 
     #[test]
-    fn apply_decay_with_policy_decay_exempt_returns_some() {
-        let result = apply_decay_with_policy(0.75, 0, MemoryKind::Decision, u64::MAX);
-        assert_eq!(result, Some(0.75));
-
-        let result = apply_decay_with_policy(0.75, 0, MemoryKind::Preference, u64::MAX);
-        assert_eq!(result, Some(0.75));
+    fn apply_decay_with_policy_decay_exempt_keeps_score() {
+        assert_eq!(apply_decay_with_policy(0.75, 0, MemoryKind::Decision, u64::MAX), 0.75);
+        assert_eq!(apply_decay_with_policy(0.75, 0, MemoryKind::Preference, u64::MAX), 0.75);
     }
 
     #[test]
-    fn apply_decay_with_policy_expired_ttl_returns_none() {
-        let created_ms = 0;
-        let now_ms = (100 * 86_400) * 1000;
-        let result = apply_decay_with_policy(1.0, created_ms, MemoryKind::Conversational, now_ms);
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn apply_decay_with_policy_within_ttl_returns_decayed() {
-        let created_ms = 0;
-        let now_ms = (30 * 86_400) * 1000;
-        let result = apply_decay_with_policy(1.0, created_ms, MemoryKind::Conversational, now_ms);
-        assert!(result.is_some());
-        let score = result.unwrap();
-        assert!(score > 0.35 && score < 1.0);
+    fn apply_decay_with_policy_old_memories_decay_to_floor_but_stay() {
+        let day = 86_400_000;
+        let recent = apply_decay_with_policy(1.0, 0, MemoryKind::Conversational, 30 * day);
+        assert!(recent > 0.35 && recent < 1.0);
+        let ancient = apply_decay_with_policy(1.0, 0, MemoryKind::Conversational, 3_000 * day);
+        assert!((ancient - DECAY_FLOOR).abs() < 1e-6);
     }
 
     #[test]
@@ -1063,21 +1192,21 @@ mod tests {
 
     #[test]
     fn parse_temporal_window_month_year() {
-        let result = parse_temporal_window("October 2023").unwrap();
+        let result = parse_temporal_window("October 2023", None).unwrap();
         let expected = (month_to_ms(2023, 10, 1), month_to_ms(2023, 10, 31) + 86_400_000);
         assert_eq!(result, expected);
     }
 
     #[test]
     fn parse_temporal_window_season_year() {
-        let result = parse_temporal_window("summer 2022").unwrap();
+        let result = parse_temporal_window("summer 2022", None).unwrap();
         let expected = (month_to_ms(2022, 6, 1), month_to_ms(2022, 8, 31) + 86_400_000);
         assert_eq!(result, expected);
     }
 
     #[test]
     fn parse_temporal_window_winter_wraps_year() {
-        let result = parse_temporal_window("winter 2024").unwrap();
+        let result = parse_temporal_window("winter 2024", None).unwrap();
         let expected =
             (month_to_ms(2024, 12, 1), month_to_ms(2025, 2, days_in_month(2025, 2)) + 86_400_000);
         assert_eq!(result, expected);
@@ -1085,29 +1214,76 @@ mod tests {
 
     #[test]
     fn parse_temporal_window_last_week_of_month() {
-        let result = parse_temporal_window("last week of October 2023").unwrap();
+        let result = parse_temporal_window("last week of October 2023", None).unwrap();
         let expected = (month_to_ms(2023, 10, 25), month_to_ms(2023, 10, 31) + 86_400_000);
         assert_eq!(result, expected);
     }
 
     #[test]
     fn parse_temporal_window_specific_day() {
-        let result = parse_temporal_window("May 1 2022").unwrap();
+        let result = parse_temporal_window("May 1 2022", None).unwrap();
         let expected = (month_to_ms(2022, 5, 1), month_to_ms(2022, 5, 1) + 86_400_000);
         assert_eq!(result, expected);
     }
 
     #[test]
-    fn parse_temporal_window_no_year_returns_none() {
-        assert_eq!(parse_temporal_window("no year here"), None);
-        assert_eq!(parse_temporal_window("January"), None);
+    fn parse_temporal_window_iso_formatted_date() {
+        let result = parse_temporal_window("Where was I living as of 2024/05/12?", None).unwrap();
+        let expected_start = month_to_ms(2024, 5, 12);
+        assert_eq!(result, (expected_start, expected_start + 86_400_000));
+
+        let result2 = parse_temporal_window("events on 2023-11-05", None).unwrap();
+        let expected_start2 = month_to_ms(2023, 11, 5);
+        assert_eq!(result2, (expected_start2, expected_start2 + 86_400_000));
+    }
+
+    #[test]
+    fn parse_temporal_window_no_temporal_info_returns_none() {
+        assert_eq!(parse_temporal_window("no time mentioned here", None), None);
     }
 
     #[test]
     fn parse_temporal_window_first_week_of_month() {
-        let result = parse_temporal_window("first week of March 2023").unwrap();
+        let result = parse_temporal_window("first week of March 2023", None).unwrap();
         let expected = (month_to_ms(2023, 3, 1), month_to_ms(2023, 3, 7) + 86_400_000);
         assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn parse_temporal_window_relative_yesterday() {
+        let ref_ms = 1_700_000_000_000_u64;
+        let day_ms = 86_400_000_u64;
+        let ref_day = (ref_ms / day_ms) * day_ms;
+        let result = parse_temporal_window("what did I do yesterday?", Some(ref_ms)).unwrap();
+        assert_eq!(result, (ref_day - day_ms, ref_day));
+    }
+
+    #[test]
+    fn parse_temporal_window_relative_last_week() {
+        let ref_ms = 1_700_000_000_000_u64;
+        let day_ms = 86_400_000_u64;
+        let result = parse_temporal_window("what happened last week?", Some(ref_ms)).unwrap();
+        assert_eq!(result, (ref_ms - 7 * day_ms, ref_ms));
+    }
+
+    #[test]
+    fn parse_temporal_window_relative_diff_ref_times() {
+        let t1 = 1_650_000_000_000_u64;
+        let t2 = 1_720_000_000_000_u64;
+        let query = "show activities from last week";
+        let win1 = parse_temporal_window(query, Some(t1)).unwrap();
+        let win2 = parse_temporal_window(query, Some(t2)).unwrap();
+        assert_ne!(win1, win2);
+        assert_eq!(win1.1, t1);
+        assert_eq!(win2.1, t2);
+    }
+
+    #[test]
+    fn parse_temporal_window_past_n_days() {
+        let ref_ms = 1_700_000_000_000_u64;
+        let day_ms = 86_400_000_u64;
+        let result = parse_temporal_window("updates in the past 5 days", Some(ref_ms)).unwrap();
+        assert_eq!(result, (ref_ms - 5 * day_ms, ref_ms));
     }
 
     #[test]

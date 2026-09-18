@@ -159,17 +159,6 @@ pub struct LifecycleMetadata {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ArtifactVersionRecord {
-    pub artifact_id: String,
-    pub version_id: String,
-    pub operation: String,
-    pub previous_version_id: Option<String>,
-    pub compiler_version: String,
-    pub reason: String,
-    pub created_at_ms: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DeletionTombstone {
     pub tombstone_id: String,
     pub scope: String,
@@ -180,6 +169,8 @@ pub struct DeletionTombstone {
     pub proof_hash: String,
 }
 
+/// `timestamp_ms` is the retention start (when the memory was stored); expiry
+/// is measured from it.
 pub fn evaluate_lifecycle(
     text: &str,
     kind: MemoryKind,

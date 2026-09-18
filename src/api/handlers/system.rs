@@ -19,8 +19,6 @@ use anyhow::Context;
 const CACHE_CAPACITY: usize = 10_000;
 const BYTES_PER_MB: u64 = 1_048_576;
 const BYTES_PER_GB: u64 = 1_073_741_824;
-const ARTIFACT_HOURS: usize = 24;
-const ARTIFACT_VERSION_HOURS: usize = 48;
 const TURN_WINDOW_DEFAULT_RADIUS: u32 = 2;
 const TURN_WINDOW_MAX_RADIUS: u32 = 8;
 const DELETION_TOMBSTONE_HOURS: usize = 8;
@@ -86,6 +84,18 @@ pub async fn version_handler(
             embedding_model: state.semantic.embedding_model_id().to_string(),
             embedding_dim: state.semantic.embedding_dim(),
             ranking_config: (*state.ranking_config).clone(),
+            rerank: state.semantic.rerank_mode().to_string(),
+            rerank_policy: crate::api::handlers::query::rerank_policy_name(),
+            rerank_margin: crate::api::handlers::query::rerank_margin(),
+            rerank_top: crate::api::handlers::query::rerank_top(),
+            embed_max_tokens: state.semantic.embed_max_tokens(),
+            query_instruction: state.semantic.query_instruction().to_string(),
+            disabled_structures: crate::features::features().disabled_names(),
+            embed_text: crate::api::ingest::embed_text::embed_text_config().mode.as_str(),
+            context_window: crate::api::ingest::embed_text::embed_text_config().window,
+            embed_batch: state.semantic.embed_batch_size(),
+            embed_cache_hits: state.semantic.embed_cache_hits(),
+            embed_cache_misses: state.semantic.embed_cache_misses(),
         }),
     );
     record_usage_for_principal(&state, &principal, "version");
@@ -155,13 +165,14 @@ pub async fn reset_handler(
         tracing::error!(error = ?e, "graph_clear failed");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    state.vector_index.clear(None).map_err(|e| {
-        tracing::error!(error = ?e, "vector_index.clear failed");
+    // Only this tenant's vectors: each tenant owns its own index.
+    tenant.vectors().and_then(|v| v.clear(None)).map_err(|e| {
+        tracing::error!(error = ?e, "vector index clear failed");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
     if payload.clear_embedding_cache.unwrap_or(false) {
-        // embedding cache clearing not supported in current semantic module
+        state.semantic.clear_embedding_cache();
     }
 
     record_usage_for_principal(&state, &principal, "admin_reset");
@@ -208,14 +219,6 @@ pub async fn memory_inspect_handler(
             .get_ledger_turns_batch(&[payload.memory_id.clone()])
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
             .remove(&payload.memory_id);
-        let artifacts = tenant
-            .get_memory_artifacts_for_source(&payload.memory_id, ARTIFACT_HOURS)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        let artifact_ids =
-            artifacts.iter().map(|artifact| artifact.artifact_id.clone()).collect::<Vec<_>>();
-        let artifact_versions = tenant
-            .get_artifact_versions_for_artifacts(&artifact_ids, ARTIFACT_VERSION_HOURS)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         let deletion_tombstones = tenant
             .get_deletion_tombstones_for_target(&payload.memory_id, DELETION_TOMBSTONE_HOURS)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -223,8 +226,7 @@ pub async fn memory_inspect_handler(
         let lifecycle = card
             .as_ref()
             .and_then(|card| card.lifecycle.clone())
-            .or_else(|| ledger_turn.as_ref().and_then(|turn| turn.lifecycle.clone()))
-            .or_else(|| artifacts.iter().find_map(|artifact| artifact.lifecycle.clone()));
+            .or_else(|| ledger_turn.as_ref().and_then(|turn| turn.lifecycle.clone()));
 
         let mut turn_window = Vec::new();
         if payload.include_turn_window.unwrap_or(false) {
@@ -255,8 +257,6 @@ pub async fn memory_inspect_handler(
             card,
             ledger_turn,
             lifecycle,
-            artifacts,
-            artifact_versions,
             deletion_tombstones,
             turn_window,
         })
@@ -284,7 +284,6 @@ pub async fn memory_delete_handler(
         .clone()
         .filter(|reason| !reason.trim().is_empty())
         .unwrap_or_else(|| API_DELETE_REASON.to_string());
-    let state_for_delete = state.clone();
     let response = tokio::task::spawn_blocking(move || {
         let tenant = tenant.clone();
         let timestamp = tenant
@@ -320,15 +319,12 @@ pub async fn memory_delete_handler(
             .and_then(|_obs| tenant.fts_remove_document(&payload.memory_id).ok().map(|_| 1))
             .unwrap_or(0);
         let graph_edges_removed = tenant.graph_remove_memory(&payload.memory_id).unwrap_or(0);
-        if let Some(vector_id) = deleted.vector_id {
-            let entity_id = if deleted.entity_id.is_empty() {
-                observation.as_ref().map(|obs| obs.entity_id.as_str()).unwrap_or("")
-            } else {
-                deleted.entity_id.as_str()
-            };
-            if !entity_id.is_empty() {
-                let _ = state_for_delete.vector_index.remove(entity_id, vector_id);
-            }
+        let vectors = tenant.vectors().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        for vector_id in deleted.vector_id.iter().chain(deleted.chunk_vector_ids.iter()) {
+            vectors.remove(&deleted.entity_id, *vector_id).map_err(|err| {
+                tracing::error!(error = ?err, vector_id, "failed to remove deleted vector");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
         }
 
         Ok::<MemoryDeleteResponse, StatusCode>(MemoryDeleteResponse {
@@ -454,10 +450,10 @@ pub async fn cluster_stats_handler(
 ) -> Result<impl IntoResponse, StatusCode> {
     crate::api::auth::authorize_global_api_key(&headers, &state.auth)?;
 
-    let tenant = state
-        .tenant_store(&cluster_id)
-        .or_else(|_| state.tenant_store("default"))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let tenant = state.tenant_store(&cluster_id).map_err(|err| {
+        tracing::warn!(cluster_id = %cluster_id, error = ?err, "unknown or invalid cluster id");
+        StatusCode::NOT_FOUND
+    })?;
 
     let mut stats = tenant.db_stats().map_err(|err| {
         tracing::warn!("Failed to query db stats for cluster {}: {:?}", cluster_id, err);
@@ -479,10 +475,10 @@ pub async fn storage_stats_handler(
     axum::extract::Path(cluster_id): axum::extract::Path<String>,
 ) -> Result<impl IntoResponse, StatusCode> {
     crate::api::auth::authorize_global_api_key(&headers, &state.auth)?;
-    let tenant = state
-        .tenant_store(&cluster_id)
-        .or_else(|_| state.tenant_store("default"))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let tenant = state.tenant_store(&cluster_id).map_err(|err| {
+        tracing::warn!(cluster_id = %cluster_id, error = ?err, "unknown or invalid cluster id");
+        StatusCode::NOT_FOUND
+    })?;
     let stats = tenant.detailed_db_stats().map_err(|err| {
         tracing::warn!("Failed to query storage stats for cluster {}: {:?}", cluster_id, err);
         StatusCode::INTERNAL_SERVER_ERROR
@@ -496,10 +492,10 @@ pub async fn cluster_graph_handler(
     axum::extract::Path(cluster_id): axum::extract::Path<String>,
 ) -> Result<impl IntoResponse, StatusCode> {
     crate::api::auth::authorize_global_api_key(&headers, &state.auth)?;
-    let tenant = state
-        .tenant_store(&cluster_id)
-        .or_else(|_| state.tenant_store("default"))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let tenant = state.tenant_store(&cluster_id).map_err(|err| {
+        tracing::warn!(cluster_id = %cluster_id, error = ?err, "unknown or invalid cluster id");
+        StatusCode::NOT_FOUND
+    })?;
     let edges = tenant.get_all_edges(GRAPH_EDGE_LIMIT).map_err(|err| {
         tracing::warn!("Failed to query graph edges for cluster {}: {:?}", cluster_id, err);
         StatusCode::INTERNAL_SERVER_ERROR

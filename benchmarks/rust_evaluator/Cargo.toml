@@ -12,3 +12,6 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 chrono = { version = "0.4.38", default-features = false, features = ["clock", "std"] }
 tokio = { version = "1.50.0", features = ["macros", "rt-multi-thread"] }
+
+# Independent of the root workspace (own target dir, own lockfile).
+[workspace]

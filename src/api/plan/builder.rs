@@ -126,6 +126,7 @@ pub fn build_query_plan(query: &str, classifier: Option<&QueryIntentClassifier>)
             slot_key.as_deref(),
             &expansion_terms,
         ),
+        prefers_latest: query_prefers_latest(query),
         prefer_distilled: query_prefers_distilled(query),
         prefer_episodic: query_prefers_episodic(query),
         temporal_terms: extract_temporal_terms(query),
@@ -145,5 +146,56 @@ pub fn build_query_plan(query: &str, classifier: Option<&QueryIntentClassifier>)
         coverage_mode,
         ordinal_rank,
         fact_key: slot_key,
+    }
+}
+
+/// Cues that the question asks for the current state rather than history.
+/// Explicit past references ("used to", "before", "as of", "back in", "last
+/// year") win, so "where did I live before?" is not treated as current.
+pub fn query_prefers_latest(query: &str) -> bool {
+    let lower = format!(" {} ", query.to_ascii_lowercase().replace(['?', '.', ',', '!'], " "));
+    const PAST: [&str; 9] = [
+        " used to ",
+        " before ",
+        " previously ",
+        " as of ",
+        " back in ",
+        " last year ",
+        " originally ",
+        " at first ",
+        " formerly ",
+    ];
+    if PAST.iter().any(|cue| lower.contains(cue)) {
+        return false;
+    }
+    const CURRENT: [&str; 12] = [
+        " currently ",
+        " current ",
+        " right now ",
+        " now ",
+        " these days ",
+        " at present ",
+        " at the moment ",
+        " latest ",
+        " most recent ",
+        " nowadays ",
+        " still ",
+        " anymore ",
+    ];
+    CURRENT.iter().any(|cue| lower.contains(cue))
+}
+
+#[cfg(test)]
+mod prefers_latest_tests {
+    use super::query_prefers_latest;
+
+    #[test]
+    fn detects_current_value_questions() {
+        assert!(query_prefers_latest("Where do I currently live?"));
+        assert!(query_prefers_latest("What city do I live in right now?"));
+        assert!(query_prefers_latest("Is she still working at Acme?"));
+        assert!(!query_prefers_latest("Where did I live before moving?"));
+        assert!(!query_prefers_latest("Where was I living as of 2023/05/01?"));
+        assert!(!query_prefers_latest("What do I know about hiking?"));
     }
 }

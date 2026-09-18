@@ -35,3 +35,10 @@ benchmarks/ranking_tuner/*
 *.tfstate.backup
 *.tfstate.lock.info
 .terraform.tfstate.lock.info
+# Python bytecode cache (bindings/python)
+__pycache__/
+*.pyc
+
+# Benchmark run outputs (regenerate with benchmarks/run_baseline.sh / run_matrix.sh)
+/benchmarks/runs/
+/benchmarks/snapshots/

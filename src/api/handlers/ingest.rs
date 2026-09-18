@@ -1,12 +1,11 @@
 #![allow(dead_code)]
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, HeaderValue};
 use axum::{
     extract::{Json, State},
     http::StatusCode,
     response::IntoResponse,
 };
-use rayon::prelude::*;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::api::auth::{
     authorize_request, principal_namespace_prefix, principal_user_id, record_usage_for_principal,
@@ -21,7 +20,6 @@ use crate::ml::cosine_similarity;
 use std::sync::Arc;
 
 type GraphEdgeRecord = crate::storage::GraphEdgeEntry<'static>;
-type EmbeddingPairSet = (Vec<(String, Vec<f32>)>, Vec<(String, Vec<f32>)>);
 
 /// Compute a deterministic content hash for dedup.
 /// Uses the text content, entity_id, and kind so that re-ingesting
@@ -37,20 +35,22 @@ fn content_hash(text: &str, entity_id: &str, kind: &str) -> String {
     let result = hasher.finalize();
     result.iter().map(|b| format!("{:02x}", b)).collect::<String>()
 }
-type MiningResult = Result<Option<(String, Vec<f32>, Vec<f32>)>, StatusCode>;
 type RetrospectiveCandidate = (String, String, String, u64, String, String);
+use crate::features::Feature;
 use crate::lifecycle::{evaluate_lifecycle, LifecycleMetadata};
 use crate::metrics;
 use crate::storage::{
-    build_session_router_text, AgentObservation, CombinedIngestUpsertInput, FacetPosting,
-    FactVersionStatus, GraphEdgeEntry, MemCell, MemSceneRecord, MemoryArtifact, MemoryCard,
-    MemoryKind, ProfileFact, SessionRouterRecord, ShadowQuestion, TemporalEvent, TenantStore,
+    build_session_router_text, AgentObservation, FactVersionStatus, GraphEdgeEntry, MemoryCard,
+    MemoryKind, SessionRouterRecord, TenantStore,
 };
 
 #[derive(Default)]
-struct IngestDiagnostics {
+pub(crate) struct IngestDiagnostics {
     input_count: usize,
     expanded_count: usize,
+    embedded_count: usize,
+    /// Records built per derived structure (see `crate::features`).
+    structure_counts: std::collections::BTreeMap<&'static str, usize>,
 
     expand_ms: u64,
     enrich_ms: u64,
@@ -68,34 +68,54 @@ struct IngestDiagnostics {
     derived_embed_ms: u64,
     derived_embed_us: u64,
     memory_cards_ms: u64,
-    memory_artifacts_ms: u64,
-    temporal_events_ms: u64,
-    shadow_questions_ms: u64,
-    facet_postings_ms: u64,
-    mem_cells_ms: u64,
-    mem_scenes_ms: u64,
-    profile_facts_ms: u64,
     session_router_ms: u64,
     fts_ms: u64,
     fts_us: u64,
-    bm25f_ms: u64,
     vector_ms: u64,
     vector_us: u64,
-    hard_negatives_ms: u64,
     graph_ms: u64,
     graph_us: u64,
     preferences_ms: u64,
     retrospective_ms: u64,
     memory_links_ms: u64,
     fact_ms: u64,
+    predicate_canon_ms: u64,
     fact_us: u64,
     card_latest_ms: u64,
-    card_relations_ms: u64,
     total_ms: u64,
     total_us: u64,
 }
 
 impl IngestDiagnostics {
+    pub(crate) fn expanded_count(&self) -> usize {
+        self.expanded_count
+    }
+
+    pub(crate) fn embedded_count(&self) -> usize {
+        self.embedded_count
+    }
+
+    pub(crate) fn total_ms(&self) -> u64 {
+        self.total_ms
+    }
+
+    fn count(&mut self, structure: &'static str, n: usize) {
+        if n > 0 {
+            *self.structure_counts.entry(structure).or_default() += n;
+        }
+    }
+
+    /// `inputs=4,expanded=12,embedded=10,gist=1,...` for `x-tm-ingest-counts`.
+    pub(crate) fn counts_header(&self) -> String {
+        let mut parts = vec![
+            format!("inputs={}", self.input_count),
+            format!("expanded={}", self.expanded_count),
+            format!("embedded={}", self.embedded_count),
+        ];
+        parts.extend(self.structure_counts.iter().map(|(k, v)| format!("{k}={v}")));
+        parts.join(",")
+    }
+
     fn log_table(&self) {
         let sum = self.expand_ms
             + self.enrich_ms
@@ -107,25 +127,16 @@ impl IngestDiagnostics {
             + self.artifact_build_ms
             + self.ner_ms
             + self.memory_cards_ms
-            + self.memory_artifacts_ms
-            + self.temporal_events_ms
-            + self.shadow_questions_ms
-            + self.facet_postings_ms
-            + self.mem_cells_ms
-            + self.mem_scenes_ms
-            + self.profile_facts_ms
             + self.session_router_ms
             + self.fts_ms
-            + self.bm25f_ms
             + self.vector_ms
-            + self.hard_negatives_ms
             + self.graph_ms
             + self.preferences_ms
             + self.retrospective_ms
             + self.memory_links_ms
             + self.fact_ms
-            + self.card_latest_ms
-            + self.card_relations_ms;
+            + self.predicate_canon_ms
+            + self.card_latest_ms;
         let indent_us = self.total_us % 1000;
 
         let rows: Vec<(&str, u64)> = vec![
@@ -139,28 +150,19 @@ impl IngestDiagnostics {
             ("artifact building (per-rec)", self.artifact_build_ms),
             ("entity resolution", self.ner_ms),
             ("memory card upserts", self.memory_cards_ms),
-            ("memory artifact upserts", self.memory_artifacts_ms),
-            ("temporal events + embed", self.temporal_events_ms),
-            ("shadow questions + embed", self.shadow_questions_ms),
-            ("facet posting upserts", self.facet_postings_ms),
-            ("memcell upserts", self.mem_cells_ms),
-            ("memscene upserts", self.mem_scenes_ms),
-            ("profile fact upserts", self.profile_facts_ms),
             ("session router + embed", self.session_router_ms),
             ("FTS indexing", self.fts_ms),
-            ("BM25F indexing", self.bm25f_ms),
             ("vector index inserts", self.vector_ms),
-            ("hard negative mining", self.hard_negatives_ms),
             ("graph upsert + aliases", self.graph_ms),
             ("preference storage", self.preferences_ms),
             ("retrospective links", self.retrospective_ms),
             ("memory link storage", self.memory_links_ms),
+            ("predicate grouping", self.predicate_canon_ms),
             ("fact supersession", self.fact_ms),
             ("card latest updates", self.card_latest_ms),
-            ("card relation updates", self.card_relations_ms),
         ];
 
-        tracing::info!(
+        tracing::debug!(
             "\n═══════════════════ Ingest Profile ═══════════════════\n\
              inputs: {} → expanded: {}\n\
              ───────────────────────────────────────────────\n\
@@ -176,7 +178,7 @@ impl IngestDiagnostics {
                 .concat()
         );
 
-        tracing::info!(
+        tracing::debug!(
             "───────────────────────────────────────────────\n\
              {:<38} {:>10} ms\n\
              {:<38} {:>8}.{:03} ms\n\
@@ -197,16 +199,6 @@ pub struct ConsolidationTask {
     pub timestamp: u64,
     pub textual_content: String,
 }
-
-#[derive(Clone)]
-struct MiningRecord {
-    entity_id: String,
-    memory_id: String,
-    textual_content: String,
-    embedding: Vec<f32>,
-}
-
-type NlpCache = std::collections::HashMap<String, Vec<String>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 enum EmbeddingMode {
@@ -236,19 +228,10 @@ struct PreparedRecord {
 struct ArtifactBatches {
     fts_batch: Vec<(String, String, String)>,
     vector_batch: std::collections::HashMap<String, Vec<(u64, Vec<f32>)>>,
-    typed_graph_batch: Vec<GraphEdgeRecord>,
     memory_links_batch: Vec<(String, String, String)>,
     memory_card_batch: Vec<MemoryCard>,
-    memory_card_relations_batch: Vec<(String, String, String)>,
     memory_card_latest_updates: Vec<(String, bool, u64)>,
     session_router_updates: Vec<SessionRouterRecord>,
-    memory_artifacts_batch: Vec<MemoryArtifact>,
-    temporal_events_batch: Vec<TemporalEvent>,
-    shadow_questions_batch: Vec<ShadowQuestion>,
-    facet_postings_batch: Vec<FacetPosting>,
-    mem_cells_batch: Vec<MemCell>,
-    mem_scenes_batch: Vec<MemSceneRecord>,
-    profile_facts_batch: Vec<ProfileFact>,
     preference_batch: std::collections::HashMap<String, Vec<(String, f32)>>,
     retrospective_candidates: Vec<RetrospectiveCandidate>,
     fact_batch: Vec<FactRegistration>,
@@ -303,6 +286,9 @@ pub async fn ingest_handler(
         diag.analytics_us,
     );
     insert_stage_timing_headers(&mut headers, "x-tm-total", diag.total_ms, diag.total_us);
+    if let Ok(value) = HeaderValue::from_str(&diag.counts_header()) {
+        headers.insert("x-tm-ingest-counts", value);
+    }
 
     if let Some(user_id) = principal_user_id(&principal) {
         std::mem::drop(state.platform_write_tx.send(PlatformWriteOp::Profile {
@@ -314,7 +300,6 @@ pub async fn ingest_handler(
     }
     record_usage_for_principal(&state, &principal, "ingest");
     metrics::increment_ingest();
-    metrics::observe_query_duration(diag.total_ms as f64 / 1000.0);
     Ok((StatusCode::CREATED, headers))
 }
 
@@ -371,6 +356,9 @@ pub async fn batch_ingest_handler(
         diag.analytics_us,
     );
     insert_stage_timing_headers(&mut headers, "x-tm-total", diag.total_ms, diag.total_us);
+    if let Ok(value) = HeaderValue::from_str(&diag.counts_header()) {
+        headers.insert("x-tm-ingest-counts", value);
+    }
 
     if let Some(user_id) = principal_user_id(&principal) {
         for (text, timestamp_ms) in profile_items {
@@ -384,11 +372,10 @@ pub async fn batch_ingest_handler(
     }
     record_usage_for_principal(&state, &principal, "ingest");
     metrics::increment_ingest();
-    metrics::observe_query_duration(diag.total_ms as f64 / 1000.0);
     Ok((StatusCode::CREATED, headers))
 }
 
-async fn process_ingest_batch(
+pub(crate) async fn process_ingest_batch(
     state: &EngineState,
     tenant: &std::sync::Arc<TenantStore>,
     payloads: Vec<IngestPayload>,
@@ -396,16 +383,36 @@ async fn process_ingest_batch(
     execute_ingest_pipeline(state, tenant, payloads).await
 }
 
+/// Cosine similarity above which two predicate wordings are treated as the
+/// same predicate (`TELLODB_PREDICATE_TAU`, default 0.86).
+fn predicate_canon_tau() -> f32 {
+    static TAU: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *TAU.get_or_init(|| {
+        std::env::var("TELLODB_PREDICATE_TAU")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|v: &f32| v.is_finite() && (0.0..=1.0).contains(v))
+            .unwrap_or(0.86)
+    })
+}
+
+/// Session of a (normalized) payload, if any.
+fn payload_session(payload: &IngestPayload) -> Option<String> {
+    payload.session_id.clone().filter(|s| !s.is_empty())
+}
+
 // ── Phase 1: Payload preparation ──
 fn expand_and_enrich_payloads(
     payloads: Vec<IngestPayload>,
     diag: &mut IngestDiagnostics,
     total_start: Instant,
-) -> (Vec<IngestPayload>, NlpCache, Vec<String>) {
+) -> (Vec<IngestPayload>, Vec<String>) {
     let stage_start = Instant::now();
 
+    let features = crate::features::features();
     let mut expanded_payloads = Vec::new();
     for mut payload in payloads {
+        normalize_payload_identity(&mut payload);
         let mut prefix = String::new();
         if let Some(ref desc) = payload.visual_description {
             if !desc.is_empty() {
@@ -421,48 +428,67 @@ fn expand_and_enrich_payloads(
             payload.textual_content = format!("{}{}", prefix, payload.textual_content);
         }
 
-        for chunked_payload in expand_payload_for_content_type(&payload) {
+        let units = if features.enabled(Feature::Chunks) {
+            expand_payload_for_content_type(&payload)
+        } else {
+            vec![payload.clone()]
+        };
+        if units.len() > 1 {
+            diag.count("chunks", units.len());
+        }
+        for chunked_payload in units {
             expanded_payloads.push(chunked_payload.clone());
             if payload.enable_mining.unwrap_or(true) {
-                expanded_payloads.extend(build_companion_payloads(&chunked_payload));
+                let tag_prefix = format!("{}::", chunked_payload.memory_id);
+                for mut companion in build_companion_payloads(&chunked_payload) {
+                    let feature = companion
+                        .memory_id
+                        .strip_prefix(&tag_prefix)
+                        .and_then(Feature::for_companion_tag);
+                    if let Some(feature) = feature {
+                        if !features.enabled(feature) {
+                            continue;
+                        }
+                        diag.count(feature.name(), 1);
+                    }
+                    // Derived records belong to the same session and turn as
+                    // their source.
+                    companion.session_id = payload.session_id.clone();
+                    companion.turn_index = payload.turn_index;
+                    companion.role = payload.role.clone();
+                    expanded_payloads.push(companion);
+                }
             }
         }
     }
 
-    let unique_texts: std::collections::HashSet<String> =
-        expanded_payloads.iter().map(|p| p.textual_content.clone()).collect();
-    let unique_vec: Vec<String> = unique_texts.into_iter().collect();
-    let nlp_pairs: Vec<(String, Vec<String>)> = unique_vec
-        .par_iter()
-        .map(|text| (text.clone(), extract_named_phrases(std::slice::from_ref(text))))
-        .collect();
-    let nlp_cache: NlpCache = nlp_pairs.into_iter().collect();
-
     diag.expand_ms = stage_start.elapsed().as_millis() as u64;
     diag.expanded_count = expanded_payloads.len();
-    tracing::info!("[CP] expand_done: μs={}", total_start.elapsed().as_micros());
+    tracing::debug!("[CP] expand_done: μs={}", total_start.elapsed().as_micros());
 
     // Context window enrichment
     let mut session_groups: std::collections::HashMap<String, Vec<usize>> =
         std::collections::HashMap::new();
     for (idx, payload) in expanded_payloads.iter().enumerate() {
-        if let Some(sid) = session_id_from_memory_id(&payload.memory_id) {
+        if let Some(sid) = payload_session(payload) {
             session_groups.entry(sid).or_default().push(idx);
         }
     }
 
     let stage_start = Instant::now();
     let mut enriched_texts = Vec::with_capacity(expanded_payloads.len());
+    let legacy_headers = crate::api::ingest::embed_text::embed_text_config().mode
+        == crate::api::ingest::embed_text::EmbedTextMode::Legacy;
 
     for (idx, payload) in expanded_payloads.iter().enumerate() {
-        if payload.kind.as_deref() == Some("synthetic_query") {
+        if !legacy_headers || payload.kind.as_deref() == Some("synthetic_query") {
             enriched_texts.push(payload.textual_content.clone());
             continue;
         }
 
         let mut final_text = payload.textual_content.clone();
 
-        if let Some(sid) = session_id_from_memory_id(&payload.memory_id) {
+        if let Some(sid) = payload_session(payload) {
             if let Some(session_indices) = session_groups.get(&sid) {
                 let my_pos = session_indices.iter().position(|&i| i == idx);
                 if let Some(pos) = my_pos {
@@ -488,7 +514,7 @@ fn expand_and_enrich_payloads(
     }
     diag.enrich_ms = stage_start.elapsed().as_millis() as u64;
 
-    (expanded_payloads, nlp_cache, enriched_texts)
+    (expanded_payloads, enriched_texts)
 }
 
 // ── Phase 2: Embedding generation ──
@@ -521,36 +547,21 @@ async fn generate_embeddings(
     } else {
         let stage_start = Instant::now();
         let texts: Vec<String> = unique_specs.iter().map(|(_, t)| t.clone()).collect();
-        let embeddings = state.semantic.embed_batch_parallel(texts).await;
-
+        diag.embedded_count += texts.len();
+        // A failed embedding must fail the ingest: storing placeholder vectors
+        // would make those memories silently unsearchable.
+        let embeddings = state.semantic.embed_texts_async(texts).await.map_err(|err| {
+            tracing::error!(error = ?err, "embedding failed; rejecting ingest batch");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
         (diag.embed_ms, diag.embed_us) = elapsed_ms_and_us(stage_start);
-
-        // Guard: if embed_batch_parallel returned fewer vectors than expected
-        // (e.g. CUDA OOM caused model.embed() to return an empty Vec via
-        // unwrap_or_default()), log a warning and return an internal error so
-        // the request fails cleanly rather than panicking the server.
-        if !embeddings.is_empty() && embeddings.len() < unique_specs.len() {
-            tracing::error!(
-                got = embeddings.len(),
-                expected = unique_specs.len(),
-                "embed_batch_parallel returned fewer vectors than texts (likely CUDA OOM); \
-                 returning 500 to caller"
-            );
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
-        }
-
         embeddings
     };
 
-    let embed_dim = state.semantic.embedding_dim();
     let mut semantic_embeddings = Vec::with_capacity(semantic_embed_specs.len());
     for spec in semantic_embed_specs {
         let idx = *spec_to_idx.get(&spec).expect("embedding spec not found in index");
-        // Use .get() instead of direct index to guard against any remaining
-        // edge case where unique_embeddings is empty (all-empty batch etc.).
-        let embedding =
-            unique_embeddings.get(idx).cloned().unwrap_or_else(|| vec![0.0f32; embed_dim]);
-        semantic_embeddings.push(embedding);
+        semantic_embeddings.push(unique_embeddings[idx].clone());
     }
 
     Ok(semantic_embeddings)
@@ -558,11 +569,11 @@ async fn generate_embeddings(
 
 // ── Phase 3: Dedup + observation building ──
 fn build_observations(
-    state: &EngineState,
+    tenant: &TenantStore,
     expanded_payloads: Vec<IngestPayload>,
     semantic_embeddings: Vec<Vec<f32>>,
     diag: &mut IngestDiagnostics,
-) -> Result<(Vec<PreparedRecord>, Vec<MiningRecord>), StatusCode> {
+) -> Result<Vec<PreparedRecord>, StatusCode> {
     let dedup_build_start = Instant::now();
 
     let mut prepared = Vec::new();
@@ -599,10 +610,18 @@ fn build_observations(
                 op == "derive" || op == "infer"
             })
             .unwrap_or(matches!(kind, MemoryKind::Lesson));
+        // Retention runs from when the memory is stored, not from the event
+        // time it describes: importing a two-year-old conversation must not
+        // make it expire immediately.
+        let recorded_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(payload.timestamp)
+            .max(payload.timestamp);
         let lifecycle = evaluate_lifecycle(
             &payload.textual_content,
             kind,
-            payload.timestamp,
+            recorded_at_ms,
             payload.fact_confidence,
             is_inference,
         );
@@ -611,9 +630,14 @@ fn build_observations(
         if index_semantic
             && lifecycle.index_vector
             && enable_semantic_dedup
+            && crate::features::enabled(Feature::SemanticDedup)
             && (kind == MemoryKind::Fact || kind == MemoryKind::Decision)
         {
-            let is_dup = is_semantic_duplicate(state, &payload.entity_id, &embedding, 0.94)?;
+            let vectors = tenant.vectors().map_err(|err| {
+                tracing::error!(error = ?err, "tenant vector index unavailable");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+            let is_dup = is_semantic_duplicate(vectors, &payload.entity_id, &embedding, 0.94)?;
             let in_batch = semantic_seen.iter().any(|(entity_id, prior_embedding)| {
                 entity_id == &payload.entity_id
                     && cosine_similarity(prior_embedding, &embedding) >= 0.94
@@ -633,27 +657,17 @@ fn build_observations(
             kind,
             content_hash: hash,
             created_at_ms: payload.timestamp,
+            session_id: payload.session_id.clone().unwrap_or_default(),
+            turn_index: payload.turn_index.unwrap_or(0),
+            role: payload.role.clone().unwrap_or_default(),
+            parent_memory_id: payload.source_memory_id.clone(),
         };
 
         prepared.push(PreparedRecord { payload, obs, embedding, lifecycle, enable_consolidation });
     }
 
-    let mining_records: Vec<MiningRecord> = prepared
-        .iter()
-        .filter(|record| {
-            record.payload.kind.as_deref() != Some("synthetic_query")
-                && !record.embedding.is_empty()
-        })
-        .map(|record| MiningRecord {
-            entity_id: record.payload.entity_id.clone(),
-            memory_id: record.payload.memory_id.clone(),
-            textual_content: record.payload.textual_content.clone(),
-            embedding: record.embedding.clone(),
-        })
-        .collect();
-
     diag.dedup_build_ms = dedup_build_start.elapsed().as_millis() as u64;
-    Ok((prepared, mining_records))
+    Ok(prepared)
 }
 
 // ── Phase 4: Artifact building ──
@@ -663,6 +677,7 @@ fn build_artifacts(
     diag: &mut IngestDiagnostics,
 ) -> ArtifactBatches {
     let artifact_build_start = Instant::now();
+    let features = crate::features::features();
     let mut batches = ArtifactBatches::default();
 
     for (record, vector_id) in prepared.into_iter().zip(inserted_flags.into_iter()) {
@@ -673,63 +688,21 @@ fn build_artifacts(
                 record.payload.entity_id.clone(),
                 record.payload.textual_content.clone(),
             ));
-            if let Some(card) =
-                build_memory_card_from_payload(&record.payload, record.obs.kind, &record.lifecycle)
-            {
-                if card.source_memory_id != card.card_id {
-                    batches.memory_card_relations_batch.push((
-                        card.source_memory_id.clone(),
-                        EdgeType::Supports.as_str().to_string(),
-                        card.card_id.clone(),
-                    ));
-                    batches.memory_card_relations_batch.push((
-                        card.card_id.clone(),
-                        EdgeType::Derives.as_str().to_string(),
-                        card.source_memory_id.clone(),
-                    ));
+            if features.enabled(Feature::MemoryCards) {
+                if let Some(card) = build_memory_card_from_payload(
+                    &record.payload,
+                    record.obs.kind,
+                    &record.lifecycle,
+                ) {
+                    batches.memory_card_batch.push(card);
                 }
-                batches.memory_card_batch.push(card);
             }
-            if let Some(router_update) =
-                build_session_router_update_from_payload(&record.payload, record.obs.kind)
-            {
-                batches.session_router_updates.push(router_update);
-            }
-            batches.memory_artifacts_batch.push(build_memory_artifact_from_payload(
-                &record.payload,
-                "ledger_turn",
-                "-v2-ledger",
-                None,
-                None,
-                &record.lifecycle,
-            ));
-            if let Some(event) = build_temporal_event_from_payload(
-                &record.payload,
-                record.obs.kind,
-                &record.lifecycle,
-            ) {
-                batches.temporal_events_batch.push(event);
-            }
-            batches
-                .shadow_questions_batch
-                .extend(build_shadow_questions_from_payload(&record.payload, record.obs.kind));
-            batches
-                .facet_postings_batch
-                .extend(build_facet_postings_from_payload(&record.payload, record.obs.kind));
-            if let Some(cell) =
-                build_mem_cell_from_payload(&record.payload, record.obs.kind, &record.lifecycle)
-            {
-                batches.mem_cells_batch.push(cell);
-            }
-            if let Some(scene) =
-                build_mem_scene_from_payload(&record.payload, record.obs.kind, &record.lifecycle)
-            {
-                batches.mem_scenes_batch.push(scene);
-            }
-            if let Some(pf) =
-                build_profile_fact_from_payload(&record.payload, record.obs.kind, &record.lifecycle)
-            {
-                batches.profile_facts_batch.push(pf);
+            if features.enabled(Feature::SessionRouter) {
+                if let Some(router_update) =
+                    build_session_router_update_from_payload(&record.payload, record.obs.kind)
+                {
+                    batches.session_router_updates.push(router_update);
+                }
             }
         }
         if !record.embedding.is_empty() {
@@ -742,7 +715,7 @@ fn build_artifacts(
             }
         }
 
-        if !is_synthetic_query {
+        if !is_synthetic_query && features.enabled(Feature::Preferences) {
             if let Some(strength) = preference_signal_strength(
                 &record.payload.textual_content,
                 &record.payload.relations,
@@ -753,7 +726,8 @@ fn build_artifacts(
                     .or_default()
                     .push((record.payload.memory_id.clone(), strength));
             }
-
+        }
+        if !is_synthetic_query && features.enabled(Feature::RetrospectiveLinks) {
             if let Some(reference_query) =
                 extract_retrospective_reference_query(&record.payload.textual_content)
             {
@@ -772,7 +746,12 @@ fn build_artifacts(
             }
         }
 
-        if let Some(source_memory_id) = record.payload.source_memory_id.as_deref() {
+        let derived_source = record
+            .payload
+            .source_memory_id
+            .as_deref()
+            .filter(|_| features.enabled(Feature::DerivedLinks));
+        if let Some(source_memory_id) = derived_source {
             batches.memory_links_batch.push((
                 record.payload.memory_id.clone(),
                 source_memory_id.to_string(),
@@ -785,9 +764,11 @@ fn build_artifacts(
             ));
         }
 
-        if record.obs.kind == MemoryKind::Fact
-            || record.obs.kind == MemoryKind::Preference
-            || record.obs.kind == MemoryKind::Decision
+        if features.enabled(Feature::Facts)
+            && matches!(
+                record.obs.kind,
+                MemoryKind::Fact | MemoryKind::Preference | MemoryKind::Decision
+            )
         {
             if let Some(fact_key) = record.payload.fact_key.as_deref() {
                 batches.fact_batch.push(FactRegistration {
@@ -814,7 +795,7 @@ fn build_artifacts(
             }
         }
 
-        if record.enable_consolidation {
+        if record.enable_consolidation && features.enabled(Feature::Consolidation) {
             batches.consolidation_tasks.push(ConsolidationTask {
                 entity_id: record.payload.entity_id.clone(),
                 memory_id: record.payload.memory_id.clone(),
@@ -824,8 +805,13 @@ fn build_artifacts(
         }
     }
 
+    diag.count(Feature::MemoryCards.name(), batches.memory_card_batch.len());
+    diag.count(Feature::SessionRouter.name(), batches.session_router_updates.len());
+    diag.count(Feature::Preferences.name(), batches.preference_batch.values().map(Vec::len).sum());
+    diag.count(Feature::DerivedLinks.name(), batches.memory_links_batch.len());
+    diag.count(Feature::Facts.name(), batches.fact_batch.len());
     diag.artifact_build_ms = artifact_build_start.elapsed().as_millis() as u64;
-    tracing::info!("[CP] artifact_build_done: μs={}", artifact_build_start.elapsed().as_micros());
+    tracing::debug!("[CP] artifact_build_done: μs={}", artifact_build_start.elapsed().as_micros());
     batches
 }
 
@@ -833,53 +819,25 @@ fn build_artifacts(
 async fn commit_batches(
     tenant: &std::sync::Arc<TenantStore>,
     state: &EngineState,
-    nlp_cache: &NlpCache,
-    _mining_records: &[MiningRecord],
     batches: &mut ArtifactBatches,
     diag: &mut IngestDiagnostics,
 ) -> Result<(), StatusCode> {
-    // Combined SQLite write: all secondary index upserts in a single spawn_blocking
-    let combined_tenant = tenant.clone();
-    let res_combined: Duration = tokio::task::spawn_blocking({
-        let tenant = combined_tenant.clone();
-        let cards = batches.memory_card_batch.clone();
-        let artifacts = batches.memory_artifacts_batch.clone();
-        let temporal_events = batches.temporal_events_batch.clone();
-        let shadow_questions = batches.shadow_questions_batch.clone();
-        let facet_postings = batches.facet_postings_batch.clone();
-        let mem_cells = batches.mem_cells_batch.clone();
-        let mem_scenes = batches.mem_scenes_batch.clone();
-        let profile_facts = batches.profile_facts_batch.clone();
-        move || -> Result<Duration, anyhow::Error> {
-            let start = Instant::now();
-            let input = CombinedIngestUpsertInput {
-                cards: &cards,
-                artifacts: &artifacts,
-                events: &temporal_events,
-                shadow_questions: &shadow_questions,
-                facet_postings: &facet_postings,
-                mem_cells: &mem_cells,
-                mem_scenes: &mem_scenes,
-                profile_facts: &profile_facts,
-            };
-            tenant.combined_ingest_upsert(&input)?;
-            Ok(start.elapsed())
-        }
-    })
-    .await
-    .map_err(|e| {
-        tracing::error!("combined_ingest_upsert panicked: {:?}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?
-    .map_err(|e| {
-        tracing::error!("combined_ingest_upsert failed: {:?}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    // Memory cards
+    if !batches.memory_card_batch.is_empty() {
+        let stage_start = Instant::now();
+        let (tenant, cards) = (tenant.clone(), batches.memory_card_batch.clone());
+        tokio::task::spawn_blocking(move || tenant.ingest_cards(&cards))
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|r| r)
+            .map_err(|err| {
+                tracing::error!(error = ?err, "memory card upsert failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        diag.memory_cards_ms = stage_start.elapsed().as_millis() as u64;
+    }
 
-    diag.memory_cards_ms = res_combined.as_millis() as u64;
-    diag.memory_artifacts_ms = res_combined.as_millis() as u64;
-
-    tracing::info!("[CP] upserts_done_before_session_router");
+    tracing::debug!("[CP] upserts_done_before_session_router");
 
     // Session router merge
     if !batches.session_router_updates.is_empty() {
@@ -902,7 +860,7 @@ async fn commit_batches(
         for record in &router_records {
             if !record.router_text.is_empty() {
                 batches.fts_batch.push((
-                    format!("{}::{}::850000", record.entity_id, record.session_id),
+                    format!("{}::{}::0::router", record.entity_id, record.session_id),
                     record.entity_id.clone(),
                     record.router_text.clone(),
                 ));
@@ -912,123 +870,50 @@ async fn commit_batches(
         diag.session_router_ms = sr_start.elapsed().as_millis() as u64;
     }
 
-    // FTS + vector indexing (parallel)
+    // FTS + vector indexing (parallel). Failures fail the request: the rows
+    // are already committed, and a 200 here would hide memories that can
+    // never be retrieved.
     let (res_fts, res_vix) = tokio::join!(
         tokio::task::spawn_blocking({
             let tenant = tenant.clone();
             let batch = batches.fts_batch.clone();
-            move || {
+            move || -> anyhow::Result<Duration> {
                 let start = Instant::now();
                 if !batch.is_empty() {
-                    let _ = tenant.fts_index_batch(&batch);
+                    tenant.fts_index_batch(&batch)?;
                 }
-                start.elapsed()
+                Ok(start.elapsed())
             }
         }),
         tokio::task::spawn_blocking({
-            let state = state.clone();
+            let tenant = tenant.clone();
             let batch = batches.vector_batch.clone();
-            move || {
+            move || -> anyhow::Result<Duration> {
                 let start = Instant::now();
                 if !batch.is_empty() {
+                    let vectors = tenant.vectors()?;
                     for (entity_id, items) in batch {
-                        let _ = state.vector_index.insert_batch(&entity_id, &items);
+                        vectors.insert_batch(&entity_id, &items)?;
                     }
                 }
-                start.elapsed()
+                Ok(start.elapsed())
             }
         })
     );
-
-    let res_fts = res_fts.unwrap_or(Duration::ZERO);
-    let res_vix = res_vix.unwrap_or(Duration::ZERO);
+    let join_stage =
+        |stage: &'static str, res: Result<anyhow::Result<Duration>, tokio::task::JoinError>| {
+            res.map_err(anyhow::Error::from).and_then(|r| r).map_err(|err| {
+                tracing::error!(stage, error = ?err, "ingest indexing stage failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })
+        };
+    let res_fts = join_stage("fts", res_fts)?;
+    let res_vix = join_stage("vector", res_vix)?;
 
     diag.fts_ms = res_fts.as_millis() as u64;
     diag.fts_us = res_fts.as_micros() as u64;
-    diag.bm25f_ms = 0;
     diag.vector_ms = res_vix.as_millis() as u64;
     diag.vector_us = res_vix.as_micros() as u64;
-
-    // Graph upsert + alias extraction + hard negative mining (parallel)
-    let (res_graph, res_hn) = tokio::join!(
-        tokio::task::spawn_blocking({
-            let tenant = tenant.clone();
-            let batch = batches.typed_graph_batch.clone();
-            let consolidation_tasks = batches.consolidation_tasks.clone();
-            let nlp_cache = nlp_cache.clone();
-            let cards_for_entities = batches.memory_card_batch.clone();
-            let facts_for_entities = batches.fact_batch.clone();
-            move || {
-                let start = Instant::now();
-                if !batch.is_empty() {
-                    let _ = tenant.graph_upsert_memory_batch(&batch);
-
-                    let mut entity_texts: std::collections::HashMap<String, Vec<String>> =
-                        std::collections::HashMap::new();
-                    for task in &consolidation_tasks {
-                        entity_texts
-                            .entry(task.entity_id.clone())
-                            .or_default()
-                            .push(task.textual_content.clone());
-                    }
-                    for (entity_id, texts) in entity_texts {
-                        let all_text = texts.join("\n");
-                        let known_entities = dedupe_preserve_order(
-                            texts
-                                .iter()
-                                .flat_map(|t| nlp_cache.get(t).cloned().unwrap_or_default())
-                                .collect(),
-                        );
-                        let aliases = extract_aliases_from_text(&all_text, &known_entities);
-                        if !aliases.is_empty() {
-                            let _ = tenant.set_aliases_batch(&entity_id, &aliases);
-                        }
-
-                        // Collect entity names from memory card subjects + fact registrations.
-                        let mut entity_names: Vec<String> = known_entities.clone();
-                        for card in &cards_for_entities {
-                            if card.entity_id == entity_id && !card.subject.is_empty() {
-                                let s = card.subject.trim().to_string();
-                                if s.len() >= 2 && !entity_names.contains(&s) {
-                                    entity_names.push(s);
-                                }
-                            }
-                        }
-                        for fact in &facts_for_entities {
-                            if fact.entity_id == entity_id && !fact.subject.is_empty() {
-                                let s = fact.subject.trim().to_string();
-                                if s.len() >= 2 && !entity_names.contains(&s) {
-                                    entity_names.push(s);
-                                }
-                            }
-                        }
-
-                        // Run tiered entity resolver on extracted entity names.
-                        for entity_name in &entity_names {
-                            let _ = tenant.register_entity(&entity_id, entity_name);
-                            let _ = tenant.resolve_and_propose(
-                                &entity_id,
-                                entity_name,
-                                None,
-                                &crate::storage::entity_resolver::ResolutionConfig::default(),
-                            );
-                        }
-                    }
-                }
-                start.elapsed()
-            }
-        }),
-        // Hard negative mining disabled — it consumed 40-70% of ingest time
-        // for a <2% accuracy gain. Re-enable by restoring the original block.
-        tokio::task::spawn_blocking(|| Duration::ZERO)
-    );
-
-    let res_graph = res_graph.unwrap_or(Duration::ZERO);
-    let res_hn = res_hn.unwrap_or(Duration::ZERO);
-
-    diag.graph_ms = res_graph.as_millis() as u64;
-    diag.graph_us = res_graph.as_micros() as u64;
-    diag.hard_negatives_ms = res_hn.as_millis() as u64;
 
     // Preferences
     if !batches.preference_batch.is_empty() {
@@ -1058,6 +943,7 @@ async fn commit_batches(
         let stage_start = Instant::now();
         let retrospective_links =
             build_retrospective_links(state, tenant, &batches.retrospective_candidates)?;
+        diag.count(Feature::RetrospectiveLinks.name(), retrospective_links.len());
         batches.memory_links_batch.extend(retrospective_links);
         diag.retrospective_ms = stage_start.elapsed().as_millis() as u64;
     }
@@ -1080,6 +966,59 @@ async fn commit_batches(
         diag.memory_links_ms = stage_start.elapsed().as_millis() as u64;
     }
 
+    // Predicate grouping: rule-derived keys vary in wording ("job title" vs
+    // "job_title"), which would otherwise keep two chains for one fact.
+    if crate::features::enabled(Feature::PredicateCanon) && !batches.fact_batch.is_empty() {
+        let stage_start = Instant::now();
+        let mut keys: Vec<(String, String)> =
+            batches.fact_batch.iter().map(|f| (f.entity_id.clone(), f.fact_key.clone())).collect();
+        keys.sort();
+        keys.dedup();
+        let texts: Vec<String> = keys.iter().map(|(_, key)| key.replace('_', " ")).collect();
+        let embeddings = state.semantic.embed_texts_async(texts).await.map_err(|err| {
+            tracing::error!(error = ?err, "predicate embedding failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        let mut by_entity: std::collections::HashMap<String, Vec<(String, Vec<f32>)>> =
+            std::collections::HashMap::new();
+        for ((entity_id, key), embedding) in keys.into_iter().zip(embeddings) {
+            by_entity.entry(entity_id).or_default().push((key, embedding));
+        }
+        let tenant_canon = tenant.clone();
+        let canonical = tokio::task::spawn_blocking(move || {
+            let tau = predicate_canon_tau();
+            let mut canonical = std::collections::HashMap::new();
+            for (entity_id, predicates) in by_entity {
+                let assigned =
+                    tenant_canon.canonicalize_predicates(&entity_id, &predicates, tau)?;
+                for (predicate, group) in assigned {
+                    canonical.insert((entity_id.clone(), predicate), group);
+                }
+            }
+            Ok::<_, anyhow::Error>(canonical)
+        })
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|r| r)
+        .map_err(|err| {
+            tracing::error!(error = ?err, "predicate canonicalization failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        let mut regrouped = 0usize;
+        for fact in batches.fact_batch.iter_mut() {
+            if let Some(group) = canonical
+                .get(&(fact.entity_id.clone(), fact.fact_key.clone()))
+                .filter(|g| **g != fact.fact_key)
+            {
+                fact.predicate = fact.fact_key.replace('_', " ");
+                fact.fact_key = group.clone();
+                regrouped += 1;
+            }
+        }
+        diag.count(Feature::PredicateCanon.name(), regrouped);
+        diag.predicate_canon_ms = stage_start.elapsed().as_millis() as u64;
+    }
+
     // Fact registration + supersession
     // Clone fact data for typed graph edges before drain consumes it.
     let facts_for_edges: Vec<FactRegistration> = batches.fact_batch.clone();
@@ -1094,7 +1033,6 @@ async fn commit_batches(
         #[derive(Default)]
         struct FactSideEffects {
             card_updates: Vec<(String, bool, u64)>,
-            card_relations: Vec<(String, String, String)>,
         }
 
         let tenant_fact = tenant.clone();
@@ -1132,11 +1070,6 @@ async fn commit_batches(
                                         true,
                                         reg.timestamp,
                                     ));
-                                    se.card_relations.push((
-                                        old_id.clone(),
-                                        EdgeType::Updates.as_str().to_string(),
-                                        reg.memory_id.clone(),
-                                    ));
                                     graph_status_batch.push(GraphEdgeEntry {
                                         memory_id: reg.memory_id.as_str(),
                                         subject: reg.subject.as_str(),
@@ -1168,11 +1101,6 @@ async fn commit_batches(
                                         false,
                                         reg.timestamp,
                                     ));
-                                    se.card_relations.push((
-                                        reg.memory_id.clone(),
-                                        EdgeType::SupersededBy.as_str().to_string(),
-                                        cur_id.clone(),
-                                    ));
                                     graph_status_batch.push(GraphEdgeEntry {
                                         memory_id: reg.memory_id.as_str(),
                                         subject: reg.subject.as_str(),
@@ -1186,6 +1114,9 @@ async fn commit_batches(
                                         timestamp: reg.timestamp,
                                     });
                                 }
+                                // A restatement confirms the version it
+                                // matches; nothing about the chain changed.
+                                FactVersionStatus::Confirmed { .. } => {}
                                 FactVersionStatus::Current { superseded: None } => {
                                     se.card_updates.push((
                                         reg.memory_id.clone(),
@@ -1225,7 +1156,6 @@ async fn commit_batches(
             match result {
                 Ok(se) => {
                     batches.memory_card_latest_updates.extend(se.card_updates);
-                    batches.memory_card_relations_batch.extend(se.card_relations);
                 }
                 Err(e) => return Err(e),
             }
@@ -1234,46 +1164,45 @@ async fn commit_batches(
         (diag.fact_ms, diag.fact_us) = elapsed_ms_and_us(stage_start);
     }
 
-    // Typed graph edges: populate the edges table from memory cards and fact registrations.
-    // These edges power the entity-graph retrieval lane in the query fusion phase.
-    {
-        let _stage_start = Instant::now();
-        let tenant_ge = tenant.clone();
-        let cards_ge = batches.memory_card_batch.clone();
-        let facts_ge = facts_for_edges;
-        tokio::task::spawn_blocking(move || {
-            for card in &cards_ge {
-                if card.subject.is_empty() || card.predicate.is_empty() || card.object.is_empty() {
-                    continue;
-                }
-                let _ = tenant_ge.graph_insert_edge(
-                    &card.entity_id,
-                    &card.source_memory_id,
-                    &card.subject,
-                    &card.predicate,
-                    &card.object,
-                    card.created_at_ms,
-                );
-            }
-            for fact in &facts_ge {
-                if fact.subject.is_empty() || fact.predicate.is_empty() || fact.object.is_empty() {
-                    continue;
-                }
-                let _ = tenant_ge.graph_insert_edge(
-                    &fact.entity_id,
-                    &fact.memory_id,
-                    &fact.subject,
-                    &fact.predicate,
-                    &fact.object,
-                    fact.timestamp,
-                );
-            }
+    // Typed graph edges from memory cards and fact registrations; they feed
+    // the entity-graph retrieval lane.
+    if crate::features::enabled(Feature::GraphEdges) {
+        let stage_start = Instant::now();
+        let tenant = tenant.clone();
+        let cards = batches.memory_card_batch.clone();
+        let written = tokio::task::spawn_blocking(move || {
+            let edges: Vec<(&str, &str, &str, &str, u64)> = cards
+                .iter()
+                .map(|c| {
+                    (
+                        c.source_memory_id.as_str(),
+                        c.subject.as_str(),
+                        c.predicate.as_str(),
+                        c.object.as_str(),
+                        c.created_at_ms,
+                    )
+                })
+                .chain(facts_for_edges.iter().map(|f| {
+                    (
+                        f.memory_id.as_str(),
+                        f.subject.as_str(),
+                        f.predicate.as_str(),
+                        f.object.as_str(),
+                        f.timestamp,
+                    )
+                }))
+                .collect();
+            tenant.graph_insert_edges_batch(&edges)
         })
         .await
-        .map_err(|e| {
-            tracing::error!("typed graph edge spawn panic: {:?}", e);
+        .map_err(anyhow::Error::from)
+        .and_then(|r| r)
+        .map_err(|err| {
+            tracing::error!(error = ?err, "typed graph edge insert failed");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
+        diag.count(Feature::GraphEdges.name(), written);
+        (diag.graph_ms, diag.graph_us) = elapsed_ms_and_us(stage_start);
     }
 
     // Card latest updates
@@ -1294,24 +1223,6 @@ async fn commit_batches(
         diag.card_latest_ms = stage_start.elapsed().as_millis() as u64;
     }
 
-    // Card relations updates
-    if !batches.memory_card_relations_batch.is_empty() {
-        let stage_start = Instant::now();
-        let tenant_cr = tenant.clone();
-        let relations = batches.memory_card_relations_batch.clone();
-        tokio::task::spawn_blocking(move || tenant_cr.set_memory_card_relations_batch(&relations))
-            .await
-            .map_err(|e| {
-                tracing::error!("card_relations spawn panic: {:?}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?
-            .map_err(|e| {
-                tracing::error!("card_relations write failed: {:?}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-        diag.card_relations_ms = stage_start.elapsed().as_millis() as u64;
-    }
-
     Ok(())
 }
 
@@ -1322,10 +1233,16 @@ fn build_memory_card_from_payload(
 ) -> Option<MemoryCard> {
     let source_memory_id =
         payload.source_memory_id.clone().unwrap_or_else(|| payload.memory_id.clone());
-    let source_session_id = session_id_from_memory_id(&source_memory_id)
-        .or_else(|| session_id_from_memory_id(&payload.memory_id))
+    let source_session_id = payload
+        .session_id
+        .clone()
+        .filter(|s| !s.is_empty())
+        .or_else(|| session_id_from_memory_id(&source_memory_id))
         .unwrap_or_default();
-    let source_turn_index = turn_index_from_memory_id(&source_memory_id);
+    let source_turn_index = payload
+        .turn_index
+        .map(|t| t as usize)
+        .unwrap_or_else(|| turn_index_from_memory_id(&source_memory_id));
     let document_time = extract_document_time_ms(&payload.textual_content, payload.timestamp);
     let event_time = extract_event_time_ms(&payload.textual_content, document_time);
     let memory_text = normalize_fact_text(&payload.textual_content);
@@ -1443,7 +1360,7 @@ fn build_session_router_update_from_payload(
     payload: &IngestPayload,
     kind: MemoryKind,
 ) -> Option<SessionRouterRecord> {
-    let session_id = session_id_from_memory_id(&payload.memory_id)?;
+    let session_id = payload_session(payload)?;
     let document_time_ms = extract_document_time_ms(&payload.textual_content, payload.timestamp);
     let session_date = extract_bracketed_header_value(&payload.textual_content, "Session Date")
         .unwrap_or_else(|| "unknown".to_string());
@@ -1517,381 +1434,6 @@ fn truncate_router_value(text: &str, max_chars: usize) -> String {
     } else {
         text.chars().take(max_chars).collect::<String>().trim().to_string()
     }
-}
-
-fn build_memory_artifact_from_payload(
-    payload: &IngestPayload,
-    artifact_type: &str,
-    compiler_name: &str,
-    index_namespace: Option<&str>,
-    embedding_dim: Option<usize>,
-    lifecycle: &LifecycleMetadata,
-) -> MemoryArtifact {
-    let source_session_id = session_id_from_memory_id(&payload.memory_id).unwrap_or_default();
-    MemoryArtifact {
-        artifact_id: format!("artifact::{}::{}", artifact_type, payload.memory_id),
-        artifact_type: artifact_type.to_string(),
-        entity_id: payload.entity_id.clone(),
-        source_turn_ids: vec![payload.memory_id.clone()],
-        source_memory_ids: vec![payload.memory_id.clone()],
-        source_session_ids: if source_session_id.is_empty() {
-            Vec::new()
-        } else {
-            vec![source_session_id]
-        },
-        compiler_name: compiler_name.to_string(),
-        compiler_version: "v2.0.0".to_string(),
-        embedding_model: index_namespace.map(|_| "runtime-default".to_string()),
-        embedding_dim,
-        index_namespace: index_namespace.map(|value| value.to_string()),
-        lifecycle: Some(lifecycle.clone()),
-        created_at_ms: payload.timestamp,
-        updated_at_ms: payload.timestamp,
-    }
-}
-
-fn build_temporal_event_from_payload(
-    payload: &IngestPayload,
-    kind: MemoryKind,
-    lifecycle: &LifecycleMetadata,
-) -> Option<TemporalEvent> {
-    let lower = payload.textual_content.to_ascii_lowercase();
-    let document_time_ms = extract_document_time_ms(&payload.textual_content, payload.timestamp);
-    let event_time_ms = extract_event_time_ms(&payload.textual_content, document_time_ms);
-    let has_event_verb = [
-        "went",
-        "visited",
-        "watched",
-        "joined",
-        "started",
-        "finished",
-        "won",
-        "bought",
-        "adopted",
-        "met",
-        "moved",
-        "traveled",
-        "played",
-        "attended",
-        "volunteered",
-        "made",
-        "built",
-        "read",
-        "studied",
-        "worked",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle));
-    if event_time_ms.is_none()
-        && extract_temporal_terms(&payload.textual_content).is_empty()
-        && !has_event_verb
-        && !matches!(kind, MemoryKind::SessionSummary)
-    {
-        return None;
-    }
-    let source_session_id = session_id_from_memory_id(&payload.memory_id).unwrap_or_default();
-    let people = extract_named_phrases(std::slice::from_ref(&payload.textual_content));
-    let terms = extract_salient_terms(&payload.textual_content, 8);
-    let relation = infer_event_relation(&lower, &terms);
-    let event_type = relation.clone();
-    Some(TemporalEvent {
-        event_id: format!("event::{}", payload.memory_id),
-        entity_id: payload.entity_id.clone(),
-        source_session_id,
-        source_memory_id: payload.memory_id.clone(),
-        source_turn_index: turn_index_from_memory_id(&payload.memory_id),
-        subject: people.first().cloned().unwrap_or_else(|| payload.entity_id.clone()),
-        relation,
-        object: terms.first().cloned(),
-        participants: people.clone(),
-        place: infer_place_hint(&payload.textual_content),
-        document_time_ms,
-        event_time_ms,
-        event_time_range_ms: event_time_ms.map(|ts| (ts, ts)),
-        event_time_granularity: if event_time_ms.is_some() {
-            "day_or_document".to_string()
-        } else {
-            "conversation".to_string()
-        },
-        actor_entities: people.clone(),
-        object_entities: terms.clone(),
-        event_type,
-        is_inferred_time: event_time_ms.is_none(),
-        event_text: truncate_router_value(&normalize_fact_text(&payload.textual_content), 420),
-        confidence: if event_time_ms.is_some() { 0.86 } else { 0.68 },
-        lifecycle: Some(lifecycle.clone()),
-        created_at_ms: payload.timestamp,
-    })
-}
-
-fn build_shadow_questions_from_payload(
-    payload: &IngestPayload,
-    kind: MemoryKind,
-) -> Vec<ShadowQuestion> {
-    let source_session_id = session_id_from_memory_id(&payload.memory_id).unwrap_or_default();
-    let people = extract_named_phrases(std::slice::from_ref(&payload.textual_content));
-    let subject = people.first().cloned().unwrap_or_else(|| payload.entity_id.clone());
-    let terms = extract_salient_terms(&payload.textual_content, 6);
-    let lower = payload.textual_content.to_ascii_lowercase();
-    let answer_type = infer_shadow_answer_type(kind, &lower);
-    let mut questions = Vec::new();
-    let mut push_question = |question: String| {
-        if question.trim().len() < 12 {
-            return;
-        }
-        if questions.iter().any(|existing: &ShadowQuestion| existing.question_text == question) {
-            return;
-        }
-        let idx = questions.len();
-        questions.push(ShadowQuestion {
-            shadow_id: format!("shadow::{}::{idx}", payload.memory_id),
-            entity_id: payload.entity_id.clone(),
-            source_session_id: source_session_id.clone(),
-            source_memory_id: payload.memory_id.clone(),
-            source_card_id: None,
-            question_text: question,
-            answer_type: answer_type.clone(),
-            entities: people.clone(),
-            facets: terms.clone(),
-            confidence: 0.74,
-            created_at_ms: payload.timestamp,
-        });
-    };
-
-    push_question(format!("What did {subject} mention?"));
-    push_question(format!("What happened with {subject}?"));
-    if lower.contains("favorite")
-        || lower.contains("likes")
-        || lower.contains("loves")
-        || lower.contains("enjoys")
-    {
-        push_question(format!("What does {subject} like?"));
-        push_question(format!("What is {subject}'s preference?"));
-        if let Some(term) = terms.first() {
-            push_question(format!("What does {subject} like about {term}?"));
-        }
-    }
-    if lower.contains("when") || !extract_temporal_terms(&payload.textual_content).is_empty() {
-        push_question(format!("When did this happen with {subject}?"));
-        push_question(format!("What happened on this date involving {subject}?"));
-    }
-    if lower.contains("where") || lower.contains("visited") || lower.contains("went") {
-        push_question(format!("Where did {subject} go?"));
-    }
-    if lower.contains("dog")
-        || lower.contains("dogs")
-        || lower.contains("pet")
-        || lower.contains("pets")
-        || lower.contains("pup")
-        || lower.contains("puppy")
-    {
-        push_question(format!("What pets does {subject} have?"));
-        push_question(format!("How many dogs does {subject} have?"));
-        push_question(format!("What does {subject} say about their pets?"));
-        push_question(format!("What does {subject} view their pets as?"));
-    }
-    if lower.contains("child") || lower.contains("children") || lower.contains("kid") {
-        push_question(format!("What do {subject}'s kids like?"));
-        push_question(format!("How many children does {subject} have?"));
-    }
-    if lower.contains("bought")
-        || lower.contains("buy")
-        || lower.contains("made")
-        || lower.contains("built")
-        || lower.contains("created")
-    {
-        push_question(format!("What did {subject} buy or make?"));
-        push_question(format!("What items did {subject} get?"));
-    }
-    if lower.contains("career") || lower.contains("job") || lower.contains("pursue") {
-        push_question(format!("What career could {subject} pursue?"));
-        push_question(format!("What job might {subject} pursue in the future?"));
-    }
-    if lower.contains("class") || lower.contains("course") || lower.contains("workshop") {
-        push_question(format!("What classes has {subject} joined?"));
-        push_question(format!("What workshop did {subject} attend?"));
-    }
-    if lower.contains("decided") || matches!(kind, MemoryKind::Decision) {
-        push_question(format!("What did {subject} decide?"));
-    }
-    if matches!(kind, MemoryKind::Fact | MemoryKind::Preference | MemoryKind::Decision) {
-        push_question(format!("What fact is known about {subject}?"));
-    }
-    questions.into_iter().take(12).collect()
-}
-
-fn build_facet_postings_from_payload(
-    payload: &IngestPayload,
-    kind: MemoryKind,
-) -> Vec<FacetPosting> {
-    let Some(session_id) = session_id_from_memory_id(&payload.memory_id) else {
-        return Vec::new();
-    };
-    let mut postings = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    let people = extract_named_phrases(std::slice::from_ref(&payload.textual_content));
-    let terms = extract_salient_terms(&payload.textual_content, 12);
-    let lower = payload.textual_content.to_ascii_lowercase();
-    let mut push = |facet_type: &str, facet_value: String, weight: f32| {
-        let value = facet_value.trim().to_ascii_lowercase();
-        if value.len() < 2 {
-            return;
-        }
-        let key = format!("{facet_type}:{value}:{}", payload.memory_id);
-        if !seen.insert(key) {
-            return;
-        }
-        postings.push(FacetPosting {
-            entity_id: payload.entity_id.clone(),
-            facet_type: facet_type.to_string(),
-            facet_value: value,
-            target_id: format!("facet::{}::{}::{}", facet_type, payload.memory_id, postings.len()),
-            target_type: "memory".to_string(),
-            session_id: session_id.clone(),
-            memory_id: Some(payload.memory_id.clone()),
-            card_id: None,
-            event_id: None,
-            turn_id: Some(payload.memory_id.clone()),
-            weight,
-        });
-    };
-    for person in people {
-        push("person", person, 0.95);
-    }
-    for term in terms {
-        push("activity", term, 0.58);
-    }
-    if matches!(kind, MemoryKind::Preference)
-        || lower.contains("favorite")
-        || lower.contains("prefers")
-    {
-        push("preference", normalize_fact_text(&payload.textual_content), 0.88);
-    }
-    if matches!(kind, MemoryKind::Decision) || lower.contains("decided") {
-        push("decision", normalize_fact_text(&payload.textual_content), 0.82);
-    }
-    if lower.contains("how many") || lower.contains("number") || lower.contains("count") {
-        push("number", normalize_fact_text(&payload.textual_content), 0.70);
-    }
-    for term in extract_temporal_terms(&payload.textual_content) {
-        push("date", term, 0.78);
-    }
-    postings
-}
-
-fn build_mem_cell_from_payload(
-    payload: &IngestPayload,
-    kind: MemoryKind,
-    lifecycle: &LifecycleMetadata,
-) -> Option<MemCell> {
-    let source_session_id = session_id_from_memory_id(&payload.memory_id)?;
-    let text = truncate_router_value(&normalize_fact_text(&payload.textual_content), 420);
-    if text.is_empty() {
-        return None;
-    }
-    let people = extract_named_phrases(std::slice::from_ref(&payload.textual_content));
-    let terms = extract_salient_terms(&payload.textual_content, 8);
-    let document_time_ms = extract_document_time_ms(&payload.textual_content, payload.timestamp);
-    Some(MemCell {
-        cell_id: format!("cell::{}", payload.memory_id),
-        entity_id: payload.entity_id.clone(),
-        source_session_id,
-        source_turn_ids: vec![payload.memory_id.clone()],
-        cell_text: text,
-        cell_type: card_type_for_kind(kind, &payload.textual_content),
-        subjects: people.clone(),
-        objects: terms.clone(),
-        activities: terms,
-        places: infer_place_hint(&payload.textual_content).into_iter().collect(),
-        document_time_ms,
-        event_time_ms: extract_event_time_ms(&payload.textual_content, document_time_ms),
-        confidence: 0.78,
-        saliency: compute_memory_saliency(&payload.textual_content, kind),
-        lifecycle: Some(lifecycle.clone()),
-        created_at_ms: payload.timestamp,
-    })
-}
-
-fn build_mem_scene_from_payload(
-    payload: &IngestPayload,
-    kind: MemoryKind,
-    lifecycle: &LifecycleMetadata,
-) -> Option<MemSceneRecord> {
-    let source_session_id = session_id_from_memory_id(&payload.memory_id)?;
-    let terms = extract_salient_terms(&payload.textual_content, 8);
-    let people = extract_named_phrases(std::slice::from_ref(&payload.textual_content));
-    if terms.is_empty() && people.is_empty() {
-        return None;
-    }
-    let scene_key = terms.iter().take(3).cloned().collect::<Vec<_>>().join("_").replace(' ', "_");
-    Some(MemSceneRecord {
-        scene_id: format!(
-            "scene::{}::{}",
-            source_session_id,
-            if scene_key.is_empty() { "general" } else { scene_key.as_str() }
-        ),
-        entity_id: payload.entity_id.clone(),
-        scene_title: if terms.is_empty() {
-            format!("{} session context", source_session_id)
-        } else {
-            terms.iter().take(4).cloned().collect::<Vec<_>>().join(" / ")
-        },
-        scene_summary: truncate_router_value(&normalize_fact_text(&payload.textual_content), 520),
-        source_cell_ids: vec![format!("cell::{}", payload.memory_id)],
-        source_session_ids: vec![source_session_id],
-        entities: people,
-        activities: terms.clone(),
-        objects: terms,
-        places: infer_place_hint(&payload.textual_content).into_iter().collect(),
-        time_range_ms: Some((payload.timestamp, payload.timestamp)),
-        scene_type: card_type_for_kind(kind, &payload.textual_content),
-        saliency: compute_memory_saliency(&payload.textual_content, kind),
-        lifecycle: Some(lifecycle.clone()),
-        created_at_ms: payload.timestamp,
-        updated_at_ms: payload.timestamp,
-    })
-}
-
-fn build_profile_fact_from_payload(
-    payload: &IngestPayload,
-    kind: MemoryKind,
-    lifecycle: &LifecycleMetadata,
-) -> Option<ProfileFact> {
-    let lower = payload.textual_content.to_ascii_lowercase();
-    let category = if matches!(kind, MemoryKind::Preference)
-        || lower.contains("favorite")
-        || lower.contains("prefers")
-        || lower.contains("likes")
-        || lower.contains("loves")
-    {
-        "durable_preference"
-    } else if matches!(kind, MemoryKind::Decision) || lower.contains("decided") {
-        "decision"
-    } else if lower.contains("works at") || lower.contains("job") || lower.contains("occupation") {
-        "occupation"
-    } else if lower.contains("family") || lower.contains("spouse") || lower.contains("children") {
-        "relationship"
-    } else if lower.contains("allergy") || lower.contains("health") {
-        "health_constraint"
-    } else if matches!(kind, MemoryKind::Fact) {
-        "stable_fact"
-    } else {
-        return None;
-    };
-    Some(ProfileFact {
-        profile_fact_id: format!("profile_fact::{}", payload.memory_id),
-        entity_id: payload.entity_id.clone(),
-        category: category.to_string(),
-        value: truncate_router_value(&normalize_fact_text(&payload.textual_content), 360),
-        source_session_id: session_id_from_memory_id(&payload.memory_id).unwrap_or_default(),
-        source_memory_id: payload.memory_id.clone(),
-        source_card_id: Some(payload.memory_id.clone()),
-        confidence: 0.78,
-        document_time_ms: extract_document_time_ms(&payload.textual_content, payload.timestamp),
-        is_latest: true,
-        lifecycle: Some(lifecycle.clone()),
-        created_at_ms: payload.timestamp,
-    })
 }
 
 fn infer_event_relation(lower: &str, terms: &[String]) -> String {
@@ -1999,138 +1541,6 @@ fn compute_memory_saliency(text: &str, kind: MemoryKind) -> f32 {
     score.min(1.0)
 }
 
-fn mine_hard_negative_profiles(
-    state: &EngineState,
-    tenant: &TenantStore,
-    records: &[MiningRecord],
-) -> Result<EmbeddingPairSet, StatusCode> {
-    let results: Vec<MiningResult> = records
-        .par_iter()
-        .map(|record| -> MiningResult {
-            let raw_hits = ok_or_500(state.vector_index.search(
-                Some(&record.entity_id),
-                &record.embedding,
-                16,
-            ))?;
-            let current_session = session_id_from_memory_id(&record.memory_id);
-            let vector_ids: Vec<u64> = raw_hits.iter().map(|(vid, _)| *vid).collect();
-            let looked_up = ok_or_500(tenant.lookup_by_vector_ids_batch(&vector_ids))?;
-
-            let mut candidate_scores: std::collections::HashMap<String, f32> =
-                std::collections::HashMap::new();
-            let mut candidate_keys: std::collections::HashMap<String, u64> =
-                std::collections::HashMap::new();
-            for ((_, dist), maybe_lookup) in raw_hits.iter().zip(looked_up.into_iter()) {
-                let Some((ts, candidate_mid)) = maybe_lookup else {
-                    continue;
-                };
-                if candidate_mid == record.memory_id {
-                    continue;
-                }
-                if let (Some(a), Some(b)) =
-                    (current_session.as_ref(), session_id_from_memory_id(&candidate_mid).as_ref())
-                {
-                    if a == b {
-                        continue;
-                    }
-                }
-                let similarity = (1.0 - *dist).clamp(0.0, 1.0);
-                if !(0.76..=0.97).contains(&similarity) {
-                    continue;
-                }
-                candidate_keys.entry(candidate_mid.clone()).or_insert(ts);
-                *candidate_scores.entry(candidate_mid).or_insert(0.0) += similarity * 0.75;
-            }
-
-            let fts_hits = tenant
-                .fts_search(&record.textual_content, 8, Some(&record.entity_id))
-                .unwrap_or_default();
-            for (rank, (memory_id, lexical_score)) in fts_hits.into_iter().enumerate() {
-                if memory_id == record.memory_id {
-                    continue;
-                }
-                if let (Some(a), Some(b)) =
-                    (current_session.as_ref(), session_id_from_memory_id(&memory_id).as_ref())
-                {
-                    if a == b {
-                        continue;
-                    }
-                }
-                if let Some((ts, _)) = tenant.lookup_by_memory_id(&memory_id).unwrap_or(None) {
-                    candidate_keys.entry(memory_id.clone()).or_insert(ts);
-                    *candidate_scores.entry(memory_id).or_insert(0.0) +=
-                        lexical_score.min(1.5) / 1.5 * 0.25 - rank as f32 * 0.01;
-                }
-            }
-
-            if candidate_scores.is_empty() {
-                return Ok(None);
-            }
-
-            let mut ranked_candidates = candidate_scores.into_iter().collect::<Vec<_>>();
-            ranked_candidates
-                .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            ranked_candidates.truncate(4);
-
-            let obs_keys: Vec<(u64, String)> = ranked_candidates
-                .iter()
-                .filter_map(|(memory_id, _)| {
-                    candidate_keys.get(memory_id).map(|ts| (*ts, memory_id.clone()))
-                })
-                .collect();
-            let observations = ok_or_500(tenant.get_observations_batch(&obs_keys))?;
-
-            let mut hard_negatives = Vec::new();
-            for (memory_id, _) in ranked_candidates {
-                if let Some(obs) = observations.get(&memory_id) {
-                    if obs.embedding.len() == record.embedding.len() && !obs.embedding.is_empty() {
-                        hard_negatives.push(obs.embedding.clone());
-                    }
-                }
-            }
-            if hard_negatives.is_empty() {
-                return Ok(None);
-            }
-
-            let mut centroid = vec![0.0f32; record.embedding.len()];
-            for negative in &hard_negatives {
-                for (c, value) in centroid.iter_mut().zip(negative.iter()) {
-                    *c += *value;
-                }
-            }
-            let inv = 1.0 / hard_negatives.len() as f32;
-            for value in &mut centroid {
-                *value *= inv;
-            }
-
-            let mut disambiguation = Vec::with_capacity(record.embedding.len());
-            for (cur, neg) in record.embedding.iter().zip(centroid.iter()) {
-                disambiguation.push(cur - neg);
-            }
-            let norm = disambiguation.iter().map(|value| value * value).sum::<f32>().sqrt();
-            if norm <= 1e-6 {
-                return Ok(None);
-            }
-            for value in &mut disambiguation {
-                *value /= norm;
-            }
-
-            Ok(Some((record.memory_id.clone(), centroid, disambiguation)))
-        })
-        .collect();
-
-    let mut disambiguation_batch = Vec::new();
-    let mut negative_centroid_batch = Vec::new();
-    for result in results {
-        let Some((mid, centroid, disambiguation)) = result? else {
-            continue;
-        };
-        negative_centroid_batch.push((mid.clone(), centroid));
-        disambiguation_batch.push((mid, disambiguation));
-    }
-    Ok((disambiguation_batch, negative_centroid_batch))
-}
-
 fn build_retrospective_links(
     state: &EngineState,
     tenant: &TenantStore,
@@ -2166,7 +1576,9 @@ fn build_retrospective_links(
         }
 
         let query_embedding = ok_or_500(state.semantic.generate_query_embedding(reference_query))?;
-        let ann_hits = ok_or_500(state.vector_index.search(Some(entity_id), &query_embedding, 10))?;
+        let ann_hits = ok_or_500(
+            tenant.vectors().and_then(|v| v.search(Some(entity_id), &query_embedding, 10)),
+        )?;
         let ann_ids: Vec<u64> = ann_hits.iter().map(|(vid, _)| *vid).collect();
         let ann_lookup = ok_or_500(tenant.lookup_by_vector_ids_batch(&ann_ids))?;
         for (rank, ((_, dist), maybe_lookup)) in
@@ -2184,7 +1596,9 @@ fn build_retrospective_links(
         }
 
         let mut ranked = score_by_memory.into_iter().collect::<Vec<_>>();
-        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        ranked.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(&b.0))
+        });
 
         if let Some((target_memory_id, score)) = ranked.into_iter().find(|(memory_id, _)| {
             timestamp_by_memory
@@ -2264,62 +1678,65 @@ fn classify_retrospective_link(
     ("recalls", "recalled_by")
 }
 
-fn spawn_consolidation_tasks(tenant: Arc<TenantStore>, tasks: Vec<ConsolidationTask>) {
-    for task in tasks {
-        let tenant_clone = tenant.clone();
-        tokio::task::spawn_blocking(move || {
-            update_core_profile_heuristic(&tenant_clone, &task);
-        });
-    }
-}
-
-fn update_core_profile_heuristic(tenant: &TenantStore, task: &ConsolidationTask) {
-    let excerpt = truncate_router_value(&normalize_fact_text(&task.textual_content), 280);
-    if excerpt.is_empty() {
+pub(crate) fn spawn_consolidation_tasks(tenant: Arc<TenantStore>, tasks: Vec<ConsolidationTask>) {
+    if tasks.is_empty() {
         return;
     }
-
-    let mut profile = tenant
-        .get_core_profile(&task.entity_id)
-        .ok()
-        .flatten()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        .unwrap_or_else(|| {
-            serde_json::json!({
-                "schema": "heuristic_core_profile_v1",
-                "entity_id": task.entity_id,
-                "facts": [],
-                "updated_at_ms": task.timestamp
-            })
-        });
-
-    let fact = serde_json::json!({
-        "memory_id": task.memory_id,
-        "timestamp_ms": task.timestamp,
-        "text": excerpt,
-        "terms": extract_salient_terms(&task.textual_content, 6)
+    // One blocking task per batch; each profile update is its own transaction.
+    tokio::task::spawn_blocking(move || {
+        for task in &tasks {
+            if let Err(err) = update_core_profile_heuristic(&tenant, task) {
+                tracing::warn!(entity_id = %task.entity_id, error = ?err, "core profile update failed");
+            }
+        }
     });
+}
 
-    if let Some(facts) = profile.get_mut("facts").and_then(|v| v.as_array_mut()) {
-        let seen = facts.iter().any(|item| {
-            item.get("memory_id")
-                .and_then(|v| v.as_str())
-                .map(|memory_id| memory_id == task.memory_id)
-                .unwrap_or(false)
-        });
-        if !seen {
-            facts.push(fact);
-        }
-        if facts.len() > 24 {
-            let drain_to = facts.len() - 24;
-            facts.drain(0..drain_to);
-        }
+/// Keeps the most recent facts per entity, ordered by fact time. Replaced
+/// facts are filtered when the profile is read (`current_core_profile`),
+/// because supersession may be recorded after this update runs.
+fn update_core_profile_heuristic(
+    tenant: &TenantStore,
+    task: &ConsolidationTask,
+) -> anyhow::Result<()> {
+    const MAX_PROFILE_FACTS: usize = 24;
+    let excerpt = truncate_router_value(&normalize_fact_text(&task.textual_content), 280);
+    if excerpt.is_empty() {
+        return Ok(());
     }
-    profile["updated_at_ms"] = serde_json::json!(task.timestamp);
-
-    if let Ok(serialized) = serde_json::to_string(&profile) {
-        let _ = tenant.set_core_profile(&task.entity_id, &serialized);
-    }
+    tenant.update_core_profile(&task.entity_id, |current| {
+        let mut profile = current
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .unwrap_or_else(|| {
+                serde_json::json!({
+                    "schema": "heuristic_core_profile_v1",
+                    "entity_id": task.entity_id,
+                    "facts": [],
+                    "updated_at_ms": task.timestamp
+                })
+            });
+        let facts = profile.get_mut("facts")?.as_array_mut()?;
+        let already = facts
+            .iter()
+            .any(|item| item.get("memory_id").and_then(|v| v.as_str()) == Some(&task.memory_id));
+        if already {
+            return None;
+        }
+        facts.push(serde_json::json!({
+            "memory_id": task.memory_id,
+            "timestamp_ms": task.timestamp,
+            "text": excerpt,
+            "terms": extract_salient_terms(&task.textual_content, 6)
+        }));
+        // Keep the newest facts by fact time, not by arrival order.
+        facts.sort_by_key(|f| std::cmp::Reverse(f.get("timestamp_ms").and_then(|t| t.as_u64())));
+        facts.truncate(MAX_PROFILE_FACTS);
+        let latest = facts.first().and_then(|f| f.get("timestamp_ms")).cloned();
+        if let Some(latest) = latest {
+            profile["updated_at_ms"] = latest;
+        }
+        serde_json::to_string(&profile).ok()
+    })
 }
 
 async fn execute_ingest_pipeline(
@@ -2336,35 +1753,69 @@ async fn execute_ingest_pipeline(
 
     diag.input_count = payloads.len();
 
+    // Numeric memory is extracted from the memories as sent, not from chunks
+    // or derived companions (which restate the same numbers).
+    let metric_sources: Vec<(String, String, u64, String)> = payloads
+        .iter()
+        .filter(|p| p.kind.as_deref() != Some("synthetic_query"))
+        .filter(|_| crate::features::enabled(Feature::Metrics))
+        .map(|p| (p.entity_id.clone(), p.memory_id.clone(), p.timestamp, p.textual_content.clone()))
+        .collect();
+
     // Phase 1: Payload preparation
-    let (mut expanded_payloads, nlp_cache, mut enriched_texts) =
+    let (mut expanded_payloads, mut enriched_texts) =
         expand_and_enrich_payloads(payloads, &mut diag, total_start);
 
-    // Content-hash dedup: skip payloads with the same content, entity_id, and kind.
-    // This runs before embedding, so it saves both compute and storage.
+    // Embedding text: `legacy` keeps the batch-neighbour header built above;
+    // `turn` / `context` build text from the turn itself (and stored
+    // neighbouring turns), independent of how requests are batched.
+    let embed_config = crate::api::ingest::embed_text::embed_text_config();
+    let mut neighbour_updates = Vec::new();
+    if embed_config.mode != crate::api::ingest::embed_text::EmbedTextMode::Legacy {
+        let (tenant_for_text, payloads_for_text) = (tenant.clone(), expanded_payloads.clone());
+        let built = tokio::task::spawn_blocking(move || {
+            crate::api::ingest::embed_text::build_embed_texts(
+                &tenant_for_text,
+                &payloads_for_text,
+                embed_config,
+            )
+        })
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|r| r)
+        .map_err(|err| {
+            tracing::error!(error = ?err, "building embedding texts failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        enriched_texts = built.texts;
+        neighbour_updates = built.neighbour_updates;
+    }
+
+    // Skip re-sends: a memory id already stored with identical content. (The
+    // previous check matched content alone, dropping distinct memories that
+    // repeat earlier text, e.g. the same statement on another day.)
     {
         let stage_start = Instant::now();
-        let hashes: Vec<String> = expanded_payloads
+        let ids: Vec<String> = expanded_payloads.iter().map(|p| p.memory_id.clone()).collect();
+        let stored = tenant.stored_content_hashes(&ids).map_err(|err| {
+            tracing::error!(error = ?err, "content hash lookup failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        let keep: Vec<bool> = expanded_payloads
             .iter()
-            .zip(enriched_texts.iter())
-            .map(|(payload, text)| {
-                let kind_str = payload.kind.as_deref().unwrap_or("memory");
-                content_hash(text, &payload.entity_id, kind_str)
+            .map(|p| {
+                let hash = content_hash(
+                    &p.textual_content,
+                    &p.entity_id,
+                    &format!("{:?}", parse_kind(p.kind.as_deref())),
+                );
+                stored.get(&p.memory_id) != Some(&hash)
             })
             .collect();
-
-        let existing = tenant.existing_content_hashes(&hashes).unwrap_or_default();
-
-        let mut keep_idx = Vec::with_capacity(expanded_payloads.len());
-        for (i, h) in hashes.iter().enumerate() {
-            if !existing.contains(h) {
-                keep_idx.push(i);
-            }
-        }
-
-        expanded_payloads = keep_idx.iter().map(|&i| expanded_payloads[i].clone()).collect();
-        enriched_texts = keep_idx.iter().map(|&i| enriched_texts[i].clone()).collect();
-
+        let mut kept = keep.iter();
+        expanded_payloads.retain(|_| *kept.next().expect("aligned"));
+        let mut kept = keep.iter();
+        enriched_texts.retain(|_| *kept.next().expect("aligned"));
         diag.dedup_build_ms += stage_start.elapsed().as_millis() as u64;
     }
 
@@ -2372,11 +1823,10 @@ async fn execute_ingest_pipeline(
     let semantic_embeddings =
         generate_embeddings(state, &expanded_payloads, &enriched_texts, &mut diag).await?;
 
-    tracing::info!("[CP] embed_done: μs={}", total_start.elapsed().as_micros());
+    tracing::debug!("[CP] embed_done: μs={}", total_start.elapsed().as_micros());
 
     // Phase 3: Dedup + observation building
-    let (prepared, mining_records) =
-        build_observations(state, expanded_payloads, semantic_embeddings, &mut diag)?;
+    let prepared = build_observations(tenant, expanded_payloads, semantic_embeddings, &mut diag)?;
 
     let batch_items: Vec<(u64, String, AgentObservation)> = prepared
         .iter()
@@ -2385,7 +1835,7 @@ async fn execute_ingest_pipeline(
         })
         .collect();
 
-    tracing::info!("[CP] dedup_done: μs={}", total_start.elapsed().as_micros());
+    tracing::debug!("[CP] dedup_done: μs={}", total_start.elapsed().as_micros());
 
     let stage_start = Instant::now();
     let inserted_flags = tenant.insert_observations_batch(&batch_items).map_err(|e| {
@@ -2394,18 +1844,69 @@ async fn execute_ingest_pipeline(
     })?;
     (diag.storage_ms, diag.storage_us) = elapsed_ms_and_us(stage_start);
 
-    // Analytics processing disabled — it consumed 600-2000ms per batch
-    // running BERT NER + writing metrics never used in retrieval.
-    diag.analytics_ms = 0;
-
     // Phase 4: Artifact building
     let mut batches = build_artifacts(prepared, inserted_flags, &mut diag);
 
     // Phase 5: Storage commit
-    commit_batches(tenant, state, &nlp_cache, &mining_records, &mut batches, &mut diag).await?;
+    commit_batches(tenant, state, &mut batches, &mut diag).await?;
+
+    // Stored neighbours whose context window changed get re-embedded.
+    if !neighbour_updates.is_empty() {
+        let (ids, texts): (Vec<String>, Vec<String>) = neighbour_updates.into_iter().unzip();
+        diag.count("context_reembeds", texts.len());
+        diag.embedded_count += texts.len();
+        let embeddings = state.semantic.embed_texts_async(texts).await.map_err(|err| {
+            tracing::error!(error = ?err, "neighbour re-embedding failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        let tenant = tenant.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let applied =
+                tenant.update_embeddings(&ids.into_iter().zip(embeddings).collect::<Vec<_>>())?;
+            let vectors = tenant.vectors()?;
+            let mut by_entity: std::collections::HashMap<String, Vec<(u64, Vec<f32>)>> =
+                std::collections::HashMap::new();
+            for (vector_id, entity_id, embedding) in applied {
+                by_entity.entry(entity_id).or_default().push((vector_id, embedding));
+            }
+            for (entity_id, items) in by_entity {
+                vectors.insert_batch(&entity_id, &items)?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|r| r)
+        .map_err(|err| {
+            tracing::error!(error = ?err, "neighbour vector update failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    }
+
+    // Phase 6: Numeric memory
+    let stage_start = Instant::now();
+    tokio::task::spawn_blocking({
+        let (analytics, tenant) = (state.analytics.clone(), tenant.clone());
+        move || -> anyhow::Result<()> {
+            for (entity_id, memory_id, timestamp, text) in &metric_sources {
+                analytics.record_memory(&tenant, entity_id, memory_id, *timestamp, text)?;
+            }
+            Ok(())
+        }
+    })
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(|r| r)
+    .map_err(|err| {
+        tracing::error!(error = ?err, "metric extraction failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    (diag.analytics_ms, diag.analytics_us) = elapsed_ms_and_us(stage_start);
 
     (diag.total_ms, diag.total_us) = elapsed_ms_and_us(total_start);
-    tracing::info!("[CP] final: μs={}", total_start.elapsed().as_micros());
-    diag.log_table();
+    tracing::debug!("[CP] final: μs={}", total_start.elapsed().as_micros());
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        diag.log_table();
+    }
     Ok((batches.consolidation_tasks, diag))
 }
