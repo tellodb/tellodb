@@ -4,17 +4,20 @@
 //!
 //! - `rules` (default): the pattern rules in [`crate::api::ingest::fact`].
 //!   Cheap, and the only tier that needs no model.
-//! - `encoder`: a span/relation extraction encoder (GLiNER-style) run through
-//!   ONNX Runtime. Not implemented — selecting it is an explicit error rather
-//!   than a silent fall back to rules, so an evaluation can never attribute
-//!   rule results to the encoder.
+//! - `encoder`: GLiNER span extraction through ONNX Runtime
+//!   ([`crate::gliner`]). The label set is the fact schema: each label is a
+//!   slot, and the marked span is that slot's value. Because the value is a
+//!   span rather than the whole sentence, restatements of one value compare
+//!   equal and merge into evidence, which sentence-level rule objects cannot
+//!   do.
 //!
 //! No generative model is involved in either tier.
 
 use crate::api::ingest::fact::{
     infer_fact_key, is_high_signal_atomic_claim, preference_signal_strength, split_atomic_claims,
 };
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
+use std::sync::{Arc, OnceLock};
 
 /// What the extractor knows about the memory it is reading.
 pub struct ExtractCtx<'a> {
@@ -115,16 +118,120 @@ impl Extractor for RuleExtractor {
     }
 }
 
-/// The extractor named by `TELLODB_EXTRACTOR` (`rules`, the default).
-pub fn active_extractor() -> Result<Box<dyn Extractor>> {
-    match std::env::var("TELLODB_EXTRACTOR").unwrap_or_default().trim() {
-        "" | "rules" => Ok(Box::new(RuleExtractor::default())),
-        "encoder" => bail!(
-            "TELLODB_EXTRACTOR=encoder is not implemented yet (no encoder model is bundled); \
-             use `rules`"
-        ),
-        other => bail!("unknown TELLODB_EXTRACTOR '{other}' (rules)"),
+/// Slots the encoder tier fills when `TELLODB_EXTRACTOR_LABELS` is unset.
+///
+/// Deliberately generic person attributes: the label set is a schema choice,
+/// and labels written against particular benchmark questions would be the
+/// same contamination the rule tier already has.
+const DEFAULT_LABELS: &str = "city of residence,employer,job title,partner,child,pet,\
+                              favorite thing,hobby,health condition,vehicle,school";
+
+/// Zero-shot span extraction (tier T1). Each label is a fact slot; the span
+/// the model marks is the value.
+pub struct EncoderExtractor {
+    model: crate::gliner::GlinerModel,
+    labels: Vec<String>,
+    threshold: f32,
+}
+
+impl EncoderExtractor {
+    /// Loads the model named by `TELLODB_EXTRACTOR_MODEL_DIR`, with labels
+    /// from `TELLODB_EXTRACTOR_LABELS` and the score floor from
+    /// `TELLODB_EXTRACTOR_THRESHOLD` (default 0.5).
+    pub fn from_env() -> Result<Self> {
+        let dir = std::env::var("TELLODB_EXTRACTOR_MODEL_DIR").map_err(|_| {
+            anyhow::anyhow!(
+                "TELLODB_EXTRACTOR=encoder needs TELLODB_EXTRACTOR_MODEL_DIR pointing at a \
+                 GLiNER export (gliner_config.json, tokenizer.json, onnx/model*.onnx)"
+            )
+        })?;
+        let labels: Vec<String> = std::env::var("TELLODB_EXTRACTOR_LABELS")
+            .unwrap_or_else(|_| DEFAULT_LABELS.to_string())
+            .split(',')
+            .map(|label| label.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|label| !label.is_empty())
+            .collect();
+        if labels.is_empty() {
+            bail!("TELLODB_EXTRACTOR_LABELS is empty");
+        }
+        let threshold = std::env::var("TELLODB_EXTRACTOR_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|v: &f32| v.is_finite() && (0.0..=1.0).contains(v))
+            .unwrap_or(0.5);
+
+        let model = crate::gliner::GlinerModel::load(std::path::Path::new(&dir))
+            .with_context(|| format!("loading extractor model from {dir}"))?;
+        if labels.len() > model.max_types() {
+            bail!("{} labels exceed the model's maximum of {}", labels.len(), model.max_types());
+        }
+        tracing::info!(labels = labels.len(), threshold, "encoder extractor ready");
+        Ok(Self { model, labels, threshold })
     }
+}
+
+/// `city of residence` -> `city_of_residence`, so a label is a fact key.
+fn slug(label: &str) -> String {
+    label
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' })
+        .collect::<String>()
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
+impl Extractor for EncoderExtractor {
+    fn name(&self) -> &'static str {
+        "encoder"
+    }
+
+    fn extract(&self, text: &str, ctx: &ExtractCtx<'_>) -> Vec<ExtractedFact> {
+        let spans = match self.model.predict(text, &self.labels, self.threshold) {
+            Ok(spans) => spans,
+            Err(err) => {
+                // A failed extraction must not fail the ingest; the memory is
+                // still stored and searchable, it just has no facts.
+                tracing::warn!(error = ?err, "encoder extraction failed; storing without facts");
+                return Vec::new();
+            }
+        };
+        let is_preference = preference_signal_strength(text, ctx.relations).is_some();
+        spans
+            .into_iter()
+            .map(|span| ExtractedFact {
+                subject: ctx.entity_id.to_string(),
+                speaker: "memory".to_string(),
+                predicate: Some(span.label.clone()),
+                fact_key: Some(slug(&span.label)),
+                object: span.text,
+                confidence: span.score,
+                is_preference,
+            })
+            .collect()
+    }
+}
+
+static EXTRACTOR: OnceLock<Arc<dyn Extractor>> = OnceLock::new();
+
+/// Builds the extractor named by `TELLODB_EXTRACTOR` (`rules` by default,
+/// or `encoder`). Call once at startup: loading an encoder model is slow and
+/// a bad configuration should fail the process, not every ingest.
+pub fn init_from_env() -> Result<Arc<dyn Extractor>> {
+    let extractor: Arc<dyn Extractor> =
+        match std::env::var("TELLODB_EXTRACTOR").unwrap_or_default().trim() {
+            "" | "rules" => Arc::new(RuleExtractor::default()),
+            "encoder" => Arc::new(EncoderExtractor::from_env()?),
+            other => bail!("unknown TELLODB_EXTRACTOR '{other}' (rules, encoder)"),
+        };
+    Ok(EXTRACTOR.get_or_init(|| extractor).clone())
+}
+
+/// The process-wide extractor, defaulting to rules until `init_from_env` runs
+/// (unit tests and library callers that never configured one).
+pub fn extractor() -> Arc<dyn Extractor> {
+    EXTRACTOR.get_or_init(|| Arc::new(RuleExtractor::default())).clone()
 }
 
 #[cfg(test)]
@@ -172,9 +279,14 @@ mod tests {
     }
 
     #[test]
-    fn extractor_selection_is_explicit() {
-        assert_eq!(active_extractor().unwrap().name(), "rules");
-        // The encoder tier must fail loudly rather than silently run rules.
-        assert!(RuleExtractor::default().name() == "rules");
+    fn labels_become_fact_keys() {
+        assert_eq!(slug("city of residence"), "city_of_residence");
+        assert_eq!(slug("  Job  Title "), "job_title");
+        assert_eq!(slug("favorite thing!"), "favorite_thing");
+    }
+
+    #[test]
+    fn default_extractor_is_rules() {
+        assert_eq!(extractor().name(), "rules");
     }
 }

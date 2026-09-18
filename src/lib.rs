@@ -6,6 +6,7 @@ pub mod engine;
 pub mod extract;
 pub mod features;
 pub mod fts;
+pub mod gliner;
 pub mod graph;
 pub mod lifecycle;
 pub mod mcp_stdio;

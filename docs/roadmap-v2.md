@@ -1,8 +1,8 @@
 # Tellodb engine roadmap v2
 
-Status: WP2, WP3 (tooling), WP4, WP6, WP7 and most of WP8 implemented on
-`feat/wp0-measurement-harness`; see "Implementation status" below. WP1 and WP9
-(GPU runs) are the owner's; WP5 is not started.
+Status: WP2, WP3 (tooling), WP4, WP5 (both extractor tiers), WP6, WP7 and
+most of WP8 implemented and merged to `main`; see "Implementation status"
+below. WP1 and WP9 (GPU runs) are the owner's.
 
 ## Implementation status (2026-09-18, laptop smoke numbers only)
 
@@ -37,6 +37,51 @@ numbers still have to come from the GPU box (WP1, WP9).
   (`x-tm-graph-{links,edges,entities,lookup}-us`). Synthetic: query p50
   115 ms → 10 ms, p95 281 ms → 15 ms, graph stage 107 ms → 3 ms, with
   identical recall and nDCG.
+- **WP5 fact extraction.** `Extractor` trait (`src/extract.rs`) with two
+  tiers, selected by `TELLODB_EXTRACTOR` and initialised at startup so a bad
+  configuration fails the process, not every ingest:
+  - `rules` (default): the existing pattern rules, unchanged.
+  - `encoder`: GLiNER zero-shot span extraction through our existing `ort`
+    (`src/gliner.rs`, `markerV0` spans, first-subtoken pooling), pointed at a
+    model by `TELLODB_EXTRACTOR_MODEL_DIR`. The label set *is* the fact
+    schema — each label is a slot and the marked span is its value — with
+    labels from `TELLODB_EXTRACTOR_LABELS` (generic person attributes by
+    default, deliberately not benchmark-shaped) and a score floor from
+    `TELLODB_EXTRACTOR_THRESHOLD`.
+  Also landed: restatements merge into the version they confirm rather than
+  starting a new one (`fact_evidence`), predicate variants group by embedding
+  similarity (`predicate_canon`, `canonicalize_predicates`), `why_stale` on
+  query results, and `GET /facts/current` / `GET /facts/history` with as-of
+  time travel.
+
+  Measured on 100 generated first-person memories (M2 CPU, gliner_small int8):
+
+  | tier | fact slots | versions | pipeline time | notes |
+  |---|---|---|---|---|
+  | `rules` | 1 | 1 | 222 ms | the one fact extracted is wrong |
+  | `encoder` | 4 | 69 | 978 ms | correct slots and supersession chains |
+
+  Three findings worth carrying into the GPU run:
+  1. **Span objects are what make supersession work.** The rules tier stores
+     whole sentences as fact objects, so `I live in Austin` and `My home city
+     is Austin` land in two different slots (`residence`, `home_city`), both
+     "current", and a later move to Seattle supersedes neither. The encoder
+     stores `Austin` and `Seattle` in one `city_of_residence` slot, so the
+     chain and the evidence merge behave.
+  2. **Ingest overhead misses the budget on CPU**: ~7.6 ms per memory, i.e.
+     222 ms -> 978 ms for 100 memories, well past the ≤25% CPU target. The
+     cause is batch-size-1 inference (one call per memory); batching across
+     an ingest request is the fix.
+  3. **The scores are not calibrated.** `My home city is Austin` scored 0.447
+     against a 0.5 default and was silently dropped. The threshold is a
+     hand-tuned knob, so sweep it — or treat calibration as the open problem
+     it is.
+
+  The graph lane also gets real triples now (`alice | city of residence |
+  Seattle`), though the `Session | summarizes | ...` junk edges from the other
+  derived structures remain; `TELLODB_DISABLE` can now measure whether those
+  still earn their cost.
+
 - **WP6 vector segments.** Per-entity segments loaded lazily from
   `vector_lookup.embedding` (SQLite is the only source of truth: no
   checkpoints, no rebuild path, no global lock), exact SIMD scans up to
@@ -83,12 +128,10 @@ numbers still have to come from the GPU box (WP1, WP9).
 
 **Not done**
 
-- **WP5 fact extraction** (encoder-only tiers, `fact_evidence`, `why_stale`,
-  predicate canonicalization). Not started. Note for the spike: the graph
-  edges today come from parsing derived card text, so their subjects are words
-  like `Session`, `Canonical`, `user` and `assistant` and their objects are
-  whole sentences — which is why disabling `graph_edges` costs no measurable
-  recall. Fixing extraction is what should make the graph worth its cost.
+- **WP5 encoder tier batching.** The encoder runs one GLiNER call per memory
+  (batch size 1), costing ~7.6 ms per memory on CPU. See the WP5 entry above:
+  batching across an ingest request is the obvious fix and is what stands
+  between the tier and the roadmap's ingest-overhead budget.
 - **Workspace crate split** (`tellodb-core` / `-models` / `-server` / `-cli`).
   The library API and CLI exist, but the code still lives in one crate with
   the retrieval pipeline under `api::handlers`; splitting it is a packaging

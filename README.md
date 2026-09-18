@@ -13,6 +13,26 @@ Unlike generic memory APIs that just wrap embeddings and return stale informatio
 - **Evidence-Cited Answers:** Memory responses can include evidence IDs, source snippets, and current/stale status, allowing agents to cite their sources.
 - **Library, server, CLI or MCP:** Embed it in a Rust program, run the HTTP API, drive it from the command line, or plug it into an MCP client over stdio. (An OpenAI-compatible proxy is planned, not built.)
 
+## Setting Up a GPU Box
+
+On a fresh Linux box (Ubuntu 24.04 recommended — 22.04's glibc is too old for
+the ONNX Runtime GPU binaries), one script installs system packages and Rust,
+builds the engine and evaluator, downloads the models and the LongMemEval
+dataset, and verifies that the CUDA execution provider actually loaded:
+
+```bash
+bash scripts/setup_gpu_box.sh
+source .env.tellodb
+```
+
+It is safe to re-run; every step is skipped if already done. `SKIP_DATASETS=1`
+and `SKIP_EXTRACTOR_MODEL=1` skip the two large downloads. The script ends by
+printing the benchmark commands to run next.
+
+If it warns that a GPU is present but the engine reports `device=CPU`, stop:
+the CUDA provider did not load and any numbers you collect would be CPU
+numbers. `tellodb doctor` reports the resolved device at any time.
+
 ## Recommended Local GPU Setup
 
 Tellodb is intended to run locally as a Rust binary. For GPU embedding with ONNX Runtime, use Ubuntu 24.04. Ubuntu 22.04 is not recommended for the ORT GPU provider binaries because its glibc is too old.
@@ -265,6 +285,10 @@ today.
 | `TELLODB_VECTOR_QUANT` | `f32` | Segment precision: `f32`, `f16`, `i8`, `binary` |
 | `TELLODB_FLAT_THRESHOLD` | 20000 | Above this many vectors an entity gets its own HNSW |
 | `TELLODB_DISABLE` | — | Comma-separated derived structures to switch off (ablations) |
+| `TELLODB_EXTRACTOR` | `rules` | Fact extraction tier: `rules` or `encoder` (GLiNER spans) |
+| `TELLODB_EXTRACTOR_MODEL_DIR` | — | GLiNER export directory, required by the `encoder` tier |
+| `TELLODB_EXTRACTOR_LABELS` | generic attributes | Comma-separated fact slots the encoder fills |
+| `TELLODB_EXTRACTOR_THRESHOLD` | 0.5 | Score floor for an extracted span |
 | `TELLODB_MODEL_DIR` | — | Load the embedder from this directory instead of downloading |
 | `TELLODB_EMBEDDING_CACHE_PATH` | data dir | Persistent embedding cache |
 
@@ -292,6 +316,31 @@ curl -sS -X POST http://localhost:3000/platform/signup \
 curl -sS http://localhost:3000/platform/profile \
   -H "Authorization: Bearer <SESSION_TOKEN>"
 ```
+
+## Fact Extraction
+
+Facts drive supersession: each one lands in a slot, and a new value for that
+slot makes the old one stale. Two tiers produce them, neither using a
+generative model:
+
+- **`rules`** (default) — pattern rules over atomic claims. No model, no
+  latency, but it keys facts on whole sentences, so two phrasings of one fact
+  land in different slots and never supersede each other.
+- **`encoder`** — GLiNER zero-shot span extraction through ONNX Runtime. The
+  label set is the schema: each label is a slot, and the span the model marks
+  is that slot's value. Because values are spans (`Austin`, not `I live in
+  Austin`), restatements compare equal and merge into evidence while real
+  changes supersede.
+
+```bash
+export TELLODB_EXTRACTOR=encoder
+export TELLODB_EXTRACTOR_MODEL_DIR=~/.cache/tellodb/models/gliner_small
+export TELLODB_EXTRACTOR_LABELS="city of residence,employer,job title,pet"
+```
+
+The encoder tier costs roughly 8 ms per memory on CPU and is off by default.
+Selecting it without a usable model is an error at startup, never a silent
+fall back to rules. See `docs/roadmap-v2.md` for measurements.
 
 ## Architecture Overview
 - **Storage:** one SQLite database per tenant (WAL), holding memories, facts,

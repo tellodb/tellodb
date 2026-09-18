@@ -26,6 +26,11 @@ pub async fn build_state(paths: &RuntimePaths, auth: api::AuthConfig) -> Result<
         info!(disabled = ?features.disabled_names(), "Ingest structures disabled");
     }
 
+    // Loading an encoder model is slow and a bad configuration should fail the
+    // process rather than every ingest.
+    let extractor = crate::extract::init_from_env()?;
+    info!(extractor = extractor.name(), "Fact extractor");
+
     let cache_path = std::env::var("TELLODB_EMBEDDING_CACHE_PATH")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| paths.embedding_cache().to_path_buf());

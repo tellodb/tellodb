@@ -353,16 +353,13 @@ pub fn is_high_signal_atomic_claim(text: &str) -> bool {
 
 /// Memory cards for the facts an extractor finds in `payload`.
 pub fn build_atomic_memory_card_payloads(payload: &IngestPayload) -> Vec<IngestPayload> {
-    let extractor = crate::extract::RuleExtractor::default();
+    let extractor = crate::extract::extractor();
     let ctx = crate::extract::ExtractCtx {
         entity_id: &payload.entity_id,
         timestamp_ms: payload.timestamp,
         relations: &payload.relations,
     };
-    build_cards_from_facts(
-        payload,
-        &crate::extract::Extractor::extract(&extractor, &payload.textual_content, &ctx),
-    )
+    build_cards_from_facts(payload, &extractor.extract(&payload.textual_content, &ctx))
 }
 
 fn build_cards_from_facts(

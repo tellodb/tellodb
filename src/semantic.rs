@@ -345,6 +345,30 @@ fn parse_reranker_model(name: &str) -> Result<Option<(&'static str, RerankerMode
     }))
 }
 
+/// Execution providers for the selected device, newest first. Shared so every
+/// ONNX model in the process (embedder, reranker, extractor) runs on the same
+/// device.
+pub(crate) fn execution_providers_for(
+    use_gpu: bool,
+    use_coreml: bool,
+) -> Vec<ort::execution_providers::ExecutionProviderDispatch> {
+    let mut eps: Vec<ort::execution_providers::ExecutionProviderDispatch> = Vec::new();
+    if use_gpu {
+        eps.push(CUDA::default().into());
+    } else if use_coreml {
+        #[cfg(target_os = "macos")]
+        eps.push(ort::ep::CoreML::default().into());
+    }
+    let _ = use_coreml;
+    eps
+}
+
+/// The device selected by `TEMPORAL_MEMORY_DEVICE`, as `(use_gpu, use_coreml)`.
+pub(crate) fn selected_device() -> (bool, bool) {
+    let device = std::env::var("TEMPORAL_MEMORY_DEVICE").unwrap_or_default().to_lowercase();
+    (device == "gpu" || device == "cuda", device == "coreml" || device == "mps" || device == "mac")
+}
+
 const BGE_QUERY_INSTRUCTION: &str = "Represent this sentence for searching relevant passages: ";
 
 /// `TELLODB_QUERY_INSTRUCTION`: unset uses the model's recommended instruction
@@ -470,16 +494,7 @@ impl SemanticInference {
             "initialising semantic models"
         );
 
-        let execution_providers = || {
-            let mut eps: Vec<ort::execution_providers::ExecutionProviderDispatch> = Vec::new();
-            if use_gpu {
-                eps.push(CUDA::default().into());
-            } else if use_coreml {
-                #[cfg(target_os = "macos")]
-                eps.push(ort::ep::CoreML::default().into());
-            }
-            eps
-        };
+        let execution_providers = || execution_providers_for(use_gpu, use_coreml);
 
         let local_files = local_model_files()?;
         let mut executors = Vec::with_capacity(n_embed);
