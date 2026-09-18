@@ -1,12 +1,10 @@
-use std::collections::HashSet;
-
 use crate::api::types::IngestPayload;
 use crate::api::utils::{
     extract_named_phrases, extract_temporal_terms, has_token, normalize_alpha_tokens,
     normalize_fact_text, singularize_token,
 };
 
-use super::dialogue::{extract_dialogue_messages, strip_leading_bracketed_prefixes};
+use super::dialogue::strip_leading_bracketed_prefixes;
 
 pub fn is_numericish(token: &str) -> bool {
     !token.is_empty()
@@ -353,86 +351,58 @@ pub fn is_high_signal_atomic_claim(text: &str) -> bool {
     (temporal || named || personal_signal) && relation_like
 }
 
-pub fn build_atomic_memory_card_payloads(
-    payload: &IngestPayload,
-    entity_id: &str,
-    session_id: &str,
-    turn_index: usize,
-) -> Vec<IngestPayload> {
-    let dialogue = extract_dialogue_messages(&payload.textual_content);
-    let source_claims = if dialogue.is_empty() {
-        payload
-            .textual_content
-            .lines()
-            .filter(|line| !line.trim_start().starts_with('['))
-            .map(|line| ("memory".to_string(), line.to_string()))
-            .collect::<Vec<_>>()
-    } else {
-        dialogue
+/// Memory cards for the facts an extractor finds in `payload`.
+pub fn build_atomic_memory_card_payloads(payload: &IngestPayload) -> Vec<IngestPayload> {
+    let extractor = crate::extract::RuleExtractor::default();
+    let ctx = crate::extract::ExtractCtx {
+        entity_id: &payload.entity_id,
+        timestamp_ms: payload.timestamp,
+        relations: &payload.relations,
     };
+    build_cards_from_facts(
+        payload,
+        &crate::extract::Extractor::extract(&extractor, &payload.textual_content, &ctx),
+    )
+}
 
-    let mut cards = Vec::new();
-    let mut seen = HashSet::new();
-    for (speaker, line) in source_claims {
-        for claim in split_atomic_claims(&line) {
-            if !is_high_signal_atomic_claim(&claim) {
-                continue;
-            }
-            let key = format!("{}|{}", speaker.to_ascii_lowercase(), claim.to_ascii_lowercase());
-            if !seen.insert(key) {
-                continue;
-            }
-            let card_idx = cards.len();
-            if card_idx >= 4 {
-                return cards;
-            }
-
-            let card_kind = if preference_signal_strength(&claim, &payload.relations).is_some() {
-                "preference"
+fn build_cards_from_facts(
+    payload: &IngestPayload,
+    facts: &[crate::extract::ExtractedFact],
+) -> Vec<IngestPayload> {
+    facts
+        .iter()
+        .enumerate()
+        .map(|(card_idx, fact)| {
+            let text = if fact.speaker.eq_ignore_ascii_case("memory") {
+                format!("Atomic memory card: {}", fact.object)
             } else {
-                "fact"
+                format!("Atomic memory card: {} said {}", fact.speaker, fact.object)
             };
-            let fact_key = infer_fact_key(&claim);
-            let subject = if speaker.eq_ignore_ascii_case("memory") {
-                payload.entity_id.clone()
-            } else {
-                speaker.clone()
-            };
-            let text = if speaker.eq_ignore_ascii_case("memory") {
-                format!("Atomic memory card: {}", claim)
-            } else {
-                format!("Atomic memory card: {} said {}", speaker, claim)
-            };
-
-            cards.push(IngestPayload {
+            IngestPayload {
                 entity_id: payload.entity_id.clone(),
-                memory_id: format!(
-                    "{}::{}::{}",
-                    entity_id,
-                    session_id,
-                    2_200_000 + turn_index * 50 + card_idx
+                memory_id: crate::api::utils::derived_memory_id(
+                    &payload.memory_id,
+                    &format!("card{card_idx}"),
                 ),
                 timestamp: payload.timestamp,
                 textual_content: text,
                 relations: payload.relations.clone(),
-                kind: Some(card_kind.to_string()),
-                fact_key,
+                kind: Some(if fact.is_preference { "preference" } else { "fact" }.to_string()),
+                fact_key: fact.fact_key.clone(),
                 source_memory_id: Some(payload.memory_id.clone()),
                 index_semantic: Some(true),
                 enable_semantic_dedup: Some(true),
                 enable_consolidation: Some(false),
                 content_type: payload.content_type.clone(),
                 fact_operation: Some("derive".to_string()),
-                fact_confidence: Some(0.90),
-                fact_subject: Some(subject),
-                fact_predicate: None,
-                fact_object: Some(claim),
+                fact_confidence: Some(fact.confidence),
+                fact_subject: Some(fact.subject.clone()),
+                fact_predicate: fact.predicate.clone(),
+                fact_object: Some(fact.object.clone()),
                 ..Default::default()
-            });
-        }
-    }
-
-    cards
+            }
+        })
+        .collect()
 }
 
 pub fn preference_signal_strength(

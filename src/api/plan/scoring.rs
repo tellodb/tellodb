@@ -193,9 +193,10 @@ pub fn kind_query_bonus(kind: MemoryKind, plan: &QueryPlan, obs: &ScorableObserv
     }
 
     if !plan.temporal_terms.is_empty()
-        && plan.temporal_terms.iter().any(|term| obs.lower.contains(term.as_str())) {
-            bonus += 0.05;
-        }
+        && plan.temporal_terms.iter().any(|term| obs.lower.contains(term.as_str()))
+    {
+        bonus += 0.05;
+    }
 
     bonus
 }
@@ -514,7 +515,9 @@ pub fn weighted_reciprocal_rank_fusion(
     let mut fused: Vec<(String, u64, f32)> =
         rrf_scores.into_iter().map(|(id, (ts, score))| (id, ts, score)).collect();
 
-    fused.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    fused.sort_by(|a, b| {
+        b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(&b.0))
+    });
     fused
 }
 
@@ -644,7 +647,9 @@ pub fn select_candidates_with_session_head(
         return Vec::new();
     }
 
-    let mut grouped: HashMap<String, Vec<EvidenceCard>> = HashMap::new();
+    // Ordered map: session selection below breaks ties by position.
+    let mut grouped: std::collections::BTreeMap<String, Vec<EvidenceCard>> =
+        std::collections::BTreeMap::new();
     for candidate in candidates {
         let session_key = if candidate.source_session_id.is_empty() {
             session_id_from_memory_id(&candidate.source_memory_id)
@@ -655,7 +660,9 @@ pub fn select_candidates_with_session_head(
         grouped.entry(session_key).or_default().push(candidate);
     }
 
-    let mut sessions = grouped.into_values().map(|mut items| {
+    let mut sessions = grouped
+        .into_values()
+        .map(|mut items| {
             items.sort_by(|a, b| {
                 b.final_score
                     .partial_cmp(&a.final_score)
@@ -664,6 +671,7 @@ pub fn select_candidates_with_session_head(
                         kind_priority(b.internal_kind, prefer_distilled)
                             .cmp(&kind_priority(a.internal_kind, prefer_distilled))
                     })
+                    .then_with(|| a.source_memory_id.cmp(&b.source_memory_id))
             });
 
             let top1 = items.first().map(|item| item.final_score).unwrap_or(0.0);
@@ -882,7 +890,10 @@ pub fn select_candidates_with_session_head(
         let mut leftovers =
             sessions.into_iter().flat_map(|session| session.items.into_iter()).collect::<Vec<_>>();
         leftovers.sort_by(|a, b| {
-            b.final_score.partial_cmp(&a.final_score).unwrap_or(std::cmp::Ordering::Equal)
+            b.final_score
+                .partial_cmp(&a.final_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.source_memory_id.cmp(&b.source_memory_id))
         });
         for candidate in leftovers {
             if selected.len() >= limit {

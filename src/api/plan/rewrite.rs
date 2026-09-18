@@ -69,8 +69,7 @@ pub fn rewrite_query_for_retrieval(query: &str) -> String {
     ];
     for suffix in advice_suffixes {
         if ql.ends_with(suffix) {
-            let trimmed =
-                q[..q.len() - suffix.len()].trim().trim_end_matches(['.', ',']);
+            let trimmed = q[..q.len() - suffix.len()].trim().trim_end_matches(['.', ',']);
             if !trimmed.is_empty() {
                 return trimmed.to_string();
             }
@@ -119,7 +118,6 @@ pub fn rewrite_query_for_retrieval(query: &str) -> String {
 
     q.to_string()
 }
-
 
 pub fn build_hyde_query(query: &str, plan: &QueryPlan) -> Option<String> {
     let lower = query.to_ascii_lowercase();

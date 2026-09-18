@@ -8,10 +8,10 @@ Unlike generic memory APIs that just wrap embeddings and return stale informatio
 
 - **Temporal Truth & Fact Supersession:** Tellodb doesn't just store "persistent memory". It understands when a new fact supersedes an old one (e.g., "I moved to Seattle" invalidates "I live in Austin"). Stale facts are filtered out, giving your agents accurate context.
 - **Deterministic Numeric Memory:** It computes numeric answers (counts, sums) deterministically using a metric vault, rather than relying on the LLM to guess the right number from a context window.
-- **Local-First, Single-Binary Engine:** Deployed via a highly performant Rust binary. Keep your data private and local, with no dependencies on complex multi-database Frankenstein architectures.
-- **True Hybrid Retrieval:** Combines HNSW vector search, BM25 full-text search, graph knowledge retrieval, and time-aware ranking in one unified system.
+- **Local-First, Single-Binary Engine:** One Rust binary and one SQLite database per tenant, holding memories, facts, graph edges and the embeddings themselves. Your data stays on your machine.
+- **True Hybrid Retrieval:** Per-entity vector segments (exact scans when small, HNSW when large), BM25 full-text search, graph walks and time-aware ranking, fused into one ranking.
 - **Evidence-Cited Answers:** Memory responses can include evidence IDs, source snippets, and current/stale status, allowing agents to cite their sources.
-- **Drop-in Proxy:** Add memory to existing OpenAI SDK apps by simply changing the base URL. Tellodb automatically injects context and forwards the request to your LLM provider.
+- **Library, server, CLI or MCP:** Embed it in a Rust program, run the HTTP API, drive it from the command line, or plug it into an MCP client over stdio. (An OpenAI-compatible proxy is planned, not built.)
 
 ## Recommended Local GPU Setup
 
@@ -21,7 +21,7 @@ The practical default is:
 
 ```text
 Model: BAAI/bge-small-en-v1.5
-Backend: Candle
+Runtime: ONNX Runtime through fastembed
 Execution provider: CPU or CUDA, depending on TEMPORAL_MEMORY_DEVICE and build features
 Embedding dimension: 384
 ```
@@ -52,9 +52,12 @@ The setup script installs CUDA 12.6, cuDNN 9, TensorRT 10 runtime libraries, Rus
 
 ```bash
 cd /root/Tellodb
+# Linux with TensorRT:
 cargo run --release --features gpu-tensorrt
+# Linux with CUDA:
 cargo run --release --features gpu-cuda
-TEMPORAL_MEMORY_DEVICE=metal TEMPORAL_MEMORY_API_KEY=XXX1111AAA cargo run --features gpu-metal --release
+# macOS with CoreML:
+cargo run --release --features coreml
 ```
 
 Warm up before benchmarking. TensorRT may spend the first run building engines and cache files.
@@ -172,24 +175,107 @@ Start with `--ingest-concurrency 4` for BGE small/base. For Qwen3 0.6B, start wi
 
 ## Integration Modes
 
-Tellodb provides three main ways to integrate with your agents:
+### 1. Embedded library
 
-### 1. Local Engine
+Tellodb is a library first; the server is a wrapper around it. No HTTP, no API
+key, one data directory:
 
-Run Tellodb privately on your local machine or GPU server. This is the recommended path for privacy-focused developers and local coding agents.
+```rust
+use tellodb::db::{Db, Memory, Query};
 
-### 2. Drop-In Proxy
+let db = Db::open("./agent-memory")?;
+db.ingest(vec![Memory::new("alice", "I just moved to Denver.").session("chat-1", 0)])?;
+let hits = db.query(Query::new("where do I live?").entity("alice").limit(5))?;
+let city = db.current_fact("alice", "residence")?;
+```
 
-For developers already using OpenAI-style APIs, you can add memory to your agents without rewriting your application code.
+`Engine` is the same API for callers that already run Tokio.
 
-Just change your SDK's base URL to point to your Tellodb instance, and pass your Tellodb API key.
-- Tellodb intercepts the request.
-- Retrieves relevant memories and current facts.
-- Injects the compact memory context.
-- Forwards to the OpenAI (or compatible) provider and returns the response.
+### 2. Command line
 
-### 3. Model Context Protocol (MCP) Server
-Tellodb is designed to integrate seamlessly into environments like Claude Desktop, Claude Code, Cursor, and Windsurf via MCP. It exposes tools like `_ingest`, `_query`, `_current_fact`, and more directly to your AI IDEs.
+```bash
+tellodb serve                                   # HTTP API (default)
+tellodb mcp --entity alice                      # MCP server over stdio
+tellodb doctor                                  # models, device, tenant health
+tellodb ingest --entity alice --session s1 turns.jsonl
+tellodb query --entity alice --limit 5 "where do I live?"
+```
+
+`--data-dir DIR` selects the data directory for any command (same as
+`TELLODB_DATA_DIR`). `ingest` reads JSON lines
+(`{"text", "role", "session_id", "turn_index", "timestamp_ms", "kind"}`) or
+plain text lines, from a file or stdin.
+
+### 3. Model Context Protocol (MCP)
+
+`tellodb mcp` speaks JSON-RPC over stdio, which is what Claude Desktop, Claude
+Code, Cursor and Windsurf expect. Tools: `remember`, `recall` and
+`current_fact`. Logs go to stderr, so stdout carries only protocol traffic.
+
+```json
+{
+  "mcpServers": {
+    "tellodb": {
+      "command": "/path/to/tellodb",
+      "args": ["--data-dir", "/path/to/agent-memory", "mcp", "--entity", "alice"]
+    }
+  }
+}
+```
+
+`POST /mcp` on the server speaks the same JSON-RPC with API-key auth.
+
+### 4. Language bindings
+
+`crates/tellodb-ffi` exposes a C ABI (`crates/tellodb-ffi/tellodb.h`), and
+`bindings/python/tellodb.py` wraps it with ctypes only — no build step beyond
+the library:
+
+```bash
+cargo build --release -p tellodb-ffi
+PYTHONPATH=bindings/python python3 -c "
+from tellodb import Tellodb
+with Tellodb('./agent-memory') as db:
+    db.remember('alice', 'I live in Lisbon.')
+    print(db.recall('where do I live?', entity_id='alice'))"
+```
+
+A Node binding over the same C ABI is not written yet.
+
+### 5. Drop-in proxy (planned)
+
+An OpenAI-compatible route that injects memory context into chat completions
+is designed but not implemented; there is no `/v1/chat/completions` endpoint
+today.
+
+## Configuration
+
+| Variable | Default | What it does |
+|---|---|---|
+| `TELLODB_DATA_DIR` | `.` | Data directory (databases, caches) |
+| `TELLODB_API_KEY` | — | Required to `serve`; unused by the library and CLI |
+| `TELLODB_THREADS` | physical cores | Thread budget for models and rayon |
+| `TEMPORAL_MEMORY_DEVICE` | cpu | `cuda`, `coreml` or cpu |
+| `TELLODB_EMBED_TEXT` | `context` | What gets embedded: `legacy`, `turn`, `context` |
+| `TELLODB_CONTEXT_WINDOW` | 1 | Neighbouring turns added in `context` mode |
+| `TELLODB_RERANK` | auto | `off` skips loading the cross-encoder |
+| `TELLODB_RERANK_POLICY` | `heuristic` | `always`, `gate` (confidence-gated) or `heuristic` |
+| `TELLODB_RERANK_MARGIN` | 0.05 | Gate: rerank when top-1 and top-5 are this close |
+| `TELLODB_RERANK_MODEL` | bge-reranker-base | Cross-encoder, or `none` |
+| `TELLODB_VECTOR_QUANT` | `f32` | Segment precision: `f32`, `f16`, `i8`, `binary` |
+| `TELLODB_FLAT_THRESHOLD` | 20000 | Above this many vectors an entity gets its own HNSW |
+| `TELLODB_DISABLE` | — | Comma-separated derived structures to switch off (ablations) |
+| `TELLODB_MODEL_DIR` | — | Load the embedder from this directory instead of downloading |
+| `TELLODB_EMBEDDING_CACHE_PATH` | data dir | Persistent embedding cache |
+
+`tellodb doctor` prints the resolved configuration.
+
+### Running without downloads
+
+Point `TELLODB_MODEL_DIR` at a model snapshot (`onnx/model.onnx` plus the
+tokenizer JSON files) to skip the Hugging Face download, or build with
+`--features bundled-models` and `TELLODB_BUNDLE_DIR` set to that directory to
+compile the embedder into the binary.
 
 ### Quick Platform Test
 You can interact with the engine directly using the REST API.
@@ -208,11 +294,19 @@ curl -sS http://localhost:3000/platform/profile \
 ```
 
 ## Architecture Overview
-- **Storage:** MVCC temporal storage using `redb`.
-- **Vector Search:** `usearch` for extreme SIMD-accelerated HNSW indexing (up to 1,000,000 vectors).
-- **Inference:** Local embedding models through ONNX Runtime with CUDA/TensorRT, with Candle still available for compatible BERT-style models.
-- **Graph:** RDF Adjacency Lists stored locally for fast associative recall.
-- **API:** Robust asynchronous routing with `axum` and `tokio`.
+- **Storage:** one SQLite database per tenant (WAL), holding memories, facts,
+  cards, links, graph edges and the embeddings themselves.
+- **Vector search:** per-entity segments loaded lazily from SQLite — exact SIMD
+  scans up to `TELLODB_FLAT_THRESHOLD` vectors, a per-entity `usearch` HNSW
+  above it, with optional f16/i8/binary quantization and f32 rescoring.
+- **Lexical search:** SQLite FTS5 (porter, unicode61) with entity-scoped queries.
+- **Temporal model:** fact version chains with validity intervals, so a query
+  can ask what was true at a point in time and see what superseded a fact.
+- **Inference:** local ONNX Runtime models through fastembed (CUDA, CoreML or
+  CPU); embeddings are cached on disk, keyed by model and text.
+- **Graph:** subject/predicate/object edges walked breadth-first with hub
+  pruning, batched per level.
+- **API:** `axum` and `tokio`, with the retrieval pipeline on blocking threads.
 
 ---
 *Tellodb ensures your agents don't just remember everything—they know what is actually true.*

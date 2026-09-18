@@ -15,6 +15,20 @@ const PRAGMA_CACHE_SIZE: i64 = -262144;
 const PRAGMA_MMAP_SIZE: i64 = 1073741824;
 const PRAGMA_BUSY_TIMEOUT: i64 = 10000;
 const PRAGMA_PAGE_SIZE: i64 = 8192;
+const STATEMENT_CACHE_CAPACITY: usize = 512;
+
+const METRICS_DDL: &str = "CREATE TABLE IF NOT EXISTS metrics (
+    memory_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    entity_id TEXT NOT NULL,
+    timestamp_ms INTEGER NOT NULL,
+    label TEXT NOT NULL,
+    value REAL NOT NULL,
+    unit TEXT,
+    source_text TEXT,
+    PRIMARY KEY(memory_id, ordinal)
+);
+CREATE INDEX IF NOT EXISTS idx_metrics_entity_label ON metrics(entity_id, label, timestamp_ms);";
 
 const SOURCE_DEPTH_DIVISOR: f32 = 8.0;
 
@@ -52,11 +66,36 @@ fn unix_timestamp_ms() -> Result<i64> {
 
 pub struct TenantStore {
     pool: Pool<SqliteConnectionManager>,
+    /// This tenant's vector index. Each tenant owns its own index because
+    /// vector ids are per-tenant `memories.rowid`s and would collide in a
+    /// shared index. Attached by `TenantDatabaseManager` after open.
+    vectors: std::sync::OnceLock<crate::vector_index::VectorIndex>,
 }
+
+/// Stable FTS5 rowid for a document key. FTS tables have no unique key on
+/// `memory_id`, so `INSERT OR REPLACE` only replaces when the rowid matches;
+/// deriving it from the key makes re-ingest replace instead of duplicate and
+/// makes deletes an O(log n) rowid lookup.
+pub(crate) fn fts_rowid(key: &str) -> i64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in key.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    // Positive and non-zero.
+    ((hash >> 1) | 1) as i64
+}
+
+/// Schema version recorded in `PRAGMA user_version`.
+const SCHEMA_VERSION: i64 = 2;
 
 impl TenantStore {
     pub fn new(path: &Path) -> Result<Self> {
         let manager = SqliteConnectionManager::file(path).with_init(|conn| {
+            // The store uses ~70 distinct cached statements plus IN-list
+            // queries; with rusqlite's default capacity of 16 they were
+            // evicted and re-parsed constantly.
+            conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
             conn.execute_batch(&format!(
                 "PRAGMA journal_mode = WAL;
                      PRAGMA synchronous = NORMAL;
@@ -78,7 +117,31 @@ impl TenantStore {
         let conn = pool.get().context("failed to get initial connection from pool")?;
         Self::init_schema(&conn)?;
         info!(path = %path.display(), "Tenant database initialized");
-        Ok(Self { pool })
+        Ok(Self { pool, vectors: std::sync::OnceLock::new() })
+    }
+
+    pub fn attach_vectors(&self, index: crate::vector_index::VectorIndex) -> Result<()> {
+        self.vectors.set(index).map_err(|_| anyhow::anyhow!("vector index already attached"))
+    }
+
+    /// This tenant's vector index.
+    pub fn vectors(&self) -> Result<&crate::vector_index::VectorIndex> {
+        self.vectors.get().context("tenant has no vector index attached")
+    }
+
+    /// A vector source reading this tenant's stored embeddings.
+    pub fn vector_source(&self) -> std::sync::Arc<dyn crate::vector_index::VectorSource> {
+        std::sync::Arc::new(SqliteVectorSource { pool: self.pool.clone() })
+    }
+
+    /// `(rows with a stored embedding, rows without one)` in `vector_lookup`.
+    pub fn stored_vector_counts(&self) -> Result<(usize, usize)> {
+        let conn = self.get_conn()?;
+        Ok(conn.query_row(
+            "SELECT COUNT(embedding), COUNT(*) - COUNT(embedding) FROM vector_lookup",
+            [],
+            |row| Ok((row.get::<_, i64>(0)? as usize, row.get::<_, i64>(1)? as usize)),
+        )?)
     }
 
     fn init_schema(conn: &rusqlite::Connection) -> Result<()> {
@@ -92,11 +155,14 @@ impl TenantStore {
                 content TEXT NOT NULL,
                 kind TEXT NOT NULL,
                 content_hash TEXT NOT NULL DEFAULT '',
-                created_at_ms INTEGER NOT NULL
+                created_at_ms INTEGER NOT NULL,
+                session_id TEXT NOT NULL DEFAULT '',
+                turn_index INTEGER NOT NULL DEFAULT 0,
+                role TEXT NOT NULL DEFAULT '',
+                parent_memory_id TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_memories_entity ON memories(entity_id);
             CREATE INDEX IF NOT EXISTS idx_memories_memory_id ON memories(memory_id);
-            CREATE INDEX IF NOT EXISTS idx_memories_content_hash ON memories(content_hash);
 
             -- Memory cards
             CREATE TABLE IF NOT EXISTS memory_cards (
@@ -148,15 +214,15 @@ impl TenantStore {
 
             -- Metrics
             CREATE TABLE IF NOT EXISTS metrics (
-                timestamp_ms INTEGER,
-                entity_id TEXT,
-                label TEXT,
-                value REAL,
+                memory_id TEXT NOT NULL,
+                ordinal INTEGER NOT NULL,
+                entity_id TEXT NOT NULL,
+                timestamp_ms INTEGER NOT NULL,
+                label TEXT NOT NULL,
+                value REAL NOT NULL,
                 unit TEXT,
-                content_hash TEXT,
-                confidence REAL DEFAULT 1.0,
-                source TEXT DEFAULT 'deterministic',
-                PRIMARY KEY(timestamp_ms, entity_id, label)
+                source_text TEXT,
+                PRIMARY KEY(memory_id, ordinal)
             );
             CREATE INDEX IF NOT EXISTS idx_metrics_entity_label ON metrics(entity_id, label, timestamp_ms);
 
@@ -173,149 +239,11 @@ impl TenantStore {
                 vector_id INTEGER PRIMARY KEY,
                 memory_id TEXT NOT NULL,
                 entity_id TEXT NOT NULL,
-                timestamp_ms INTEGER NOT NULL
+                timestamp_ms INTEGER NOT NULL,
+                embedding BLOB
             );
             CREATE INDEX IF NOT EXISTS idx_vector_lookup_memory ON vector_lookup(memory_id);
-
-            -- Ledger turns
-            CREATE TABLE IF NOT EXISTS ledger_turns (
-                turn_id TEXT PRIMARY KEY,
-                entity_id TEXT,
-                session_id TEXT,
-                speaker TEXT,
-                turn_index INTEGER,
-                raw_text TEXT,
-                document_time_ms INTEGER,
-                ingest_time_ms INTEGER,
-                source_type TEXT,
-                source_uri TEXT,
-                raw_sha256 TEXT,
-                redaction_state TEXT DEFAULT 'none',
-                lifecycle TEXT,
-                schema_version INTEGER DEFAULT 1
-            );
-            CREATE INDEX IF NOT EXISTS idx_ledger_turns_session ON ledger_turns(session_id);
-            CREATE INDEX IF NOT EXISTS idx_ledger_turns_entity ON ledger_turns(entity_id);
-
-            -- Memory artifacts
-            CREATE TABLE IF NOT EXISTS memory_artifacts (
-                artifact_id TEXT PRIMARY KEY,
-                artifact_type TEXT,
-                entity_id TEXT,
-                source_turn_ids TEXT DEFAULT '[]',
-                source_memory_ids TEXT DEFAULT '[]',
-                source_session_ids TEXT DEFAULT '[]',
-                compiler_name TEXT,
-                compiler_version TEXT,
-                embedding_model TEXT,
-                embedding_dim INTEGER,
-                index_namespace TEXT,
-                lifecycle TEXT,
-                created_at_ms INTEGER,
-                updated_at_ms INTEGER
-            );
-            CREATE INDEX IF NOT EXISTS idx_artifacts_source ON memory_artifacts(source_memory_ids);
-
-            -- Artifact versions
-            CREATE TABLE IF NOT EXISTS artifact_versions (
-                version_id TEXT PRIMARY KEY,
-                artifact_id TEXT,
-                entity_id TEXT,
-                version_data TEXT,
-                lifecycle TEXT,
-                created_at_ms INTEGER
-            );
-            CREATE INDEX IF NOT EXISTS idx_artifact_versions_artifact ON artifact_versions(artifact_id);
-
-            -- Temporal events
-            CREATE TABLE IF NOT EXISTS temporal_events (
-                event_id TEXT PRIMARY KEY,
-                entity_id TEXT,
-                source_session_id TEXT,
-                source_memory_id TEXT,
-                subject TEXT,
-                relation TEXT,
-                object TEXT,
-                document_time_ms INTEGER,
-                event_time_ms INTEGER,
-                event_text TEXT,
-                event_type TEXT,
-                confidence REAL,
-                lifecycle TEXT,
-                created_at_ms INTEGER
-            );
-            CREATE INDEX IF NOT EXISTS idx_events_entity ON temporal_events(entity_id);
-
-            -- Shadow questions
-            CREATE TABLE IF NOT EXISTS shadow_questions (
-                shadow_id TEXT PRIMARY KEY,
-                entity_id TEXT,
-                source_session_id TEXT,
-                source_memory_id TEXT,
-                question_text TEXT,
-                answer_type TEXT,
-                confidence REAL,
-                created_at_ms INTEGER
-            );
-            CREATE INDEX IF NOT EXISTS idx_shadow_entity ON shadow_questions(entity_id);
-
-            -- Facet postings
-            CREATE TABLE IF NOT EXISTS facet_postings (
-                posting_id TEXT PRIMARY KEY,
-                entity_id TEXT,
-                facet_type TEXT,
-                facet_value TEXT,
-                target_id TEXT,
-                target_type TEXT,
-                session_id TEXT,
-                memory_id TEXT,
-                weight REAL DEFAULT 1.0
-            );
-            CREATE INDEX IF NOT EXISTS idx_facets_entity ON facet_postings(entity_id);
-
-            -- Memory cells
-            CREATE TABLE IF NOT EXISTS mem_cells (
-                cell_id TEXT PRIMARY KEY,
-                entity_id TEXT,
-                source_session_id TEXT,
-                cell_text TEXT,
-                cell_type TEXT,
-                document_time_ms INTEGER,
-                confidence REAL,
-                saliency REAL,
-                lifecycle TEXT,
-                created_at_ms INTEGER
-            );
-            CREATE INDEX IF NOT EXISTS idx_cells_entity ON mem_cells(entity_id);
-
-            -- Memory scenes
-            CREATE TABLE IF NOT EXISTS mem_scenes (
-                scene_id TEXT PRIMARY KEY,
-                entity_id TEXT,
-                scene_title TEXT,
-                scene_summary TEXT,
-                scene_type TEXT,
-                saliency REAL,
-                lifecycle TEXT,
-                created_at_ms INTEGER
-            );
-            CREATE INDEX IF NOT EXISTS idx_scenes_entity ON mem_scenes(entity_id);
-
-            -- Profile facts
-            CREATE TABLE IF NOT EXISTS profile_facts (
-                profile_fact_id TEXT PRIMARY KEY,
-                entity_id TEXT,
-                category TEXT,
-                value TEXT,
-                source_session_id TEXT,
-                source_memory_id TEXT,
-                confidence REAL,
-                document_time_ms INTEGER,
-                is_latest INTEGER DEFAULT 1,
-                lifecycle TEXT,
-                created_at_ms INTEGER
-            );
-            CREATE INDEX IF NOT EXISTS idx_profile_entity ON profile_facts(entity_id);
+            CREATE INDEX IF NOT EXISTS idx_vector_lookup_entity ON vector_lookup(entity_id);
 
             -- Session router
             CREATE TABLE IF NOT EXISTS session_router (
@@ -333,22 +261,6 @@ impl TenantStore {
                 session_id UNINDEXED,
                 entity_id UNINDEXED,
                 router_text,
-                tokenize='porter unicode61'
-            );
-
-            CREATE VIRTUAL TABLE IF NOT EXISTS fts_temporal_events USING fts5(
-                event_id UNINDEXED,
-                entity_id UNINDEXED,
-                source_session_id UNINDEXED,
-                event_text,
-                tokenize='porter unicode61'
-            );
-
-            CREATE VIRTUAL TABLE IF NOT EXISTS fts_shadow_questions USING fts5(
-                shadow_id UNINDEXED,
-                entity_id UNINDEXED,
-                source_session_id UNINDEXED,
-                question_text,
                 tokenize='porter unicode61'
             );
 
@@ -398,13 +310,30 @@ impl TenantStore {
             CREATE INDEX IF NOT EXISTS idx_fact_entity ON fact_versions(entity_id);
             CREATE INDEX IF NOT EXISTS idx_fact_versions_lookup ON fact_versions(fact_key, entity_id, status);
 
-            -- Card relations
-            CREATE TABLE IF NOT EXISTS card_relations (
-                source_card_id TEXT NOT NULL,
-                target_card_id TEXT NOT NULL,
-                relation_type TEXT NOT NULL,
-                PRIMARY KEY(source_card_id, target_card_id, relation_type)
+            -- Memories that support a fact version (restatements merge into
+            -- the version they confirm instead of creating a new one).
+            CREATE TABLE IF NOT EXISTS fact_evidence (
+                fact_key TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                version_memory_id TEXT NOT NULL,
+                memory_id TEXT NOT NULL,
+                timestamp_ms INTEGER NOT NULL,
+                PRIMARY KEY(fact_key, entity_id, version_memory_id, memory_id)
             );
+            CREATE INDEX IF NOT EXISTS idx_fact_evidence_version
+                ON fact_evidence(entity_id, fact_key, version_memory_id);
+
+            -- Predicates grouped by meaning, so variants of one predicate
+            -- supersede each other (see canonicalize_predicates).
+            CREATE TABLE IF NOT EXISTS predicate_canon (
+                entity_id TEXT NOT NULL,
+                predicate TEXT NOT NULL,
+                canonical TEXT NOT NULL,
+                embedding BLOB,
+                PRIMARY KEY(entity_id, predicate)
+            );
+            CREATE INDEX IF NOT EXISTS idx_predicate_canon_canonical
+                ON predicate_canon(entity_id, canonical);
 
             -- Core profiles
             CREATE TABLE IF NOT EXISTS core_profiles (
@@ -485,28 +414,124 @@ impl TenantStore {
         ",
         )?;
 
-        // Migration: add content_hash column if upgrading from an older schema.
-        // Wrapped in a closure so prepare errors don't propagate.
-        let _ = (|| -> std::result::Result<(), rusqlite::Error> {
-            let has_hash_col: bool = conn
-                .prepare("SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name = 'content_hash'")?
-                .query_row([], |row| row.get::<_, i64>(0))
-                .unwrap_or(0)
-                > 0;
-            if !has_hash_col {
-                conn.execute_batch("ALTER TABLE memories ADD COLUMN content_hash TEXT NOT NULL DEFAULT '';")?;
-            }
-            let has_hash_idx: bool = conn
-                .prepare("SELECT COUNT(*) FROM pragma_index_list('memories') WHERE name = 'idx_memories_content_hash'")?
-                .query_row([], |row| row.get::<_, i64>(0))
-                .unwrap_or(0)
-                > 0;
-            if !has_hash_idx {
-                conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_memories_content_hash ON memories(content_hash);")?;
-            }
-            Ok(())
-        })();
+        Self::migrate(conn)?;
 
+        Ok(())
+    }
+
+    fn has_column(conn: &rusqlite::Connection, table: &str, column: &str) -> Result<bool> {
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+            params![table, column],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Upgrades databases created by older builds. Runs on every open and is
+    /// idempotent; failures abort the open instead of leaving a half-migrated
+    /// schema behind.
+    fn migrate(conn: &rusqlite::Connection) -> Result<()> {
+        if !Self::has_column(conn, "memories", "content_hash")? {
+            conn.execute_batch(
+                "ALTER TABLE memories ADD COLUMN content_hash TEXT NOT NULL DEFAULT '';",
+            )?;
+        }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_memories_content_hash ON memories(content_hash);",
+        )?;
+        for (column, ddl) in [
+            ("session_id", "ALTER TABLE memories ADD COLUMN session_id TEXT NOT NULL DEFAULT ''"),
+            ("turn_index", "ALTER TABLE memories ADD COLUMN turn_index INTEGER NOT NULL DEFAULT 0"),
+            ("role", "ALTER TABLE memories ADD COLUMN role TEXT NOT NULL DEFAULT ''"),
+            ("parent_memory_id", "ALTER TABLE memories ADD COLUMN parent_memory_id TEXT"),
+        ] {
+            if !Self::has_column(conn, "memories", column)? {
+                conn.execute_batch(ddl)?;
+            }
+        }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_memories_session_turn
+                 ON memories(entity_id, session_id, turn_index);",
+        )?;
+        if !Self::has_column(conn, "vector_lookup", "embedding")? {
+            conn.execute_batch("ALTER TABLE vector_lookup ADD COLUMN embedding BLOB;")?;
+        }
+        if !Self::has_column(conn, "metrics", "memory_id")? {
+            // The old table was keyed by (timestamp, entity, label), so two
+            // amounts in one memory overwrote each other. Ingest never wrote
+            // to it, so there is nothing to carry over.
+            conn.execute_batch(&format!("DROP TABLE metrics; {}", METRICS_DDL))?;
+        }
+        if !Self::has_column(conn, "fact_versions", "recorded_at_ms")? {
+            conn.execute_batch("ALTER TABLE fact_versions ADD COLUMN recorded_at_ms INTEGER;")?;
+        }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_fact_versions_memory ON fact_versions(memory_id);",
+        )?;
+
+        // Structures that were written on ingest but never read by retrieval.
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS temporal_events;
+             DROP TABLE IF EXISTS fts_temporal_events;
+             DROP TABLE IF EXISTS shadow_questions;
+             DROP TABLE IF EXISTS fts_shadow_questions;
+             DROP TABLE IF EXISTS facet_postings;
+             DROP TABLE IF EXISTS mem_cells;
+             DROP TABLE IF EXISTS mem_scenes;
+             DROP TABLE IF EXISTS profile_facts;
+             DROP TABLE IF EXISTS card_relations;
+             DROP TABLE IF EXISTS ledger_turns;
+             DROP TABLE IF EXISTS memory_artifacts;
+             DROP TABLE IF EXISTS artifact_versions;",
+        )?;
+
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version < 2 {
+            // FTS rows used to get random rowids, so re-ingest duplicated them.
+            // Re-key every row by `fts_rowid`, keeping the newest copy. Each
+            // table is rewritten in one transaction.
+            for (table, key_col, cols) in
+                [("fts_memories", "memory_id", "memory_id, entity_id, content")]
+            {
+                let tmp = format!("{table}_migrate");
+                conn.execute_batch(&format!(
+                    "BEGIN IMMEDIATE;
+                     DROP TABLE IF EXISTS {tmp};
+                     CREATE TEMP TABLE {tmp} AS
+                        SELECT {cols} FROM {table} WHERE rowid IN
+                            (SELECT MAX(rowid) FROM {table} GROUP BY {key_col});
+                     DELETE FROM {table};"
+                ))?;
+                let rows: Vec<Vec<rusqlite::types::Value>> = {
+                    let mut stmt = conn.prepare(&format!("SELECT {cols} FROM {tmp}"))?;
+                    let width = stmt.column_count();
+                    let mapped = stmt.query_map([], |row| {
+                        (0..width).map(|i| row.get::<_, rusqlite::types::Value>(i)).collect()
+                    })?;
+                    mapped.collect::<rusqlite::Result<_>>()?
+                };
+                let placeholders = vec!["?"; cols.split(',').count() + 1].join(", ");
+                {
+                    let mut insert = conn.prepare(&format!(
+                        "INSERT OR REPLACE INTO {table} (rowid, {cols}) VALUES ({placeholders})"
+                    ))?;
+                    for row in rows {
+                        let key = match &row[0] {
+                            rusqlite::types::Value::Text(key) => key.clone(),
+                            _ => continue,
+                        };
+                        let mut values = vec![rusqlite::types::Value::Integer(fts_rowid(&key))];
+                        values.extend(row);
+                        insert.execute(rusqlite::params_from_iter(values))?;
+                    }
+                }
+                conn.execute_batch(&format!("COMMIT; DROP TABLE {tmp};"))?;
+            }
+        }
+        if version < SCHEMA_VERSION {
+            conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+        }
         Ok(())
     }
 
@@ -533,15 +558,17 @@ impl TenantStore {
             let mut select_stmt =
                 tx.prepare_cached("SELECT rowid FROM memories WHERE memory_id = ?1")?;
             let mut update_stmt = tx.prepare_cached(
-                "UPDATE memories SET content = ?1, kind = ?2, created_at_ms = ?3, entity_id = ?4, content_hash = ?5 WHERE rowid = ?6",
+                "UPDATE memories SET content = ?1, kind = ?2, created_at_ms = ?3, entity_id = ?4, content_hash = ?5,
+                 session_id = ?7, turn_index = ?8, role = ?9, parent_memory_id = ?10 WHERE rowid = ?6",
             )?;
             let mut insert_stmt = tx.prepare_cached(
-                "INSERT INTO memories (memory_id, entity_id, content, kind, content_hash, created_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO memories (memory_id, entity_id, content, kind, content_hash, created_at_ms,
+                                       session_id, turn_index, role, parent_memory_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             )?;
             let mut vec_stmt = tx.prepare_cached(
-                "INSERT OR REPLACE INTO vector_lookup (vector_id, memory_id, entity_id, timestamp_ms)
-                 VALUES (?1, ?2, ?3, ?4)",
+                "INSERT OR REPLACE INTO vector_lookup (vector_id, memory_id, entity_id, timestamp_ms, embedding)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
             )?;
             let mut del_vec_stmt =
                 tx.prepare_cached("DELETE FROM vector_lookup WHERE vector_id = ?1")?;
@@ -555,7 +582,11 @@ impl TenantStore {
                         ts,
                         obs.entity_id,
                         obs.content_hash,
-                        rid
+                        rid,
+                        obs.session_id,
+                        obs.turn_index,
+                        obs.role,
+                        obs.parent_memory_id
                     ])?;
                     rid
                 } else {
@@ -565,13 +596,23 @@ impl TenantStore {
                         obs.textual_content,
                         format!("{:?}", obs.kind),
                         obs.content_hash,
-                        ts
+                        ts,
+                        obs.session_id,
+                        obs.turn_index,
+                        obs.role,
+                        obs.parent_memory_id
                     ])?;
                     tx.last_insert_rowid()
                 };
 
                 if !obs.embedding.is_empty() {
-                    vec_stmt.execute(params![rid, mem_id, obs.entity_id, ts])?;
+                    vec_stmt.execute(params![
+                        rid,
+                        mem_id,
+                        obs.entity_id,
+                        ts,
+                        vec_f32_to_bytes(&obs.embedding)
+                    ])?;
                 } else {
                     del_vec_stmt.execute(params![rid])?;
                 }
@@ -601,16 +642,18 @@ impl TenantStore {
         Ok(())
     }
 
-    pub fn lookup_by_memory_id(&self, memory_id: &str) -> Result<Option<(u64, u64)>> {
+    /// Returns `(created_at_ms, vector_id)`; `vector_id` is `None` for
+    /// memories stored without an embedding.
+    pub fn lookup_by_memory_id(&self, memory_id: &str) -> Result<Option<(u64, Option<u64>)>> {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
-            "SELECT v.vector_id, m.created_at_ms
+            "SELECT m.created_at_ms, v.vector_id
              FROM memories m
              LEFT JOIN vector_lookup v ON v.memory_id = m.memory_id
              WHERE m.memory_id = ?1",
         )?;
         let res = stmt.query_row(params![memory_id], |row| {
-            Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64))
+            Ok((row.get::<_, i64>(0)? as u64, row.get::<_, Option<i64>>(1)?.map(|v| v as u64)))
         });
         match res {
             Ok(pair) => Ok(Some(pair)),
@@ -659,6 +702,9 @@ impl TenantStore {
         &self,
         memory_ids: &[String],
     ) -> Result<std::collections::HashMap<String, (u64, u64)>> {
+        // Values are `(created_at_ms, vector_id)`; every caller reads the first
+        // element as the memory timestamp. (They used to be swapped, which fed
+        // vector ids into recency scoring as timestamps.)
         if memory_ids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
@@ -685,9 +731,35 @@ impl TenantStore {
 
         for row in rows {
             let (mid, vid_opt, ts) = row?;
-            result.insert(mid, (vid_opt.unwrap_or(0), ts));
+            result.insert(mid, (ts, vid_opt.unwrap_or(0)));
         }
         Ok(result)
+    }
+
+    /// `memory_id -> (session_id, turn_index)` for stored memories.
+    pub fn memory_identity_batch(
+        &self,
+        memory_ids: &[String],
+    ) -> Result<HashMap<String, (String, u32)>> {
+        let mut out = HashMap::with_capacity(memory_ids.len());
+        if memory_ids.is_empty() {
+            return Ok(out);
+        }
+        let conn = self.get_conn()?;
+        for chunk in memory_ids.chunks(256) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let mut stmt = conn.prepare_cached(&format!(
+                "SELECT memory_id, session_id, turn_index FROM memories WHERE memory_id IN ({placeholders})"
+            ))?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                Ok((row.get::<_, String>(0)?, (row.get::<_, String>(1)?, row.get::<_, u32>(2)?)))
+            })?;
+            for row in rows {
+                let (id, identity) = row?;
+                out.insert(id, identity);
+            }
+        }
+        Ok(out)
     }
 
     pub fn get_observation(
@@ -697,7 +769,8 @@ impl TenantStore {
     ) -> Result<Option<AgentObservation>> {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
-            "SELECT entity_id, content, kind, created_at_ms FROM memories WHERE memory_id = ?1",
+            "SELECT entity_id, content, kind, created_at_ms, session_id, turn_index, role, parent_memory_id
+             FROM memories WHERE memory_id = ?1",
         )?;
         let res = stmt.query_row(params![memory_id], |row| {
             Ok(AgentObservation {
@@ -707,6 +780,10 @@ impl TenantStore {
                 kind: parse_kind_enum(row.get::<_, String>(2)?.as_str()),
                 content_hash: String::new(),
                 created_at_ms: row.get(3)?,
+                session_id: row.get(4)?,
+                turn_index: row.get(5)?,
+                role: row.get(6)?,
+                parent_memory_id: row.get(7)?,
             })
         });
         match res {
@@ -727,7 +804,8 @@ impl TenantStore {
         let conn = self.get_conn()?;
         let placeholders: Vec<String> = memory_ids.iter().map(|_| "?".to_string()).collect();
         let sql = format!(
-            "SELECT memory_id, entity_id, content, kind, created_at_ms FROM memories WHERE memory_id IN ({})",
+            "SELECT memory_id, entity_id, content, kind, created_at_ms, session_id, turn_index, role, parent_memory_id
+             FROM memories WHERE memory_id IN ({})",
             placeholders.join(",")
         );
         let mut stmt = conn.prepare_cached(&sql)?;
@@ -743,6 +821,10 @@ impl TenantStore {
                     kind: parse_kind_enum(row.get::<_, String>(3)?.as_str()),
                     content_hash: String::new(),
                     created_at_ms: row.get::<_, i64>(4)? as u64,
+                    session_id: row.get(5)?,
+                    turn_index: row.get(6)?,
+                    role: row.get(7)?,
+                    parent_memory_id: row.get(8)?,
                 },
             ))
         })?;
@@ -863,244 +945,6 @@ impl TenantStore {
         Ok(())
     }
 
-    pub fn set_memory_card_relations_batch(
-        &self,
-        relations: &[(String, String, String)],
-    ) -> Result<()> {
-        let mut conn = self.get_conn()?;
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        {
-            let mut stmt = tx.prepare_cached(
-                "INSERT OR IGNORE INTO card_relations (source_card_id, target_card_id, relation_type)
-                 VALUES (?1, ?2, ?3)",
-            )?;
-            for (src, tgt, rel) in relations {
-                stmt.execute(params![src, tgt, rel])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    // ── Combined Ingest Upsert ──
-
-    pub fn combined_ingest_upsert(&self, input: &CombinedIngestUpsertInput) -> Result<()> {
-        self.ingest_cards(input.cards)?;
-        self.ingest_temporal_events(input.events)?;
-        self.ingest_shadow_questions(input.shadow_questions)?;
-        self.ingest_facet_postings(input.facet_postings)?;
-        self.ingest_mem_cells(input.mem_cells)?;
-        self.ingest_mem_scenes(input.mem_scenes)?;
-        self.ingest_profile_facts(input.profile_facts)?;
-        Ok(())
-    }
-
-    pub fn ingest_temporal_events(&self, events: &[TemporalEvent]) -> Result<()> {
-        let mut conn = self.get_conn()?;
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        {
-            let mut stmt = tx.prepare_cached(
-                "INSERT OR REPLACE INTO temporal_events (event_id, entity_id, source_session_id, source_memory_id,
-                 subject, relation, object, document_time_ms, event_time_ms, event_text, event_type,
-                 confidence, lifecycle, created_at_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)"
-            )?;
-            let mut fts = tx.prepare_cached(
-                "INSERT OR REPLACE INTO fts_temporal_events (event_id, entity_id, source_session_id, event_text) VALUES (?1, ?2, ?3, ?4)"
-            )?;
-            for e in events {
-                stmt.execute(params![
-                    e.event_id,
-                    e.entity_id,
-                    e.source_session_id,
-                    e.source_memory_id,
-                    e.subject,
-                    e.relation,
-                    e.object,
-                    e.document_time_ms,
-                    e.event_time_ms,
-                    e.event_text,
-                    e.event_type,
-                    e.confidence,
-                    e.lifecycle
-                        .as_ref()
-                        .map(serde_json::to_string)
-                        .transpose()
-                        .context("failed to serialize temporal event lifecycle")?
-                        .as_deref()
-                        .unwrap_or(""),
-                    e.created_at_ms,
-                ])?;
-                fts.execute(params![e.event_id, e.entity_id, e.source_session_id, e.event_text])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub fn ingest_shadow_questions(&self, questions: &[ShadowQuestion]) -> Result<()> {
-        let mut conn = self.get_conn()?;
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        {
-            let mut stmt = tx.prepare_cached(
-                "INSERT OR REPLACE INTO shadow_questions (shadow_id, entity_id, source_session_id, source_memory_id,
-                 question_text, answer_type, confidence, created_at_ms)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)"
-            )?;
-            let mut fts = tx.prepare_cached(
-                "INSERT OR REPLACE INTO fts_shadow_questions (shadow_id, entity_id, source_session_id, question_text) VALUES (?1, ?2, ?3, ?4)"
-            )?;
-            for q in questions {
-                stmt.execute(params![
-                    q.shadow_id,
-                    q.entity_id,
-                    q.source_session_id,
-                    q.source_memory_id,
-                    q.question_text,
-                    q.answer_type,
-                    q.confidence,
-                    q.created_at_ms,
-                ])?;
-                fts.execute(params![
-                    q.shadow_id,
-                    q.entity_id,
-                    q.source_session_id,
-                    q.question_text
-                ])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub fn ingest_facet_postings(&self, postings: &[FacetPosting]) -> Result<()> {
-        let mut conn = self.get_conn()?;
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        {
-            let mut stmt = tx.prepare_cached(
-                "INSERT OR REPLACE INTO facet_postings (posting_id, entity_id, facet_type, facet_value,
-                 target_id, target_type, session_id, memory_id, weight)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)"
-            )?;
-            for p in postings {
-                let posting_id = format!("fp::{}::{}::{}", p.entity_id, p.facet_type, p.target_id);
-                stmt.execute(params![
-                    posting_id,
-                    p.entity_id,
-                    p.facet_type,
-                    p.facet_value,
-                    p.target_id,
-                    p.target_type,
-                    p.session_id,
-                    p.memory_id,
-                    p.weight,
-                ])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub fn ingest_mem_cells(&self, cells: &[MemCell]) -> Result<()> {
-        let mut conn = self.get_conn()?;
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        {
-            let mut stmt = tx.prepare_cached(
-                "INSERT OR REPLACE INTO mem_cells (cell_id, entity_id, source_session_id, cell_text,
-                 cell_type, document_time_ms, confidence, saliency, lifecycle, created_at_ms)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)"
-            )?;
-            for c in cells {
-                stmt.execute(params![
-                    c.cell_id,
-                    c.entity_id,
-                    c.source_session_id,
-                    c.cell_text,
-                    c.cell_type,
-                    c.document_time_ms,
-                    c.confidence,
-                    c.saliency,
-                    c.lifecycle
-                        .as_ref()
-                        .map(serde_json::to_string)
-                        .transpose()
-                        .context("failed to serialize mem cell lifecycle")?
-                        .as_deref()
-                        .unwrap_or(""),
-                    c.created_at_ms,
-                ])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub fn ingest_mem_scenes(&self, scenes: &[MemSceneRecord]) -> Result<()> {
-        let mut conn = self.get_conn()?;
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        {
-            let mut stmt = tx.prepare_cached(
-                "INSERT OR REPLACE INTO mem_scenes (scene_id, entity_id, scene_title, scene_summary,
-                 scene_type, saliency, lifecycle, created_at_ms)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)"
-            )?;
-            for s in scenes {
-                stmt.execute(params![
-                    s.scene_id,
-                    s.entity_id,
-                    s.scene_title,
-                    s.scene_summary,
-                    s.scene_type,
-                    s.saliency,
-                    s.lifecycle
-                        .as_ref()
-                        .map(serde_json::to_string)
-                        .transpose()
-                        .context("failed to serialize mem scene lifecycle")?
-                        .as_deref()
-                        .unwrap_or(""),
-                    s.created_at_ms,
-                ])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub fn ingest_profile_facts(&self, facts: &[ProfileFact]) -> Result<()> {
-        let mut conn = self.get_conn()?;
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        {
-            let mut stmt = tx.prepare_cached(
-                "INSERT OR REPLACE INTO profile_facts (profile_fact_id, entity_id, category, value,
-                 source_session_id, source_memory_id, confidence, document_time_ms, is_latest, lifecycle, created_at_ms)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)"
-            )?;
-            for f in facts {
-                stmt.execute(params![
-                    f.profile_fact_id,
-                    f.entity_id,
-                    f.category,
-                    f.value,
-                    f.source_session_id,
-                    f.source_memory_id,
-                    f.confidence,
-                    f.document_time_ms,
-                    f.is_latest as i32,
-                    f.lifecycle
-                        .as_ref()
-                        .map(serde_json::to_string)
-                        .transpose()
-                        .context("failed to serialize profile fact lifecycle")?
-                        .as_deref()
-                        .unwrap_or(""),
-                    f.created_at_ms,
-                ])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
     // ── Aliases ──
 
     pub fn set_aliases_batch(&self, entity_id: &str, aliases: &[(String, String)]) -> Result<()> {
@@ -1123,10 +967,8 @@ impl TenantStore {
     /// Register a canonical entity name with its phonetic key.
     /// If the name already exists for this scope, it is a no-op.
     pub fn register_entity(&self, entity_id: &str, canonical_name: &str) -> Result<()> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let now =
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
         let sk = crate::storage::entity_resolver::phonetic_key(canonical_name);
         let conn = self.get_conn()?;
         conn.execute(
@@ -1152,7 +994,8 @@ impl TenantStore {
         })?;
 
         let mut candidates: Vec<crate::storage::entity_resolver::EntityCandidate> = Vec::new();
-        let mut name_index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut name_index: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
 
         for row in rows {
             let (name, sk) = row?;
@@ -1166,9 +1009,8 @@ impl TenantStore {
             name_index.insert(name.to_ascii_lowercase(), idx);
         }
 
-        let mut alias_stmt = conn.prepare_cached(
-            "SELECT alias FROM aliases WHERE entity_id = ?1",
-        )?;
+        let mut alias_stmt =
+            conn.prepare_cached("SELECT alias FROM aliases WHERE entity_id = ?1")?;
         let alias_rows = alias_stmt.query_map(params![entity_id], |row| row.get::<_, String>(0))?;
         for alias in alias_rows {
             let alias = alias?;
@@ -1189,7 +1031,11 @@ impl TenantStore {
             "SELECT canonical_name, embedding_blob, dim FROM name_embeddings WHERE entity_id = ?1",
         )?;
         let emb_rows = emb_stmt.query_map(params![entity_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, i64>(2)? as usize))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, i64>(2)? as usize,
+            ))
         })?;
         for row in emb_rows {
             let (cname, blob, dim) = row?;
@@ -1227,10 +1073,8 @@ impl TenantStore {
         tier: &str,
         confidence: f32,
     ) -> Result<Option<String>> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let now =
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
         let pid = Self::proposal_id(entity_id, from_name, to_name, now);
         let conn = self.get_conn()?;
         let inserted = conn.execute(
@@ -1238,7 +1082,11 @@ impl TenantStore {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7)",
             params![pid, entity_id, from_name, to_name, tier, confidence as f64, now as i64],
         )?;
-        if inserted > 0 { Ok(Some(pid)) } else { Ok(None) }
+        if inserted > 0 {
+            Ok(Some(pid))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Run the tiered resolver against the entity registry.
@@ -1251,7 +1099,12 @@ impl TenantStore {
         config: &crate::storage::entity_resolver::ResolutionConfig,
     ) -> Result<crate::storage::entity_resolver::EntityResolution> {
         let candidates = self.load_entity_candidates(entity_id)?;
-        let resolution = crate::storage::entity_resolver::resolve_name(name, &candidates, name_embedding, config);
+        let resolution = crate::storage::entity_resolver::resolve_name(
+            name,
+            &candidates,
+            name_embedding,
+            config,
+        );
         if let Some(ref matched) = resolution.matched_name {
             let tier_label = match resolution.tier {
                 crate::storage::entity_resolver::ResolverTier::Exact => return Ok(resolution),
@@ -1259,8 +1112,14 @@ impl TenantStore {
                 crate::storage::entity_resolver::ResolverTier::Phonetic => "phonetic",
                 crate::storage::entity_resolver::ResolverTier::Embedding(_) => "embedding",
             };
-            if name.to_ascii_lowercase() != matched.to_ascii_lowercase() {
-                let _ = self.create_merge_proposal(entity_id, name, matched, tier_label, resolution.tier.confidence());
+            if !name.eq_ignore_ascii_case(matched) {
+                let _ = self.create_merge_proposal(
+                    entity_id,
+                    name,
+                    matched,
+                    tier_label,
+                    resolution.tier.confidence(),
+                );
             }
         }
         Ok(resolution)
@@ -1268,12 +1127,88 @@ impl TenantStore {
 
     /// Batch check which content hashes already exist.
     /// Returns a set of hashes that are already stored.
-    pub fn existing_content_hashes(&self, hashes: &[String]) -> Result<std::collections::HashSet<String>> {
+    /// Stored `content_hash` per memory id (ids not stored are absent).
+    pub fn stored_content_hashes(&self, memory_ids: &[String]) -> Result<HashMap<String, String>> {
+        let mut out = HashMap::with_capacity(memory_ids.len());
+        let conn = self.get_conn()?;
+        for chunk in memory_ids.chunks(256) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let mut stmt = conn.prepare_cached(&format!(
+                "SELECT memory_id, content_hash FROM memories WHERE memory_id IN ({placeholders})"
+            ))?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (id, hash) = row?;
+                out.insert(id, hash);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Source turns (not derived records) of one session with
+    /// `lo <= turn_index <= hi`, ordered by turn: `(memory_id, turn, role, content)`.
+    pub fn session_turn_window(
+        &self,
+        entity_id: &str,
+        session_id: &str,
+        lo: u32,
+        hi: u32,
+    ) -> Result<Vec<(String, u32, String, String)>> {
+        let conn = self.get_conn()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT memory_id, turn_index, role, content FROM memories
+             WHERE entity_id = ?1 AND session_id = ?2 AND turn_index BETWEEN ?3 AND ?4
+               AND (parent_memory_id IS NULL OR memory_id = parent_memory_id || '::c0')
+             ORDER BY turn_index, rowid",
+        )?;
+        let rows = stmt.query_map(params![entity_id, session_id, lo, hi], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Replaces stored embeddings of existing memories and returns
+    /// `(vector_id, entity_id, embedding)` for updating the vector index.
+    /// Memories stored without a vector are skipped.
+    pub fn update_embeddings(
+        &self,
+        updates: &[(String, Vec<f32>)],
+    ) -> Result<Vec<(u64, String, Vec<f32>)>> {
+        let mut conn = self.get_conn()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut applied = Vec::with_capacity(updates.len());
+        {
+            let mut select = tx.prepare_cached(
+                "SELECT vector_id, entity_id FROM vector_lookup WHERE memory_id = ?1",
+            )?;
+            let mut update =
+                tx.prepare_cached("UPDATE vector_lookup SET embedding = ?1 WHERE vector_id = ?2")?;
+            for (memory_id, embedding) in updates {
+                let found = match select.query_row(params![memory_id], |row| {
+                    Ok((row.get::<_, i64>(0)? as u64, row.get::<_, String>(1)?))
+                }) {
+                    Ok(found) => found,
+                    Err(rusqlite::Error::QueryReturnedNoRows) => continue,
+                    Err(err) => return Err(err.into()),
+                };
+                update.execute(params![vec_f32_to_bytes(embedding), found.0 as i64])?;
+                applied.push((found.0, found.1, embedding.clone()));
+            }
+        }
+        tx.commit()?;
+        Ok(applied)
+    }
+
+    pub fn existing_content_hashes(
+        &self,
+        hashes: &[String],
+    ) -> Result<std::collections::HashSet<String>> {
         let conn = self.get_conn()?;
         let mut found = std::collections::HashSet::new();
-        let mut stmt = conn.prepare_cached(
-            "SELECT content_hash FROM memories WHERE content_hash = ?1",
-        )?;
+        let mut stmt =
+            conn.prepare_cached("SELECT content_hash FROM memories WHERE content_hash = ?1")?;
         for h in hashes {
             let exists: bool = stmt
                 .query_row(params![h], |row| row.get::<_, String>(0))
@@ -1305,6 +1240,7 @@ impl TenantStore {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn get_linked_memories(&self, memory_id: &str) -> Result<Vec<String>> {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
@@ -1330,7 +1266,9 @@ impl TenantStore {
             "WITH RECURSIVE
                bfs(node, depth, path_weight) AS (
                  SELECT ?1, 0, 1.0
-                 UNION ALL
+                 -- UNION (not ALL): links are stored in both directions, so the
+                 -- same neighbour is reached twice per hop and was double-counted.
+                 UNION
                  SELECT
                    CASE WHEN ml.source_memory_id = bfs.node THEN ml.target_memory_id ELSE ml.source_memory_id END,
                    bfs.depth + 1,
@@ -1372,12 +1310,12 @@ impl TenantStore {
              WHERE e.memory_id != ?1
                AND (?2 IS NULL OR e.edge_type = ?2)
              ORDER BY e.weight DESC
-             LIMIT ?3"
+             LIMIT ?3",
         )?;
-        let rows = stmt.query_map(
-            params![seed_memory_id, edge_type_filter, limit as i64],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)? as f32))
-        )?;
+        let rows = stmt
+            .query_map(params![seed_memory_id, edge_type_filter, limit as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)? as f32))
+            })?;
         let mut result = Vec::new();
         for row in rows {
             result.push(row?);
@@ -1393,13 +1331,25 @@ impl TenantStore {
         seed_memory_id: &str,
         edge_type_filter: Option<&str>,
         limit: usize,
+        max_node_degree: usize,
     ) -> Result<Vec<(String, f32, String)>> {
         let conn = self.get_conn()?;
+        // Nodes with more than `max_node_degree` edges are not traversed. Such
+        // hubs (the entity id, speaker labels like "assistant", header words
+        // from derived text, the empty name) connect nearly every memory, carry
+        // no relational signal, and made each hop scan thousands of edges.
+        // Degree counts are capped so checking a hub stays cheap.
         let mut stmt = conn.prepare_cached(
             "WITH seed_nodes AS (
-                 SELECT source AS node FROM edges WHERE memory_id = ?1
-                 UNION ALL
-                 SELECT target AS node FROM edges WHERE memory_id = ?1
+                 SELECT node FROM (
+                     SELECT source AS node FROM edges WHERE memory_id = ?1
+                     UNION ALL
+                     SELECT target AS node FROM edges WHERE memory_id = ?1
+                 )
+                 WHERE node != ''
+                   AND (SELECT COUNT(*) FROM (SELECT 1 FROM edges x WHERE x.source = node LIMIT ?4 + 1))
+                     + (SELECT COUNT(*) FROM (SELECT 1 FROM edges y WHERE y.target = node LIMIT ?4 + 1))
+                     <= ?4
              )
              SELECT memory_id, weight, edge_type FROM (
                  SELECT e.memory_id, e.weight, e.edge_type
@@ -1414,20 +1364,135 @@ impl TenantStore {
                  WHERE e.memory_id != ?1
                    AND (?2 IS NULL OR e.edge_type = ?2)
              )
-             ORDER BY weight DESC
-             LIMIT ?3"
+             ORDER BY weight DESC, memory_id
+             LIMIT ?3",
         )?;
         let rows = stmt.query_map(
-            params![seed_memory_id, edge_type_filter, limit as i64],
-            |row| Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, f64>(1)? as f32,
-                row.get::<_, String>(2)?,
-            ))
+            params![seed_memory_id, edge_type_filter, limit as i64, max_node_degree as i64],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, f64>(1)? as f32,
+                    row.get::<_, String>(2)?,
+                ))
+            },
         )?;
-        let mut result = Vec::new();
-        for row in rows {
-            result.push(row?);
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Batched form of `get_edge_cluster_neighbors_typed` for many memories:
+    /// the same rows (including multiplicities) and ordering per memory, from
+    /// a handful of `IN` queries instead of one query per memory.
+    pub fn get_edge_cluster_neighbors_batch(
+        &self,
+        memory_ids: &[String],
+        edge_type_filter: Option<&str>,
+        limit: usize,
+        max_node_degree: usize,
+    ) -> Result<HashMap<String, Vec<EdgeNeighbour>>> {
+        const CHUNK: usize = 400;
+        let conn = self.get_conn()?;
+        let placeholders = |n: usize| vec!["?"; n].join(",");
+
+        // Node multiset per memory (a node listed once per edge endpoint).
+        let mut nodes_of: HashMap<String, Vec<String>> = HashMap::new();
+        for ids in memory_ids.chunks(CHUNK) {
+            let mut stmt = conn.prepare_cached(&format!(
+                "SELECT memory_id, source, target FROM edges WHERE memory_id IN ({})",
+                placeholders(ids.len())
+            ))?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(ids), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            })?;
+            for row in rows {
+                let (memory_id, source, target) = row?;
+                let nodes = nodes_of.entry(memory_id).or_default();
+                nodes.extend([source, target].into_iter().filter(|n| !n.is_empty()));
+            }
+        }
+
+        let mut unique: Vec<String> = nodes_of.values().flatten().cloned().collect();
+        unique.sort();
+        unique.dedup();
+
+        // Degree = edges with the node as source + as target; hubs are skipped.
+        let mut degree: HashMap<String, usize> = HashMap::new();
+        for column in ["source", "target"] {
+            for nodes in unique.chunks(CHUNK) {
+                let mut stmt = conn.prepare_cached(&format!(
+                    "SELECT {column}, COUNT(*) FROM edges WHERE {column} IN ({}) GROUP BY {column}",
+                    placeholders(nodes.len())
+                ))?;
+                let rows = stmt.query_map(rusqlite::params_from_iter(nodes), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
+                })?;
+                for row in rows {
+                    let (node, count) = row?;
+                    *degree.entry(node).or_default() += count;
+                }
+            }
+        }
+        let traversable: Vec<String> = unique
+            .into_iter()
+            .filter(|n| degree.get(n).copied().unwrap_or(0) <= max_node_degree)
+            .collect();
+
+        type Incident = HashMap<String, Vec<(String, f32, String)>>;
+        let mut incident: [Incident; 2] = [HashMap::new(), HashMap::new()];
+        for (slot, column) in ["source", "target"].into_iter().enumerate() {
+            for nodes in traversable.chunks(CHUNK) {
+                // The filter is bound last: bare `?` markers number from 1.
+                let filter_idx = nodes.len() + 1;
+                let mut stmt = conn.prepare_cached(&format!(
+                    "SELECT {column}, memory_id, weight, edge_type FROM edges
+                     WHERE {column} IN ({}) AND memory_id IS NOT NULL
+                       AND (?{filter_idx} IS NULL OR edge_type = ?{filter_idx})",
+                    placeholders(nodes.len())
+                ))?;
+                let mut params: Vec<&dyn rusqlite::types::ToSql> =
+                    nodes.iter().map(|n| n as &dyn rusqlite::types::ToSql).collect();
+                params.push(&edge_type_filter);
+                let rows = stmt.query_map(params.as_slice(), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, f64>(2)? as f32,
+                        row.get::<_, String>(3)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (node, memory_id, weight, edge_type) = row?;
+                    incident[slot].entry(node).or_default().push((memory_id, weight, edge_type));
+                }
+            }
+        }
+
+        let traversable: std::collections::HashSet<&str> =
+            traversable.iter().map(String::as_str).collect();
+        let mut result = HashMap::with_capacity(memory_ids.len());
+        for memory_id in memory_ids {
+            let mut rows: Vec<(String, f32, String)> = Vec::new();
+            for node in nodes_of.get(memory_id).into_iter().flatten() {
+                if !traversable.contains(node.as_str()) {
+                    continue;
+                }
+                for side in &incident {
+                    rows.extend(
+                        side.get(node)
+                            .into_iter()
+                            .flatten()
+                            .filter(|(mid, _, _)| mid != memory_id)
+                            .cloned(),
+                    );
+                }
+            }
+            rows.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+            rows.truncate(limit);
+            result.insert(memory_id.clone(), rows);
         }
         Ok(result)
     }
@@ -1476,15 +1541,18 @@ impl TenantStore {
                     Err(_) => record.clone(),
                 };
                 let json = serde_json::to_string(&merged)?;
-                let rowid: i64 = upsert_stmt.query_row(params![
-                    merged.session_id,
-                    merged.entity_id,
-                    json,
-                    &merged.router_text,
-                    merged.created_at_ms.min(now),
-                    now,
-                ], |row| row.get(0))?;
-                
+                let rowid: i64 = upsert_stmt.query_row(
+                    params![
+                        merged.session_id,
+                        merged.entity_id,
+                        json,
+                        &merged.router_text,
+                        merged.created_at_ms.min(now),
+                        now,
+                    ],
+                    |row| row.get(0),
+                )?;
+
                 fts.execute(params![
                     rowid,
                     &merged.session_id,
@@ -1552,7 +1620,12 @@ impl TenantStore {
         };
 
         let mut hits = hits;
-        hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.session_id.cmp(&b.session_id))
+        });
         hits.truncate(limit);
         Ok(hits)
     }
@@ -1588,11 +1661,7 @@ impl TenantStore {
                     .filter(|part| part.len() >= FOCUS_MATCH_MIN_LEN)
                     .any(|part| record.session_focus.to_ascii_lowercase().contains(part));
 
-            if lexical_hits == 0
-                && temporal_hits == 0
-                && entity_hits == 0
-                && !exact_focus_hit
-            {
+            if lexical_hits == 0 && temporal_hits == 0 && entity_hits == 0 && !exact_focus_hit {
                 // Last-ditch accept: if the router_text has ANY of the raw query
                 // terms (not just the classified lexical/temporal/entity terms),
                 // keep the row. The classified term lists are often empty for
@@ -1601,8 +1670,8 @@ impl TenantStore {
                     .split_whitespace()
                     .filter(|t| t.len() > SEARCH_MIN_TERM_LEN)
                     .collect();
-                let has_raw_term = !lower_terms.is_empty()
-                    && lower_terms.iter().any(|t| lower.contains(t));
+                let has_raw_term =
+                    !lower_terms.is_empty() && lower_terms.iter().any(|t| lower.contains(t));
                 if !has_raw_term {
                     continue;
                 }
@@ -1702,7 +1771,7 @@ impl TenantStore {
             )?;
             let rows = stmt.query_map(
                 params![fts_query, entity_id, (subject_entities.len().saturating_mul(8)) as i64],
-                |row| Ok(row.get::<_, String>(0)?),
+                |row| row.get::<_, String>(0),
             )?;
             for row in rows.flatten() {
                 *session_to_hits.entry(row).or_insert(0) += 1;
@@ -1720,10 +1789,9 @@ impl TenantStore {
                 "SELECT session_id FROM session_router
                  WHERE entity_id = ?1 AND LOWER(router_text) LIKE ?2",
             )?;
-            let rows = stmt.query_map(
-                params![entity_id, format!("%{}%", needle)],
-                |row| Ok(row.get::<_, String>(0)?),
-            )?;
+            let rows = stmt.query_map(params![entity_id, format!("%{}%", needle)], |row| {
+                row.get::<_, String>(0)
+            })?;
             for row in rows.flatten() {
                 *session_to_hits.entry(row).or_insert(0) += 1;
             }
@@ -1739,7 +1807,12 @@ impl TenantStore {
                 session_id,
             })
             .collect();
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.session_id.cmp(&b.session_id))
+        });
         Ok(results)
     }
 
@@ -1782,39 +1855,242 @@ impl TenantStore {
         Ok(results)
     }
 
-    pub fn get_fact_versions_by_memory_ids(
+    /// Fact versions relevant to these memories, keyed by the id asked for.
+    ///
+    /// Facts are registered against derived records (cards, fact companions),
+    /// so a conversation turn is matched through its derived children. When a
+    /// turn has several, the version with the latest `valid_from_ms` wins. The
+    /// rows carry what superseded them and which memories state the same
+    /// value, for `why_stale` in results.
+    pub fn fact_versions_for_memories(
         &self,
         memory_ids: &[String],
-    ) -> Result<HashMap<String, (String, Option<String>)>> {
+    ) -> Result<HashMap<String, FactVersionRow>> {
         if memory_ids.is_empty() {
             return Ok(HashMap::new());
         }
         let conn = self.get_conn()?;
-        let placeholders: Vec<String> = memory_ids.iter().map(|_| "?".to_string()).collect();
-        let sql = format!(
-            "SELECT memory_id, fact_key, superseded_by FROM fact_versions WHERE memory_id IN ({})",
-            placeholders.join(",")
-        );
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            memory_ids.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
-        let rows = stmt.query_map(param_refs.as_slice(), |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-            ))
-        })?;
-        let mut result = HashMap::new();
-        for row in rows {
-            let (memory_id, fact_key, superseded_by) = row?;
-            result.insert(memory_id, (fact_key, superseded_by));
+        let mut rows_by_memory: HashMap<String, (String, FactVersionRow)> = HashMap::new();
+        for chunk in memory_ids.chunks(200) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let mut stmt = conn.prepare_cached(&format!(
+                "SELECT COALESCE(m.parent_memory_id, v.memory_id) AS asked_for,
+                        v.memory_id, v.fact_key, v.entity_id, v.object, v.status,
+                        v.valid_from_ms, v.valid_to_ms,
+                        -- Report the turn the client sent, not the derived
+                        -- record the fact was registered against.
+                        COALESCE(
+                            (SELECT sm.parent_memory_id FROM memories sm
+                              WHERE sm.memory_id = v.superseded_by),
+                            v.superseded_by
+                        ),
+                        (SELECT c.object FROM fact_versions c
+                          WHERE c.fact_key = v.fact_key AND c.entity_id = v.entity_id
+                            AND c.status = 'current' LIMIT 1),
+                        (SELECT s.timestamp_ms FROM fact_versions s
+                          WHERE s.fact_key = v.fact_key AND s.memory_id = v.superseded_by LIMIT 1)
+                 FROM fact_versions v
+                 LEFT JOIN memories m ON m.memory_id = v.memory_id
+                 WHERE v.memory_id IN ({placeholders})
+                    OR m.parent_memory_id IN ({placeholders})
+                 ORDER BY v.valid_from_ms, v.memory_id"
+            ))?;
+            let params: Vec<&dyn rusqlite::types::ToSql> = chunk
+                .iter()
+                .chain(chunk.iter())
+                .map(|s| s as &dyn rusqlite::types::ToSql)
+                .collect();
+            let mapped = stmt.query_map(params.as_slice(), |row| {
+                let status: String = row.get(5)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    FactVersionRow {
+                        fact_key: row.get(2)?,
+                        entity_id: row.get(3)?,
+                        object: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                        is_current: status == "current",
+                        valid_from_ms: row.get::<_, Option<i64>>(6)?.unwrap_or(0) as u64,
+                        valid_to_ms: row.get::<_, Option<i64>>(7)?.map(|v| v as u64),
+                        superseded_by: row.get(8)?,
+                        current_object: row.get(9)?,
+                        superseded_at_ms: row.get::<_, Option<i64>>(10)?.map(|v| v as u64),
+                        evidence: Vec::new(),
+                    },
+                ))
+            })?;
+            let wanted: std::collections::HashSet<&str> =
+                chunk.iter().map(String::as_str).collect();
+            for row in mapped {
+                let (asked_for, version_memory_id, version) = row?;
+                // Direct matches win over a turn's derived records; among
+                // derived records the ordering above leaves the latest.
+                let key = if wanted.contains(version_memory_id.as_str()) {
+                    version_memory_id.clone()
+                } else {
+                    asked_for
+                };
+                rows_by_memory.insert(key, (version_memory_id, version));
+            }
+        }
+
+        // Evidence per version, newest first.
+        let mut stmt = conn.prepare_cached(
+            "SELECT COALESCE(
+                        (SELECT em.parent_memory_id FROM memories em
+                          WHERE em.memory_id = e.memory_id),
+                        e.memory_id
+                    )
+             FROM fact_evidence e
+             WHERE e.entity_id = ?1 AND e.fact_key = ?2 AND e.version_memory_id = ?3
+             ORDER BY e.timestamp_ms DESC, e.memory_id",
+        )?;
+        let mut result = HashMap::with_capacity(rows_by_memory.len());
+        for (asked_for, (version_memory_id, mut version)) in rows_by_memory {
+            version.evidence = stmt
+                .query_map(
+                    params![version.entity_id, version.fact_key, version_memory_id],
+                    |row| row.get(0),
+                )?
+                .collect::<rusqlite::Result<_>>()?;
+            result.insert(asked_for, version);
         }
         Ok(result)
     }
 
+    /// Every version of one fact, oldest first: what the value was, when it
+    /// held, and which memories stated it. Ids are source turns where the
+    /// fact came from a derived record.
+    pub fn fact_history(&self, entity_id: &str, fact_key: &str) -> Result<Vec<FactHistoryEntry>> {
+        let conn = self.get_conn()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT v.memory_id,
+                    COALESCE(
+                        (SELECT m.parent_memory_id FROM memories m
+                          WHERE m.memory_id = v.memory_id),
+                        v.memory_id
+                    ),
+                    COALESCE(v.object, ''), v.status, v.valid_from_ms, v.valid_to_ms
+             FROM fact_versions v
+             WHERE v.entity_id = ?1 AND v.fact_key = ?2
+             ORDER BY v.valid_from_ms, v.memory_id",
+        )?;
+        let rows: Vec<(String, String, String, String, u64, Option<u64>)> = stmt
+            .query_map(params![entity_id, fact_key], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get::<_, Option<i64>>(4)?.unwrap_or(0) as u64,
+                    row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
+                ))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+
+        let mut evidence_stmt = conn.prepare_cached(
+            "SELECT COALESCE(
+                        (SELECT em.parent_memory_id FROM memories em
+                          WHERE em.memory_id = e.memory_id),
+                        e.memory_id
+                    )
+             FROM fact_evidence e
+             WHERE e.entity_id = ?1 AND e.fact_key = ?2 AND e.version_memory_id = ?3
+             ORDER BY e.timestamp_ms DESC, e.memory_id",
+        )?;
+        let mut history = Vec::with_capacity(rows.len());
+        for (version_id, memory_id, object, status, valid_from_ms, valid_to_ms) in rows {
+            history.push(FactHistoryEntry {
+                memory_id,
+                object,
+                is_current: status == "current",
+                valid_from_ms,
+                valid_to_ms,
+                evidence: evidence_stmt
+                    .query_map(params![entity_id, fact_key, version_id], |row| row.get(0))?
+                    .collect::<rusqlite::Result<_>>()?,
+            });
+        }
+        Ok(history)
+    }
+
+    /// Groups predicates by meaning: a predicate whose embedding is within
+    /// `tau` of a known group joins it, otherwise it starts its own. Returns
+    /// the canonical predicate for each input. Assignments are stored, so a
+    /// predicate keeps its group once chosen.
+    pub fn canonicalize_predicates(
+        &self,
+        entity_id: &str,
+        predicates: &[(String, Vec<f32>)],
+        tau: f32,
+    ) -> Result<HashMap<String, String>> {
+        let mut assigned = HashMap::with_capacity(predicates.len());
+        if predicates.is_empty() {
+            return Ok(assigned);
+        }
+        let mut conn = self.get_conn()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        {
+            let mut known = tx.prepare_cached(
+                "SELECT canonical FROM predicate_canon WHERE entity_id = ?1 AND predicate = ?2",
+            )?;
+            let mut groups = tx.prepare_cached(
+                "SELECT canonical, embedding FROM predicate_canon
+                 WHERE entity_id = ?1 AND predicate = canonical AND embedding IS NOT NULL",
+            )?;
+            let mut insert = tx.prepare_cached(
+                "INSERT OR REPLACE INTO predicate_canon (entity_id, predicate, canonical, embedding)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for (predicate, embedding) in predicates {
+                match known.query_row(params![entity_id, predicate], |row| row.get::<_, String>(0))
+                {
+                    Ok(canonical) => {
+                        assigned.insert(predicate.clone(), canonical);
+                        continue;
+                    }
+                    Err(rusqlite::Error::QueryReturnedNoRows) => {}
+                    Err(err) => return Err(err.into()),
+                }
+                let mut best: Option<(String, f32)> = None;
+                let candidates = groups.query_map(params![entity_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })?;
+                for candidate in candidates {
+                    let (canonical, bytes) = candidate?;
+                    let other = bytes_to_vec_f32(&bytes);
+                    if other.len() != embedding.len() {
+                        continue;
+                    }
+                    let similarity = crate::ml::cosine_similarity(embedding, &other);
+                    if similarity >= tau && best.as_ref().map_or(true, |(_, s)| similarity > *s) {
+                        best = Some((canonical, similarity));
+                    }
+                }
+                let canonical = match best {
+                    Some((canonical, _)) => canonical,
+                    None => predicate.clone(),
+                };
+                let stored_embedding =
+                    (canonical == *predicate).then(|| vec_f32_to_bytes(embedding));
+                insert.execute(params![entity_id, predicate, canonical, stored_embedding])?;
+                assigned.insert(predicate.clone(), canonical);
+            }
+        }
+        tx.commit()?;
+        Ok(assigned)
+    }
+
     // ── Fact Versions ──
 
+    /// Records fact versions and recomputes the validity chain of every
+    /// affected `(entity, fact_key)`: versions are ordered by timestamp, each is
+    /// valid until the next one starts, and only the latest is `current`.
+    /// Recomputing the whole chain keeps intervals correct when versions
+    /// arrive out of order (an earlier implementation only compared against
+    /// the current version, leaving overlapping intervals for backfilled
+    /// facts). Among equal timestamps the earlier-registered version stays
+    /// latest.
     pub fn register_fact_versions_batch(
         &self,
         entity_id: &str,
@@ -1822,67 +2098,116 @@ impl TenantStore {
     ) -> Result<Vec<FactVersionStatus>> {
         let mut conn = self.get_conn()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let mut statuses = Vec::new();
+        let recorded_at = unix_timestamp_ms()?;
+        let mut statuses = Vec::with_capacity(registrations.len());
         {
-            let mut select_stmt = tx.prepare_cached(
-                "SELECT memory_id, timestamp_ms FROM fact_versions WHERE fact_key = ?1 AND entity_id = ?2 AND status = 'current'",
+            let mut insert = tx.prepare_cached(
+                "INSERT INTO fact_versions (fact_key, memory_id, entity_id, subject, predicate, object, status, timestamp_ms, valid_from_ms, recorded_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'current', ?7, ?7, ?8)
+                 ON CONFLICT(fact_key, memory_id) DO NOTHING",
             )?;
-            let mut update_stmt = tx.prepare_cached(
-                "UPDATE fact_versions SET status = 'stale', superseded_by = ?1, valid_to_ms = ?4 WHERE fact_key = ?2 AND entity_id = ?3 AND status = 'current'",
+            let mut latest_stmt = tx.prepare_cached(
+                "SELECT memory_id, timestamp_ms FROM fact_versions
+                 WHERE fact_key = ?1 AND entity_id = ?2 AND status = 'current'",
             )?;
-            let mut insert_current = tx.prepare_cached(
-                "INSERT OR REPLACE INTO fact_versions (fact_key, memory_id, entity_id, subject, predicate, object, status, timestamp_ms, valid_from_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'current', ?7, ?7)",
+            let mut chain_stmt = tx.prepare_cached(
+                "SELECT memory_id, timestamp_ms, COALESCE(object, '') FROM fact_versions
+                 WHERE fact_key = ?1 AND entity_id = ?2
+                 ORDER BY timestamp_ms ASC, rowid DESC",
             )?;
-            let mut insert_stale = tx.prepare_cached(
-                "INSERT OR REPLACE INTO fact_versions (fact_key, memory_id, entity_id, subject, predicate, object, status, timestamp_ms, superseded_by, valid_from_ms, valid_to_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'stale', ?7, ?8, ?7, ?9)",
+            let mut evidence = tx.prepare_cached(
+                "INSERT OR IGNORE INTO fact_evidence
+                     (fact_key, entity_id, version_memory_id, memory_id, timestamp_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
             )?;
-            // NOTE: We intentionally do NOT delete from fts_memories here.
-            // fts_memories is an FTS5 virtual table with memory_id UNINDEXED,
-            // so DELETE by memory_id requires a full FTS index scan — O(N) in
-            // total DB size. As the database grows this dominated ingest time
-            // (400-500ms per batch). Stale FTS entries are harmless: the
-            // dedicated FTS indexing phase handles inserts correctly (INSERT OR
-            // REPLACE), and queries are not affected by leftover stale rows.
+            let mut update = tx.prepare_cached(
+                "UPDATE fact_versions
+                 SET status = ?1, valid_from_ms = ?2, valid_to_ms = ?3, superseded_by = ?4, supersedes = ?5
+                 WHERE fact_key = ?6 AND memory_id = ?7",
+            )?;
 
             for (fact_key, ts, memory_id, subject, predicate, object) in registrations {
-                let existing: Option<(String, u64)> = select_stmt
-                    .query_row(params![fact_key, entity_id], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
-                    })
-                    .ok();
-
-                match existing {
-                    Some((old_id, old_ts)) if old_id != *memory_id => {
-                        if *ts > old_ts {
-                            // Incoming is newer: supersede the old version
-                            update_stmt.execute(params![memory_id, fact_key, entity_id, *ts as i64])?;
-                            insert_current.execute(params![
-                                fact_key, memory_id, entity_id, subject, predicate, object, ts
-                            ])?;
-                            statuses.push(FactVersionStatus::Current {
-                                superseded: Some((*ts, old_id)),
-                            });
-                        } else {
-                            // Incoming is older or equal: mark incoming as stale, keep existing current
-                            insert_stale.execute(params![
-                                fact_key, memory_id, entity_id, subject, predicate, object, ts,
-                                old_id, old_ts as i64
-                            ])?;
-                            statuses.push(FactVersionStatus::Stale { current: (old_ts, old_id) });
-                        }
-                    }
-                    None => {
-                        insert_current.execute(params![
-                            fact_key, memory_id, entity_id, subject, predicate, object, ts
+                // A memory that restates the value already covering its
+                // timestamp confirms that version instead of starting a new
+                // one, so repeating "I live in Seattle" does not look like a
+                // change of residence.
+                let existing: Vec<(String, u64, String)> = chain_stmt
+                    .query_map(params![fact_key, entity_id], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)? as u64,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<_>>()?;
+                let covering = existing
+                    .iter()
+                    .rev()
+                    .find(|(_, version_ts, _)| version_ts <= ts)
+                    .or_else(|| existing.first());
+                if let Some((version_id, version_ts, version_object)) = covering {
+                    if version_id != memory_id && same_fact_object(version_object, object) {
+                        evidence.execute(params![
+                            fact_key, entity_id, version_id, memory_id, *ts as i64
                         ])?;
-                        statuses.push(FactVersionStatus::Current { superseded: None });
-                    }
-                    _ => {
-                        statuses.push(FactVersionStatus::Current { superseded: None });
+                        statuses.push(FactVersionStatus::Confirmed {
+                            version: (*version_ts, version_id.clone()),
+                        });
+                        continue;
                     }
                 }
+
+                let previous_latest: Option<(String, u64)> = match latest_stmt
+                    .query_row(params![fact_key, entity_id], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+                    }) {
+                    Ok(latest) => Some(latest),
+                    Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                    Err(err) => return Err(err.into()),
+                };
+
+                insert.execute(params![
+                    fact_key,
+                    memory_id,
+                    entity_id,
+                    subject,
+                    predicate,
+                    object,
+                    *ts as i64,
+                    recorded_at
+                ])?;
+
+                evidence.execute(params![fact_key, entity_id, memory_id, memory_id, *ts as i64])?;
+
+                let chain: Vec<(String, u64)> = chain_stmt
+                    .query_map(params![fact_key, entity_id], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+                    })?
+                    .collect::<rusqlite::Result<_>>()?;
+                for (idx, (version_id, version_ts)) in chain.iter().enumerate() {
+                    let next = chain.get(idx + 1);
+                    let prev = idx.checked_sub(1).map(|p| &chain[p]);
+                    update.execute(params![
+                        if next.is_none() { "current" } else { "stale" },
+                        *version_ts as i64,
+                        next.map(|(_, next_ts)| *next_ts as i64),
+                        next.map(|(next_id, _)| next_id.as_str()),
+                        prev.map(|(prev_id, _)| prev_id.as_str()),
+                        fact_key,
+                        version_id,
+                    ])?;
+                }
+
+                let (latest_id, latest_ts) = chain.last().expect("chain contains the new version");
+                statuses.push(if latest_id == memory_id {
+                    FactVersionStatus::Current {
+                        superseded: previous_latest
+                            .filter(|(id, _)| id != *memory_id)
+                            .map(|(id, t)| (t, id)),
+                    }
+                } else {
+                    FactVersionStatus::Stale { current: (*latest_ts, latest_id.clone()) }
+                });
             }
         }
         tx.commit()?;
@@ -1903,9 +2228,8 @@ impl TenantStore {
              WHERE fact_key = ?1 AND entity_id = ?2 AND status = 'current'
              ORDER BY timestamp_ms DESC LIMIT 1",
         )?;
-        let res = stmt.query_row(params![fact_key, entity_id], |row| {
-            row.get::<_, Option<String>>(0)
-        });
+        let res =
+            stmt.query_row(params![fact_key, entity_id], |row| row.get::<_, Option<String>>(0));
         match res {
             Ok(Some(value)) => Ok(Some(value)),
             Ok(None) => Ok(None),
@@ -1926,6 +2250,35 @@ impl TenantStore {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Read-modify-write of one entity's core profile inside a single
+    /// IMMEDIATE transaction, so concurrent ingests cannot overwrite each
+    /// other's updates. `update` returns `None` to leave the profile unchanged.
+    pub fn update_core_profile(
+        &self,
+        entity_id: &str,
+        update: impl FnOnce(Option<String>) -> Option<String>,
+    ) -> Result<()> {
+        let mut conn = self.get_conn()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let current = match tx.query_row(
+            "SELECT profile_json FROM core_profiles WHERE entity_id = ?1",
+            params![entity_id],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(json) => Some(json),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(err) => return Err(err.into()),
+        };
+        if let Some(next) = update(current) {
+            tx.execute(
+                "INSERT OR REPLACE INTO core_profiles (entity_id, profile_json, updated_at_ms) VALUES (?1, ?2, ?3)",
+                params![entity_id, next, unix_timestamp_ms()?],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn set_core_profile(&self, entity_id: &str, profile_json: &str) -> Result<()> {
@@ -1950,21 +2303,25 @@ impl TenantStore {
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
         // Get vector_id before deleting
-        let vector_id: Option<i64> = tx
-            .query_row(
-                "SELECT vector_id FROM vector_lookup WHERE memory_id = ?1",
-                params![memory_id],
-                |row| row.get(0),
-            )
-            .ok();
+        let vector_id: Option<i64> = match tx.query_row(
+            "SELECT vector_id FROM vector_lookup WHERE memory_id = ?1",
+            params![memory_id],
+            |row| row.get(0),
+        ) {
+            Ok(id) => Some(id),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(err) => return Err(err.into()),
+        };
 
-        let entity_id: String = tx
-            .query_row(
-                "SELECT entity_id FROM memories WHERE memory_id = ?1",
-                params![memory_id],
-                |row| row.get(0),
-            )
-            .unwrap_or_default();
+        let entity_id: String = match tx.query_row(
+            "SELECT entity_id FROM memories WHERE memory_id = ?1",
+            params![memory_id],
+            |row| row.get(0),
+        ) {
+            Ok(entity_id) => entity_id,
+            Err(rusqlite::Error::QueryReturnedNoRows) => String::new(),
+            Err(err) => return Err(err.into()),
+        };
 
         // Create tombstone
         let tombstone_id_val = format!("tombstone::{}", memory_id);
@@ -1988,7 +2345,8 @@ impl TenantStore {
 
         // Delete from memories and clean up FTS, centroids, and disambiguation vectors
         tx.execute("DELETE FROM memories WHERE memory_id = ?1", params![memory_id])?;
-        tx.execute("DELETE FROM fts_memories WHERE memory_id = ?1", params![memory_id])?;
+        tx.execute("DELETE FROM metrics WHERE memory_id = ?1", params![memory_id])?;
+        tx.execute("DELETE FROM fts_memories WHERE rowid = ?1", params![fts_rowid(memory_id)])?;
         tx.execute("DELETE FROM negative_centroids WHERE memory_id = ?1", params![memory_id])?;
         tx.execute("DELETE FROM disambiguation_vectors WHERE memory_id = ?1", params![memory_id])?;
         tx.execute("DELETE FROM vector_lookup WHERE memory_id = ?1", params![memory_id])?;
@@ -1997,40 +2355,37 @@ impl TenantStore {
             "DELETE FROM memory_links WHERE source_memory_id = ?1 OR target_memory_id = ?1",
             params![memory_id],
         )?;
-        // Cascade chunks: if this memory was a parent that was chunked, the
-        // child chunks have card_id = "{parent}::ct{N}" and source_memory_id
-        // = parent. Clean them up.
-        let chunk_pattern = format!("{}::ct%", memory_id);
-        
-        let mut chunk_rowids: Vec<i64> = Vec::new();
-        {
-            let mut stmt = tx.prepare("SELECT rowid FROM memories WHERE source_memory_id = ?1 OR memory_id LIKE ?2")?;
-            let mut rows = stmt.query(params![memory_id, chunk_pattern])?;
-            while let Some(row) = rows.next()? {
-                chunk_rowids.push(row.get(0)?);
-            }
-        }
-        
-        let _chunk_rows = tx.execute(
-            "DELETE FROM memory_cards WHERE source_memory_id = ?1 OR card_id LIKE ?2",
-            params![memory_id, chunk_pattern],
+        // Cascade to every record derived from this memory (chunks, companions,
+        // cards): their ids extend "{parent}::". Match the prefix literally
+        // (LIKE would treat `%`/`_` inside the id as wildcards).
+        let chunk_prefix = format!("{}::", memory_id);
+        let chunks: Vec<(String, Option<i64>)> = {
+            let mut stmt = tx.prepare(
+                "SELECT m.memory_id, v.vector_id FROM memories m
+                 LEFT JOIN vector_lookup v ON v.memory_id = m.memory_id
+                 WHERE substr(m.memory_id, 1, length(?1)) = ?1",
+            )?;
+            let rows =
+                stmt.query_map(params![chunk_prefix], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        tx.execute(
+            "DELETE FROM memory_cards WHERE source_memory_id = ?1 OR substr(card_id, 1, length(?2)) = ?2",
+            params![memory_id, chunk_prefix],
         )?;
-        
-        if !chunk_rowids.is_empty() {
-            let placeholders: Vec<String> = chunk_rowids.iter().map(|_| "?".to_string()).collect();
-            let sql = format!("DELETE FROM fts_memories WHERE rowid IN ({})", placeholders.join(","));
-            let params: Vec<&dyn rusqlite::types::ToSql> = chunk_rowids.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
-            tx.execute(&sql, params.as_slice())?;
-            
-            let sql2 = format!("DELETE FROM memories WHERE rowid IN ({})", placeholders.join(","));
-            tx.execute(&sql2, params.as_slice())?;
+        let mut chunk_vector_ids = Vec::new();
+        for (chunk_id, chunk_vector_id) in &chunks {
+            tx.execute("DELETE FROM fts_memories WHERE rowid = ?1", params![fts_rowid(chunk_id)])?;
+            tx.execute("DELETE FROM vector_lookup WHERE memory_id = ?1", params![chunk_id])?;
+            tx.execute("DELETE FROM memories WHERE memory_id = ?1", params![chunk_id])?;
+            chunk_vector_ids.extend(chunk_vector_id.map(|v| v as u64));
         }
-
 
         tx.commit()?;
 
         Ok(DeletedObservation {
             vector_id: vector_id.map(|v| v as u64),
+            chunk_vector_ids,
             entity_id,
             tombstone: Some(tombstone),
         })
@@ -2038,52 +2393,50 @@ impl TenantStore {
 
     // ── Turn / Ledger ──
 
+    /// Conversation turns as stored in `memories`, keyed by the requested id.
+    /// A chunked memory is reassembled from its `::cN` chunks.
     pub fn get_ledger_turns_batch(
         &self,
         turn_ids: &[String],
     ) -> Result<std::collections::HashMap<String, LedgerTurn>> {
+        let mut result = std::collections::HashMap::new();
         if turn_ids.is_empty() {
-            return Ok(std::collections::HashMap::new());
+            return Ok(result);
         }
         let conn = self.get_conn()?;
-        let placeholders: Vec<String> = turn_ids.iter().map(|_| "?".to_string()).collect();
-        let sql = format!(
-            "SELECT turn_id, entity_id, session_id, speaker, turn_index, raw_text,
-                    document_time_ms, ingest_time_ms, source_type, source_uri, raw_sha256,
-                    redaction_state, lifecycle, schema_version
-             FROM ledger_turns WHERE turn_id IN ({})",
-            placeholders.join(",")
-        );
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            turn_ids.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
-        let rows = stmt.query_map(param_refs.as_slice(), |row| {
-            let lifecycle_str: Option<String> = row.get(12)?;
-            Ok(LedgerTurn {
-                turn_id: row.get(0)?,
-                entity_id: row.get(1)?,
-                session_id: row.get(2)?,
-                speaker: row.get(3)?,
-                turn_index: row.get::<_, i32>(4)? as u32,
-                raw_text: row.get(5)?,
-                document_time_ms: row.get::<_, i64>(6)? as u64,
-                ingest_time_ms: row.get::<_, i64>(7)? as u64,
-                source_type: row.get(8)?,
-                source_uri: row.get(9)?,
-                raw_sha256: row.get(10)?,
-                redaction_state: row.get(11)?,
-                lifecycle: lifecycle_str.and_then(|s| serde_json::from_str(&s).ok()),
-                schema_version: row.get::<_, i32>(13)? as u32,
-            })
-        })?;
-        let mut result = std::collections::HashMap::new();
-        for row in rows {
-            let turn = row?;
-            result.insert(turn.turn_id.clone(), turn);
+        let wanted: std::collections::HashSet<&str> = turn_ids.iter().map(String::as_str).collect();
+        for ids in turn_ids.chunks(400) {
+            let placeholders = vec!["?"; ids.len()].join(",");
+            let sql = format!(
+                "SELECT memory_id, parent_memory_id, entity_id, session_id, role, turn_index,
+                        content, created_at_ms, content_hash
+                 FROM memories
+                 WHERE memory_id IN ({placeholders})
+                    OR (parent_memory_id IN ({placeholders})
+                        AND memory_id GLOB parent_memory_id || '::c[0-9]*')
+                 ORDER BY rowid"
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
+            let params: Vec<&dyn rusqlite::types::ToSql> =
+                ids.iter().chain(ids.iter()).map(|s| s as &dyn rusqlite::types::ToSql).collect();
+            let rows = stmt.query_map(params.as_slice(), memory_turn_row)?;
+            for row in rows {
+                let (memory_id, parent, turn) = row?;
+                let key = if wanted.contains(memory_id.as_str()) {
+                    memory_id
+                } else {
+                    match parent {
+                        Some(parent) => parent,
+                        None => continue,
+                    }
+                };
+                merge_turn(&mut result, key, turn);
+            }
         }
         Ok(result)
     }
 
+    /// Source turns of a session within `radius` of `turn_index`, in order.
     pub fn get_turn_window(
         &self,
         entity_id: &str,
@@ -2092,131 +2445,33 @@ impl TenantStore {
         radius: u32,
     ) -> Result<Vec<LedgerTurn>> {
         let conn = self.get_conn()?;
-        let min_idx = (turn_index as i64 - radius as i64).max(0);
-        let max_idx = turn_index as i64 + radius as i64;
+        let min_idx = turn_index.saturating_sub(radius);
+        let max_idx = turn_index.saturating_add(radius);
         let mut stmt = conn.prepare_cached(
-            "SELECT turn_id, entity_id, session_id, speaker, turn_index, raw_text,
-                    document_time_ms, ingest_time_ms, source_type, source_uri, raw_sha256,
-                    redaction_state, lifecycle, schema_version
-             FROM ledger_turns
-             WHERE entity_id = ?1 AND session_id = ?2 AND turn_index >= ?3 AND turn_index <= ?4
-             ORDER BY turn_index ASC",
+            "SELECT memory_id, parent_memory_id, entity_id, session_id, role, turn_index,
+                    content, created_at_ms, content_hash
+             FROM memories
+             WHERE entity_id = ?1 AND session_id = ?2 AND turn_index BETWEEN ?3 AND ?4
+               AND (parent_memory_id IS NULL
+                    OR memory_id GLOB parent_memory_id || '::c[0-9]*')
+             ORDER BY turn_index, rowid",
         )?;
-        let rows = stmt.query_map(params![entity_id, session_id, min_idx, max_idx], |row| {
-            let lifecycle_str: Option<String> = row.get(12)?;
-            Ok(LedgerTurn {
-                turn_id: row.get(0)?,
-                entity_id: row.get(1)?,
-                session_id: row.get(2)?,
-                speaker: row.get(3)?,
-                turn_index: row.get::<_, i32>(4)? as u32,
-                raw_text: row.get(5)?,
-                document_time_ms: row.get::<_, i64>(6)? as u64,
-                ingest_time_ms: row.get::<_, i64>(7)? as u64,
-                source_type: row.get(8)?,
-                source_uri: row.get(9)?,
-                raw_sha256: row.get(10)?,
-                redaction_state: row.get(11)?,
-                lifecycle: lifecycle_str.and_then(|s| serde_json::from_str(&s).ok()),
-                schema_version: row.get::<_, i32>(13)? as u32,
-            })
-        })?;
-        let mut results = Vec::with_capacity(rows.size_hint().0);
+        let rows =
+            stmt.query_map(params![entity_id, session_id, min_idx, max_idx], memory_turn_row)?;
+        let mut by_turn = std::collections::HashMap::new();
+        let mut order = Vec::new();
         for row in rows {
-            results.push(row?);
+            let (memory_id, parent, turn) = row?;
+            let key = parent.unwrap_or(memory_id);
+            if !by_turn.contains_key(&key) {
+                order.push(key.clone());
+            }
+            merge_turn(&mut by_turn, key, turn);
         }
-        Ok(results)
+        Ok(order.into_iter().filter_map(|key| by_turn.remove(&key)).collect())
     }
 
-    // ── Memory Artifacts ──
-
-    pub fn get_memory_artifacts_for_source(
-        &self,
-        memory_id: &str,
-        limit: usize,
-    ) -> Result<Vec<MemoryArtifact>> {
-        let conn = self.get_conn()?;
-        let search = format!("%{}%", memory_id);
-        let mut stmt = conn.prepare_cached(
-            "SELECT artifact_id, artifact_type, entity_id, source_turn_ids, source_memory_ids,
-                    source_session_ids, compiler_name, compiler_version, embedding_model,
-                    embedding_dim, index_namespace, lifecycle, created_at_ms, updated_at_ms
-             FROM memory_artifacts
-             WHERE source_memory_ids LIKE ?1
-             LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![search, limit as i64], |row| {
-            let lifecycle_str: Option<String> = row.get(11)?;
-            Ok(MemoryArtifact {
-                artifact_id: row.get(0)?,
-                artifact_type: row.get(1)?,
-                entity_id: row.get(2)?,
-                source_turn_ids: serde_json::from_str::<Vec<String>>(
-                    &row.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                )
-                .unwrap_or_default(),
-                source_memory_ids: serde_json::from_str::<Vec<String>>(
-                    &row.get::<_, Option<String>>(4)?.unwrap_or_default(),
-                )
-                .unwrap_or_default(),
-                source_session_ids: serde_json::from_str::<Vec<String>>(
-                    &row.get::<_, Option<String>>(5)?.unwrap_or_default(),
-                )
-                .unwrap_or_default(),
-                compiler_name: row.get(6)?,
-                compiler_version: row.get(7)?,
-                embedding_model: row.get(8)?,
-                embedding_dim: row.get::<_, Option<i64>>(9)?.map(|v| v as usize),
-                index_namespace: row.get(10)?,
-                lifecycle: lifecycle_str.and_then(|s| serde_json::from_str(&s).ok()),
-                created_at_ms: row.get::<_, i64>(12)? as u64,
-                updated_at_ms: row.get::<_, i64>(13)? as u64,
-            })
-        })?;
-        let mut results = Vec::with_capacity(rows.size_hint().0);
-        for row in rows {
-            results.push(row?);
-        }
-        Ok(results)
-    }
-
-    pub fn get_artifact_versions_for_artifacts(
-        &self,
-        artifact_ids: &[String],
-        limit: usize,
-    ) -> Result<Vec<crate::lifecycle::ArtifactVersionRecord>> {
-        if artifact_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let conn = self.get_conn()?;
-        let placeholders: Vec<String> = artifact_ids.iter().map(|_| "?".to_string()).collect();
-        let sql = format!(
-            "SELECT version_id, artifact_id, entity_id, version_data, created_at_ms
-             FROM artifact_versions WHERE artifact_id IN ({}) ORDER BY created_at_ms DESC LIMIT ?",
-            placeholders.join(",")
-        );
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let mut param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            artifact_ids.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
-        let limit_i64 = limit as i64;
-        param_refs.push(&limit_i64);
-        let rows = stmt.query_map(param_refs.as_slice(), |row| {
-            Ok(crate::lifecycle::ArtifactVersionRecord {
-                version_id: row.get::<_, String>(0)?,
-                artifact_id: row.get::<_, String>(1)?,
-                operation: "version".to_string(),
-                previous_version_id: None,
-                compiler_version: row.get::<_, String>(3).unwrap_or_default(),
-                reason: String::new(),
-                created_at_ms: row.get::<_, i64>(4)? as u64,
-            })
-        })?;
-        let mut results = Vec::with_capacity(rows.size_hint().0);
-        for row in rows {
-            results.push(row?);
-        }
-        Ok(results)
-    }
+    // ── Deletion tombstones ──
 
     pub fn get_deletion_tombstones_for_target(
         &self,
@@ -2322,8 +2577,11 @@ impl TenantStore {
             } else {
                 temporal_hits as f32 / query.temporal_terms.len() as f32
             };
-            let entity_coverage =
-                if query.entities.is_empty() { 0.0 } else { entity_hits as f32 / query.entities.len() as f32 };
+            let entity_coverage = if query.entities.is_empty() {
+                0.0
+            } else {
+                entity_hits as f32 / query.entities.len() as f32
+            };
 
             let type_boost = match card_type.as_str() {
                 "fact" => FACT_TYPE_BOOST,
@@ -2355,7 +2613,12 @@ impl TenantStore {
             });
         }
 
-        hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.card_id.cmp(&b.card_id))
+        });
         hits.truncate(query.limit);
         Ok(hits)
     }
@@ -2369,7 +2632,7 @@ impl TenantStore {
         entity_id: Option<&str>,
     ) -> Result<Vec<(String, f32)>> {
         let conn = self.get_conn()?;
-        
+
         let cleaned = query.replace(|c: char| !c.is_alphanumeric() && c != ' ', " ");
         let mut terms: Vec<String> = cleaned
             .split_whitespace()
@@ -2421,8 +2684,8 @@ impl TenantStore {
     pub fn fts_index_text(&self, memory_id: &str, content: &str, entity_id: &str) -> Result<()> {
         let conn = self.get_conn()?;
         conn.execute(
-            "INSERT OR REPLACE INTO fts_memories (memory_id, entity_id, content) VALUES (?1, ?2, ?3)",
-            params![memory_id, entity_id, content],
+            "INSERT OR REPLACE INTO fts_memories (rowid, memory_id, entity_id, content) VALUES (?1, ?2, ?3, ?4)",
+            params![fts_rowid(memory_id), memory_id, entity_id, content],
         )?;
         Ok(())
     }
@@ -2432,10 +2695,10 @@ impl TenantStore {
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         {
             let mut stmt = tx.prepare_cached(
-                "INSERT OR REPLACE INTO fts_memories (memory_id, entity_id, content) VALUES (?1, ?2, ?3)",
+                "INSERT OR REPLACE INTO fts_memories (rowid, memory_id, entity_id, content) VALUES (?1, ?2, ?3, ?4)",
             )?;
             for (memory_id, entity_id, content) in batch {
-                stmt.execute(params![memory_id, entity_id, content])?;
+                stmt.execute(params![fts_rowid(memory_id), memory_id, entity_id, content])?;
             }
         }
         tx.commit()?;
@@ -2444,7 +2707,7 @@ impl TenantStore {
 
     pub fn fts_remove_document(&self, memory_id: &str) -> Result<()> {
         let conn = self.get_conn()?;
-        conn.execute("DELETE FROM fts_memories WHERE memory_id = ?1", params![memory_id])?;
+        conn.execute("DELETE FROM fts_memories WHERE rowid = ?1", params![fts_rowid(memory_id)])?;
         Ok(())
     }
 
@@ -2456,10 +2719,7 @@ impl TenantStore {
 
     // ── Graph methods (delegated here) ──
 
-    pub fn graph_upsert_memory_batch(
-        &self,
-        batch: &GraphEdgeBatch<'_>,
-    ) -> Result<()> {
+    pub fn graph_upsert_memory_batch(&self, batch: &GraphEdgeBatch<'_>) -> Result<()> {
         let mut conn = self.get_conn()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         {
@@ -2468,11 +2728,24 @@ impl TenantStore {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )?;
             for entry in batch {
-                let edge_id = format!("edge::{}::{}::{}", entry.memory_id, entry.subject, entry.predicate);
+                // An empty node name would join every such edge into one hub.
+                if entry.subject.trim().is_empty() || entry.object.trim().is_empty() {
+                    continue;
+                }
+                let edge_id =
+                    format!("edge::{}::{}::{}", entry.memory_id, entry.subject, entry.predicate);
                 let label = format!("{} {} {}", entry.subject, entry.predicate, entry.object);
                 let weight = crate::graph::EdgeType::from_str(entry.predicate).default_weight();
                 stmt.execute(params![
-                    edge_id, entry.subject, entry.object, entry.predicate, label, entry.status, entry.timestamp as i64, entry.memory_id, weight as f64,
+                    edge_id,
+                    entry.subject,
+                    entry.object,
+                    entry.predicate,
+                    label,
+                    entry.status,
+                    entry.timestamp as i64,
+                    entry.memory_id,
+                    weight as f64,
                 ])?;
             }
         }
@@ -2481,24 +2754,41 @@ impl TenantStore {
     }
 
     /// Insert a single typed edge using owned strings (no lifetime issues).
-    pub fn graph_insert_edge(
+    /// Inserts `(memory_id, subject, predicate, object, timestamp_ms)` edges
+    /// in one transaction and returns how many were new; edges with an empty
+    /// part are skipped.
+    pub fn graph_insert_edges_batch(
         &self,
-        _entity_scope: &str,
-        memory_id: &str,
-        subject: &str,
-        predicate: &str,   // becomes edge_type
-        object: &str,
-        timestamp_ms: u64,
-    ) -> Result<()> {
-        let edge_id = format!("edge::{}::{}::{}", memory_id, subject, predicate);
-        let label = format!("{} {} {}", subject, predicate, object);
-        let conn = self.get_conn()?;
-        conn.execute(
-            "INSERT OR IGNORE INTO edges (edge_id, source, target, edge_type, label, status, timestamp_ms, memory_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'current', ?6, ?7)",
-            params![edge_id, subject, object, predicate, label, timestamp_ms as i64, memory_id],
-        )?;
-        Ok(())
+        edges: &[(&str, &str, &str, &str, u64)],
+    ) -> Result<usize> {
+        let mut written = 0;
+        if edges.is_empty() {
+            return Ok(written);
+        }
+        let mut conn = self.get_conn()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT OR IGNORE INTO edges (edge_id, source, target, edge_type, label, status, timestamp_ms, memory_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'current', ?6, ?7)",
+            )?;
+            for (memory_id, subject, predicate, object, timestamp_ms) in edges {
+                if subject.is_empty() || predicate.is_empty() || object.is_empty() {
+                    continue;
+                }
+                written += stmt.execute(params![
+                    format!("edge::{memory_id}::{subject}::{predicate}"),
+                    subject,
+                    object,
+                    predicate,
+                    format!("{subject} {predicate} {object}"),
+                    *timestamp_ms as i64,
+                    memory_id
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(written)
     }
 
     pub fn graph_upsert_fact_status_batch(
@@ -2597,34 +2887,29 @@ impl TenantStore {
 
     // ── Clear / Reset ──
 
+    /// Deletes every row in every tenant table (FTS shadow tables are
+    /// cleared through their virtual table). Enumerating `sqlite_master`
+    /// keeps `/reset` complete as tables are added; a hand-written list had
+    /// already missed centroids, registries and three FTS indexes.
     pub fn clear_all(&self) -> Result<()> {
-        let conn = self.get_conn()?;
-        conn.execute_batch(
-            "DELETE FROM memories;
-             DELETE FROM fts_memories;
-             DELETE FROM vector_lookup;
-             DELETE FROM memory_cards;
-             DELETE FROM edges;
-             DELETE FROM ledger_turns;
-             DELETE FROM memory_artifacts;
-             DELETE FROM artifact_versions;
-             DELETE FROM temporal_events;
-             DELETE FROM shadow_questions;
-             DELETE FROM facet_postings;
-             DELETE FROM mem_cells;
-             DELETE FROM mem_scenes;
-             DELETE FROM profile_facts;
-             DELETE FROM session_router;
-             DELETE FROM aliases;
-             DELETE FROM preferences;
-             DELETE FROM memory_links;
-             DELETE FROM fact_versions;
-             DELETE FROM card_relations;
-             DELETE FROM core_profiles;
-             DELETE FROM entity_embeddings;
-             DELETE FROM deletion_tombstones;
-             DELETE FROM metrics;",
-        )?;
+        let mut conn = self.get_conn()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tables: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                 AND (sql LIKE 'CREATE VIRTUAL TABLE%' OR name NOT IN (
+                     SELECT m.name FROM sqlite_master v, sqlite_master m
+                     WHERE v.sql LIKE 'CREATE VIRTUAL TABLE%' AND m.name LIKE v.name || '_%'
+                 ))",
+            )?;
+            let rows = stmt.query_map([], |row| row.get(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        for table in tables {
+            tx.execute(&format!("DELETE FROM \"{}\"", table.replace('"', "\"\"")), [])?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -2639,7 +2924,7 @@ impl TenantStore {
             .unwrap_or(0);
 
         let fact_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM profile_facts WHERE is_latest = 1", [], |row| {
+            .query_row("SELECT COUNT(*) FROM fact_versions WHERE status = 'current'", [], |row| {
                 row.get(0)
             })
             .unwrap_or(0);
@@ -2671,22 +2956,16 @@ impl TenantStore {
             conn.query_row("PRAGMA page_count", [], |row| row.get(0)).unwrap_or(0);
         let page_size: i64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0)).unwrap_or(0);
         let storage_bytes = page_count * page_size;
+        let free_pages: i64 =
+            conn.query_row("PRAGMA freelist_count", [], |row| row.get(0)).unwrap_or(0);
         Ok(crate::api::types::StorageStatsResponse {
+            used_bytes: ((page_count - free_pages).max(0) * page_size) as usize,
             memory_card_count: count("memory_cards") as usize,
             edge_count: count("edges") as usize,
             memory_count: count("memories") as usize,
             metric_count: count("metrics") as usize,
-            ledger_turn_count: count("ledger_turns") as usize,
-            memory_artifact_count: count("memory_artifacts") as usize,
-            temporal_event_count: count("temporal_events") as usize,
-            shadow_question_count: count("shadow_questions") as usize,
-            facet_posting_count: count("facet_postings") as usize,
-            mem_cell_count: count("mem_cells") as usize,
-            mem_scene_count: count("mem_scenes") as usize,
-            profile_fact_count: count("profile_facts") as usize,
             session_router_count: count("session_router") as usize,
             fact_version_count: count("fact_versions") as usize,
-            card_relation_count: count("card_relations") as usize,
             memory_link_count: count("memory_links") as usize,
             alias_count: count("aliases") as usize,
             preference_count: count("preferences") as usize,
@@ -2701,10 +2980,7 @@ impl TenantStore {
     /// Look up the highest-confidence, most-recent memory card for a given
     /// source memory_id. Returns the most recent `is_latest` card, or the
     /// most recent card of any kind if no `is_latest` row exists.
-    pub fn get_memory_card_by_source(
-        &self,
-        source_memory_id: &str,
-    ) -> Result<Option<MemoryCard>> {
+    pub fn get_memory_card_by_source(&self, source_memory_id: &str) -> Result<Option<MemoryCard>> {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT card_id, entity_id, user_id, source_memory_id, source_session_id,
@@ -2814,73 +3090,65 @@ impl TenantStore {
         Ok(results)
     }
 
-    pub fn get_disambiguation_vectors_batch(
+    /// Which of `memory_ids` are stale fact versions now.
+    pub fn invalidated_set(
         &self,
-        entity_id: &str,
-    ) -> Result<Vec<(String, Vec<f32>)>> {
-        let conn = self.get_conn()?;
-        let mut stmt = conn.prepare_cached(
-            "SELECT memory_id, vector_blob FROM disambiguation_vectors WHERE entity_id = ?1",
-        )?;
-        let rows = stmt.query_map(params![entity_id], |row| {
-            let memory_id: String = row.get(0)?;
-            let blob: Vec<u8> = row.get(1)?;
-            let vector = bytes_to_vec_f32(&blob);
-            Ok((memory_id, vector))
-        })?;
-        let mut results = Vec::with_capacity(rows.size_hint().0);
-        for row in rows {
-            results.push(row?);
-        }
-        Ok(results)
+        memory_ids: &[String],
+    ) -> Result<std::collections::HashSet<String>> {
+        self.invalidated_among(memory_ids, "status = 'stale'", None)
     }
 
-    pub fn get_negative_centroids_batch(&self, entity_id: &str) -> Result<Vec<(String, Vec<f32>)>> {
-        let conn = self.get_conn()?;
-        let mut stmt = conn.prepare_cached(
-            "SELECT memory_id, centroid_blob FROM negative_centroids WHERE entity_id = ?1",
-        )?;
-        let rows = stmt.query_map(params![entity_id], |row| {
-            let memory_id: String = row.get(0)?;
-            let blob: Vec<u8> = row.get(1)?;
-            let vector = bytes_to_vec_f32(&blob);
-            Ok((memory_id, vector))
-        })?;
-        let mut results = Vec::with_capacity(rows.size_hint().0);
-        for row in rows {
-            results.push(row?);
-        }
-        Ok(results)
+    /// Which of `memory_ids` were not the valid version at `point_in_time_ms`
+    /// (superseded before it, or not yet recorded).
+    pub fn invalidated_set_at_time(
+        &self,
+        point_in_time_ms: u64,
+        memory_ids: &[String],
+    ) -> Result<std::collections::HashSet<String>> {
+        self.invalidated_among(
+            memory_ids,
+            "((valid_to_ms IS NOT NULL AND valid_to_ms <= ?1) OR COALESCE(valid_from_ms, 0) > ?1)",
+            Some(point_in_time_ms),
+        )
     }
 
-    pub fn invalidated_set(&self) -> Result<std::collections::HashSet<String>> {
-        let conn = self.get_conn()?;
-        let mut stmt =
-            conn.prepare_cached("SELECT memory_id FROM fact_versions WHERE status = 'stale'")?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    /// Checks only the candidates a query is scoring instead of loading every
+    /// stale version in the tenant on each query.
+    fn invalidated_among(
+        &self,
+        memory_ids: &[String],
+        condition: &str,
+        point_in_time_ms: Option<u64>,
+    ) -> Result<std::collections::HashSet<String>> {
+        const CHUNK: usize = 500;
         let mut set = std::collections::HashSet::new();
-        for r in rows {
-            set.insert(r?);
+        if memory_ids.is_empty() {
+            return Ok(set);
         }
-        Ok(set)
-    }
-
-    pub fn invalidated_set_at_time(&self, point_in_time_ms: u64) -> Result<std::collections::HashSet<String>> {
         let conn = self.get_conn()?;
-        let mut stmt = conn.prepare_cached(
-            "SELECT memory_id FROM fact_versions 
-             WHERE (valid_to_ms IS NOT NULL AND valid_to_ms <= ?1)
-                OR (COALESCE(valid_from_ms, 0) > ?1)"
-        )?;
-        let rows = stmt.query_map(params![point_in_time_ms as i64], |row| row.get::<_, String>(0))?;
-        let mut set = std::collections::HashSet::new();
-        for r in rows {
-            set.insert(r?);
+        for chunk in memory_ids.chunks(CHUNK) {
+            let first_id_param = if point_in_time_ms.is_some() { 2 } else { 1 };
+            let placeholders: Vec<String> =
+                (0..chunk.len()).map(|i| format!("?{}", i + first_id_param)).collect();
+            let sql = format!(
+                "SELECT DISTINCT memory_id FROM fact_versions WHERE {condition} AND memory_id IN ({})",
+                placeholders.join(",")
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
+            let mut values: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() + 1);
+            if let Some(pit) = point_in_time_ms {
+                values.push(rusqlite::types::Value::Integer(pit as i64));
+            }
+            values.extend(chunk.iter().map(|m| rusqlite::types::Value::Text(m.clone())));
+            let rows =
+                stmt.query_map(rusqlite::params_from_iter(values), |row| row.get::<_, String>(0))?;
+            for row in rows {
+                set.insert(row?);
+            }
         }
         Ok(set)
     }
 }
-
 
 fn dedupe_append<T: Clone + PartialEq + Eq + std::hash::Hash>(base: &[T], extra: &[T]) -> Vec<T> {
     let mut seen: std::collections::HashSet<&T> = base.iter().collect();
@@ -3002,11 +3270,14 @@ impl TenantStore {
 
             for row in rows {
                 let (card_id, lifecycle_json) = row?;
-                if let Ok(mut lifecycle) = serde_json::from_str::<crate::lifecycle::LifecycleMetadata>(&lifecycle_json) {
+                if let Ok(mut lifecycle) =
+                    serde_json::from_str::<crate::lifecycle::LifecycleMetadata>(&lifecycle_json)
+                {
                     if lifecycle.lifecycle_state != crate::lifecycle::LifecycleState::Expired
                         && matches!(
                             lifecycle.retention_class,
-                            crate::lifecycle::RetentionClass::Ephemeral | crate::lifecycle::RetentionClass::Working
+                            crate::lifecycle::RetentionClass::Ephemeral
+                                | crate::lifecycle::RetentionClass::Working
                         )
                     {
                         lifecycle.lifecycle_state = crate::lifecycle::LifecycleState::Expired;
@@ -3023,7 +3294,7 @@ impl TenantStore {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             {
                 let mut update_stmt = tx.prepare_cached(
-                    "UPDATE memory_cards SET lifecycle = ?1, updated_at_ms = ?2 WHERE card_id = ?3"
+                    "UPDATE memory_cards SET lifecycle = ?1, updated_at_ms = ?2 WHERE card_id = ?3",
                 )?;
                 for (card_id, updated_json) in updates {
                     update_stmt.execute(params![updated_json, now_ms as i64, card_id])?;
@@ -3038,7 +3309,6 @@ impl TenantStore {
 // Re-import needed for artifact versions
 use serde::{Deserialize, Serialize};
 
-#[allow(dead_code)]
 fn vec_f32_to_bytes(v: &[f32]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(v.len() * 4);
     for &x in v {
@@ -3054,10 +3324,346 @@ fn bytes_to_vec_f32(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+/// Reads per-entity embeddings from `vector_lookup` for the vector index.
+struct SqliteVectorSource {
+    pool: Pool<SqliteConnectionManager>,
+}
+
+impl crate::vector_index::VectorSource for SqliteVectorSource {
+    fn entity_vectors(&self, entity_id: &str) -> Result<Vec<(u64, Vec<f32>)>> {
+        let conn = self.pool.get().context("failed to get connection")?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT vector_id, embedding FROM vector_lookup
+             WHERE entity_id = ?1 AND embedding IS NOT NULL ORDER BY vector_id",
+        )?;
+        let rows = stmt.query_map(params![entity_id], |row| {
+            Ok((row.get::<_, i64>(0)? as u64, bytes_to_vec_f32(&row.get::<_, Vec<u8>>(1)?)))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    fn entities(&self) -> Result<Vec<String>> {
+        let conn = self.pool.get().context("failed to get connection")?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT DISTINCT entity_id FROM vector_lookup WHERE embedding IS NOT NULL ORDER BY entity_id",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    fn vectors_by_id(&self, ids: &[u64]) -> Result<HashMap<u64, Vec<f32>>> {
+        let conn = self.pool.get().context("failed to get connection")?;
+        let mut out = HashMap::with_capacity(ids.len());
+        for chunk in ids.chunks(500) {
+            let mut stmt = conn.prepare_cached(&format!(
+                "SELECT vector_id, embedding FROM vector_lookup
+                 WHERE embedding IS NOT NULL AND vector_id IN ({})",
+                vec!["?"; chunk.len()].join(",")
+            ))?;
+            let params: Vec<i64> = chunk.iter().map(|id| *id as i64).collect();
+            let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
+                Ok((row.get::<_, i64>(0)? as u64, bytes_to_vec_f32(&row.get::<_, Vec<u8>>(1)?)))
+            })?;
+            for row in rows {
+                let (id, vector) = row?;
+                out.insert(id, vector);
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Whether two fact objects state the same value (whitespace, case and
+/// trailing punctuation ignored).
+fn same_fact_object(a: &str, b: &str) -> bool {
+    let normalize = |text: &str| {
+        text.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .trim_matches(|c: char| c.is_ascii_punctuation())
+            .to_ascii_lowercase()
+    };
+    !a.is_empty() && normalize(a) == normalize(b)
+}
+
+/// `(memory_id, weight, edge_type)` reached through a shared graph node.
+pub type EdgeNeighbour = (String, f32, String);
+
+type MemoryTurnRow = (String, Option<String>, LedgerTurn);
+
+fn memory_turn_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryTurnRow> {
+    let memory_id: String = row.get(0)?;
+    let parent: Option<String> = row.get(1)?;
+    let role: String = row.get(4)?;
+    let created_at_ms = row.get::<_, i64>(7)? as u64;
+    let turn = LedgerTurn {
+        turn_id: parent.clone().unwrap_or_else(|| memory_id.clone()),
+        entity_id: row.get(2)?,
+        session_id: row.get(3)?,
+        speaker: (!role.is_empty()).then_some(role),
+        turn_index: row.get::<_, i64>(5)? as u32,
+        raw_text: row.get(6)?,
+        document_time_ms: created_at_ms,
+        ingest_time_ms: created_at_ms,
+        source_type: "memory".to_string(),
+        source_uri: None,
+        raw_sha256: row.get(8)?,
+        redaction_state: "none".to_string(),
+        lifecycle: None,
+        schema_version: 2,
+    };
+    Ok((memory_id, parent, turn))
+}
+
+/// Adds a row to its turn; chunks of one memory are joined in rowid order.
+fn merge_turn(
+    turns: &mut std::collections::HashMap<String, LedgerTurn>,
+    key: String,
+    turn: LedgerTurn,
+) {
+    match turns.entry(key) {
+        std::collections::hash_map::Entry::Occupied(mut existing) => {
+            let existing = existing.get_mut();
+            existing.raw_text.push('\n');
+            existing.raw_text.push_str(&turn.raw_text);
+        }
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            let turn_id = slot.key().clone();
+            slot.insert(LedgerTurn { turn_id, ..turn });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn turn_obs(
+        session: &str,
+        turn: u32,
+        role: &str,
+        text: &str,
+        parent: Option<&str>,
+    ) -> AgentObservation {
+        AgentObservation {
+            entity_id: "alice".into(),
+            textual_content: text.into(),
+            created_at_ms: 1_000 + u64::from(turn),
+            session_id: session.into(),
+            turn_index: turn,
+            role: role.into(),
+            parent_memory_id: parent.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    fn register(
+        store: &TenantStore,
+        entity: &str,
+        items: &[(&str, u64, &str, &str)],
+    ) -> Vec<FactVersionStatus> {
+        let registrations: Vec<(&str, u64, &str, &str, &str, &str)> = items
+            .iter()
+            .map(|(key, ts, memory_id, object)| (*key, *ts, *memory_id, entity, *key, *object))
+            .collect();
+        store.register_fact_versions_batch(entity, &registrations).unwrap()
+    }
+
+    #[test]
+    fn restatements_become_evidence_instead_of_new_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TenantStore::new(&dir.path().join("t.db")).unwrap();
+        let statuses = register(
+            &store,
+            "alice",
+            &[
+                ("residence", 100, "m1", "Austin"),
+                // Same value restated, with different spacing and case.
+                ("residence", 150, "m2", " austin "),
+                ("residence", 200, "m3", "Seattle"),
+            ],
+        );
+        assert!(matches!(statuses[0], FactVersionStatus::Current { superseded: None }));
+        assert!(
+            matches!(&statuses[1], FactVersionStatus::Confirmed { version } if version.1 == "m1")
+        );
+        assert!(
+            matches!(&statuses[2], FactVersionStatus::Current { superseded: Some((_, id)) } if id == "m1")
+        );
+
+        let rows =
+            store.fact_versions_for_memories(&["m1".into(), "m2".into(), "m3".into()]).unwrap();
+        // The restatement has no version row of its own.
+        assert!(!rows.contains_key("m2"));
+        let stale = &rows["m1"];
+        assert!(!stale.is_current);
+        assert_eq!(stale.object, "Austin");
+        assert_eq!(stale.superseded_by.as_deref(), Some("m3"));
+        assert_eq!(stale.current_object.as_deref(), Some("Seattle"));
+        assert_eq!(stale.superseded_at_ms, Some(200));
+        assert_eq!(stale.evidence, vec!["m2".to_string(), "m1".to_string()]);
+        assert_eq!(stale.superseded_by.as_deref(), Some("m3"), "no derived parent to map to");
+        assert!(rows["m3"].is_current);
+
+        // A turn is matched through its derived records: the fact lives on
+        // `turn::card0`, but asking for the turn finds it.
+        store
+            .insert_observations_batch(&[(
+                300,
+                "turn::card0".to_string(),
+                AgentObservation {
+                    entity_id: "alice".into(),
+                    textual_content: "Atomic memory card: I work at Globex".into(),
+                    parent_memory_id: Some("turn".into()),
+                    ..Default::default()
+                },
+            )])
+            .unwrap();
+        register(&store, "alice", &[("employer", 300, "turn::card0", "Globex")]);
+        let via_turn = store.fact_versions_for_memories(&["turn".into()]).unwrap();
+        assert_eq!(via_turn["turn"].object, "Globex");
+        assert!(via_turn["turn"].is_current);
+        assert_eq!(
+            store.get_current_fact_value("alice", "residence").unwrap().as_deref(),
+            Some("Seattle")
+        );
+    }
+
+    #[test]
+    fn predicate_variants_join_one_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TenantStore::new(&dir.path().join("t.db")).unwrap();
+        // "job title" and "job_title" get near-identical embeddings; "pet
+        // name" is unrelated.
+        let job = vec![1.0, 0.0, 0.0];
+        let job_variant = vec![0.99, 0.10, 0.0];
+        let pet = vec![0.0, 1.0, 0.0];
+        let assigned = store
+            .canonicalize_predicates(
+                "alice",
+                &[
+                    ("job title".to_string(), job),
+                    ("job_title".to_string(), job_variant.clone()),
+                    ("pet name".to_string(), pet),
+                ],
+                0.86,
+            )
+            .unwrap();
+        assert_eq!(assigned["job title"], "job title");
+        assert_eq!(assigned["job_title"], "job title", "variant joins the first group");
+        assert_eq!(assigned["pet name"], "pet name");
+
+        // Assignments are stable across calls, even with a different vector.
+        let again = store
+            .canonicalize_predicates(
+                "alice",
+                &[("job_title".to_string(), vec![0.0, 0.0, 1.0])],
+                0.86,
+            )
+            .unwrap();
+        assert_eq!(again["job_title"], "job title");
+        // Another entity groups independently.
+        let other = store
+            .canonicalize_predicates("bob", &[("job_title".to_string(), job_variant)], 0.86)
+            .unwrap();
+        assert_eq!(other["job_title"], "job_title");
+    }
+
+    #[test]
+    fn turn_window_reads_stored_turns_and_joins_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TenantStore::new(&dir.path().join("t.db")).unwrap();
+        let items = vec![
+            (1_000, "m0".to_string(), turn_obs("s", 0, "user", "hello", None)),
+            (1_001, "m1::c0".to_string(), turn_obs("s", 1, "assistant", "part one", Some("m1"))),
+            (1_001, "m1::c1".to_string(), turn_obs("s", 1, "assistant", "part two", Some("m1"))),
+            (1_001, "m1::gist".to_string(), turn_obs("s", 1, "", "a gist", Some("m1"))),
+            (1_002, "m2".to_string(), turn_obs("s", 2, "user", "bye", None)),
+            (1_003, "other".to_string(), turn_obs("t", 1, "user", "elsewhere", None)),
+        ];
+        store.insert_observations_batch(&items).unwrap();
+
+        let window = store.get_turn_window("alice", "s", 1, 1).unwrap();
+        let summary: Vec<(String, u32, Option<String>, String)> =
+            window.into_iter().map(|t| (t.turn_id, t.turn_index, t.speaker, t.raw_text)).collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("m0".into(), 0, Some("user".into()), "hello".into()),
+                ("m1".into(), 1, Some("assistant".into()), "part one\npart two".into()),
+                ("m2".into(), 2, Some("user".into()), "bye".into()),
+            ]
+        );
+
+        let by_id =
+            store.get_ledger_turns_batch(&["m1".into(), "m2".into(), "nope".into()]).unwrap();
+        assert_eq!(by_id["m1"].raw_text, "part one\npart two");
+        assert_eq!(by_id["m2"].session_id, "s");
+        assert!(!by_id.contains_key("nope"));
+    }
+
+    #[test]
+    fn batched_edge_neighbours_match_per_memory_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TenantStore::new(&dir.path().join("t.db")).unwrap();
+        // Deterministic pseudo-random graph with a hub ("hub") and repeats.
+        let names = ["hub", "a", "b", "c", "d", "e", ""];
+        let mut state = 7u64;
+        let mut next = |m: u64| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) % m
+        };
+        let mut owned = Vec::new();
+        for i in 0..160 {
+            let memory = format!("m{}", next(40));
+            let source =
+                if i % 3 == 0 { "hub".to_string() } else { names[next(7) as usize].to_string() };
+            let target = names[next(7) as usize].to_string();
+            let predicate = ["p", "q"][next(2) as usize].to_string();
+            owned.push((memory, source, predicate, target, i as u64));
+        }
+        {
+            let conn = store.get_conn().unwrap();
+            for (i, (m, s, p, t, ts)) in owned.iter().enumerate() {
+                conn.execute(
+                    "INSERT INTO edges (edge_id, source, target, edge_type, weight, timestamp_ms, memory_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    rusqlite::params![format!("e{i}"), s, t, p, 1.0 + (i % 4) as f64, *ts as i64, m],
+                )
+                .unwrap();
+            }
+        }
+        let ids: Vec<String> = (0..42).map(|i| format!("m{i}")).collect();
+        for (filter, limit, degree) in [(None, 50, 40), (Some("p"), 7, 40), (None, 1000, 1000)] {
+            let batch =
+                store.get_edge_cluster_neighbors_batch(&ids, filter, limit, degree).unwrap();
+            for id in &ids {
+                let single =
+                    store.get_edge_cluster_neighbors_typed(id, filter, limit, degree).unwrap();
+                let key = |rows: &[(String, f32, String)]| {
+                    let mut v: Vec<(String, i64)> =
+                        rows.iter().map(|(m, w, _)| (m.clone(), (*w * 100.0) as i64)).collect();
+                    v.sort();
+                    v
+                };
+                assert_eq!(
+                    key(&batch[id]),
+                    key(&single),
+                    "memory {id} filter {filter:?} limit {limit}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn edge_batch_inserts_once_and_skips_incomplete_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TenantStore::new(&dir.path().join("t.db")).unwrap();
+        let edges = [("m1", "alice", "lives_in", "Denver", 5), ("m1", "alice", "", "x", 5)];
+        assert_eq!(store.graph_insert_edges_batch(&edges).unwrap(), 1);
+        assert_eq!(store.graph_insert_edges_batch(&edges).unwrap(), 0);
+    }
 
     #[test]
     fn test_tenant_memory_upsert_rowid_stability() {
@@ -3072,6 +3678,7 @@ mod tests {
             kind: MemoryKind::Fact,
             content_hash: String::new(),
             created_at_ms: 1000,
+            ..Default::default()
         };
 
         // Ingest first time
@@ -3087,6 +3694,7 @@ mod tests {
             kind: MemoryKind::Fact,
             content_hash: String::new(),
             created_at_ms: 2000,
+            ..Default::default()
         };
 
         let ids2 = store.insert_observations_batch(&[(2000, "mem-001".to_string(), obs2)]).unwrap();
@@ -3128,23 +3736,22 @@ mod tests {
         let db_path = temp.path().join("tenant.db");
         let store = TenantStore::new(&db_path).unwrap();
 
-        let registrations1 = vec![
-            ("fact_key_1", 100, "mem-100", "Caroline", "prefers", "counseling")
-        ];
+        let registrations1 =
+            vec![("fact_key_1", 100, "mem-100", "Caroline", "prefers", "counseling")];
         let statuses1 = store.register_fact_versions_batch("Caroline", &registrations1).unwrap();
         assert_eq!(statuses1.len(), 1);
 
-        let registrations2 = vec![
-            ("fact_key_1", 200, "mem-200", "Caroline", "prefers", "coaching")
-        ];
+        let registrations2 =
+            vec![("fact_key_1", 200, "mem-200", "Caroline", "prefers", "coaching")];
         let statuses2 = store.register_fact_versions_batch("Caroline", &registrations2).unwrap();
         assert_eq!(statuses2.len(), 1);
 
-        let stale_at_150 = store.invalidated_set_at_time(150).unwrap();
+        let ids = vec!["mem-100".to_string(), "mem-200".to_string()];
+        let stale_at_150 = store.invalidated_set_at_time(150, &ids).unwrap();
         assert!(stale_at_150.contains("mem-200"));
         assert!(!stale_at_150.contains("mem-100"));
 
-        let stale_at_250 = store.invalidated_set_at_time(250).unwrap();
+        let stale_at_250 = store.invalidated_set_at_time(250, &ids).unwrap();
         assert!(stale_at_250.contains("mem-100"));
         assert!(!stale_at_250.contains("mem-200"));
     }
@@ -3187,19 +3794,18 @@ mod tests {
         let db_path = temp.path().join("tenant.db");
         let store = TenantStore::new(&db_path).unwrap();
 
-        let registrations1 = vec![
-            ("pref_key_1", 100, "mem-pref-1", "Caroline", "prefers", "counseling")
-        ];
+        let registrations1 =
+            vec![("pref_key_1", 100, "mem-pref-1", "Caroline", "prefers", "counseling")];
         let statuses1 = store.register_fact_versions_batch("Caroline", &registrations1).unwrap();
         assert_eq!(statuses1.len(), 1);
 
-        let registrations2 = vec![
-            ("pref_key_1", 200, "mem-pref-2", "Caroline", "prefers", "coaching")
-        ];
+        let registrations2 =
+            vec![("pref_key_1", 200, "mem-pref-2", "Caroline", "prefers", "coaching")];
         let statuses2 = store.register_fact_versions_batch("Caroline", &registrations2).unwrap();
         assert_eq!(statuses2.len(), 1);
 
-        let stale_at_250 = store.invalidated_set_at_time(250).unwrap();
+        let ids = vec!["mem-pref-1".to_string(), "mem-pref-2".to_string()];
+        let stale_at_250 = store.invalidated_set_at_time(250, &ids).unwrap();
         assert!(stale_at_250.contains("mem-pref-1"));
         assert!(!stale_at_250.contains("mem-pref-2"));
     }
@@ -3248,7 +3854,7 @@ mod tests {
             updated_at_ms: 100,
         };
 
-        store.ingest_cards(&[card.clone()]).unwrap();
+        store.ingest_cards(std::slice::from_ref(&card)).unwrap();
 
         // Sweep at time 500 (card has not expired)
         let swept = store.expire_records(500).unwrap();
@@ -3273,5 +3879,124 @@ mod tests {
         // Sweep again (already marked Expired, should not be returned again)
         let swept = store.expire_records(1500).unwrap();
         assert_eq!(swept, 0);
+    }
+
+    fn fact_chain(store: &TenantStore, fact_key: &str) -> Vec<(String, String, u64, Option<u64>)> {
+        let conn = store.get_conn().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT memory_id, status, valid_from_ms, valid_to_ms FROM fact_versions
+                 WHERE fact_key = ?1 ORDER BY valid_from_ms, rowid DESC",
+            )
+            .unwrap();
+        stmt.query_map(params![fact_key], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get::<_, i64>(2)? as u64,
+                row.get::<_, Option<i64>>(3)?.map(|v| v as u64),
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    #[test]
+    fn out_of_order_fact_versions_form_a_consistent_chain() {
+        let temp = tempdir().unwrap();
+        let store = TenantStore::new(&temp.path().join("tenant.db")).unwrap();
+        let register = |ts: u64, id: &str, city: &str| {
+            store
+                .register_fact_versions_batch(
+                    "user",
+                    &[("residence", ts, id, "user", "lives_in", city)],
+                )
+                .unwrap()
+                .remove(0)
+        };
+
+        assert!(matches!(
+            register(100, "m100", "Austin"),
+            FactVersionStatus::Current { superseded: None }
+        ));
+        assert!(matches!(register(50, "m50", "Boston"), FactVersionStatus::Stale { .. }));
+        assert!(matches!(register(75, "m75", "Denver"), FactVersionStatus::Stale { .. }));
+
+        let chain = fact_chain(&store, "residence");
+        assert_eq!(
+            chain,
+            vec![
+                ("m50".into(), "stale".into(), 50, Some(75)),
+                ("m75".into(), "stale".into(), 75, Some(100)),
+                ("m100".into(), "current".into(), 100, None),
+            ]
+        );
+
+        // As of t=80 only the t=75 version is valid (it used to overlap with t=50).
+        let ids: Vec<String> = ["m50", "m75", "m100"].iter().map(|s| s.to_string()).collect();
+        let invalid = store.invalidated_set_at_time(80, &ids).unwrap();
+        assert!(invalid.contains("m50") && invalid.contains("m100") && !invalid.contains("m75"));
+
+        match register(150, "m150", "Seattle") {
+            FactVersionStatus::Current { superseded: Some((ts, id)) } => {
+                assert_eq!((ts, id.as_str()), (100, "m100"));
+            }
+            other => panic!("unexpected status {other:?}"),
+        }
+        // Re-registering an existing version is idempotent.
+        assert!(matches!(
+            register(150, "m150", "Seattle"),
+            FactVersionStatus::Current { superseded: None }
+        ));
+        assert_eq!(fact_chain(&store, "residence").len(), 4);
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn fact_chain_invariants_hold_for_any_insertion_order(
+            timestamps in proptest::collection::vec(0u64..50, 1..8)
+        ) {
+            let temp = tempdir().unwrap();
+            let store = TenantStore::new(&temp.path().join("tenant.db")).unwrap();
+            // Distinct objects: equal values are merged as evidence for the
+            // version they restate (covered by its own test).
+            for (i, ts) in timestamps.iter().enumerate() {
+                let id = format!("m{i}");
+                let object = format!("o{i}");
+                store
+                    .register_fact_versions_batch(
+                        "e",
+                        &[("k", *ts, id.as_str(), "e", "p", object.as_str())],
+                    )
+                    .unwrap();
+            }
+            let chain = fact_chain(&store, "k");
+            proptest::prop_assert_eq!(chain.len(), timestamps.len());
+            proptest::prop_assert_eq!(chain.iter().filter(|c| c.1 == "current").count(), 1);
+            let last = chain.last().unwrap();
+            proptest::prop_assert_eq!(last.1.as_str(), "current");
+            proptest::prop_assert_eq!(last.2, *timestamps.iter().max().unwrap());
+            proptest::prop_assert_eq!(last.3, None);
+            for pair in chain.windows(2) {
+                // Each version ends exactly where the next begins.
+                proptest::prop_assert_eq!(pair[0].3, Some(pair[1].2));
+                proptest::prop_assert!(pair[0].2 <= pair[1].2);
+            }
+        }
+    }
+
+    #[test]
+    fn link_cluster_counts_bidirectional_link_once() {
+        let temp = tempdir().unwrap();
+        let store = TenantStore::new(&temp.path().join("tenant.db")).unwrap();
+        store
+            .set_memory_links_batch(&[
+                ("a".into(), "b".into(), "derived_from".into()),
+                ("b".into(), "a".into(), "derived_variant".into()),
+            ])
+            .unwrap();
+        let scores = store.get_link_cluster_scores("a", 1).unwrap();
+        assert!((scores["b"] - 0.6).abs() < 1e-6, "got {:?}", scores);
     }
 }

@@ -23,7 +23,14 @@ const MAX_ACTIVITY_SENTENCE_LENGTH: usize = 220;
 #[derive(Clone)]
 pub struct PlatformStore {
     pool: Pool<SqliteConnectionManager>,
+    /// When each API key's `last_used_ms` was last written, so authentication
+    /// does not issue a database write on every request.
+    key_touched:
+        std::sync::Arc<parking_lot::Mutex<std::collections::HashMap<String, std::time::Instant>>>,
 }
+
+/// Minimum interval between `last_used_ms` writes for one API key.
+const KEY_TOUCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct UserRecord {
@@ -156,7 +163,7 @@ impl PlatformStore {
         )
         .context("failed to initialize platform database schema")?;
 
-        Ok(Self { pool })
+        Ok(Self { pool, key_touched: Default::default() })
     }
 
     fn get_conn(&self) -> Result<r2d2::PooledConnection<SqliteConnectionManager>> {
@@ -682,6 +689,17 @@ impl PlatformStore {
     }
 
     fn touch_key(&self, key_id: &str) -> Result<()> {
+        let now = std::time::Instant::now();
+        {
+            let mut touched = self.key_touched.lock();
+            if touched
+                .get(key_id)
+                .is_some_and(|last| now.duration_since(*last) < KEY_TOUCH_INTERVAL)
+            {
+                return Ok(());
+            }
+            touched.insert(key_id.to_string(), now);
+        }
         let conn = self.get_conn()?;
         conn.execute(
             "UPDATE api_keys SET last_used_ms = ?1 WHERE key_id = ?2",
@@ -716,7 +734,7 @@ fn verify_password(password_hash: &str, password: &str) -> bool {
 
 fn is_safe_user_id(user_id: &str) -> bool {
     let len = user_id.len();
-    if len < 8 || len > 128 {
+    if !(8..=128).contains(&len) {
         return false;
     }
     if !user_id.starts_with("usr_") {

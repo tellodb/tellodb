@@ -20,7 +20,9 @@ pub struct AuthConfig {
 }
 
 impl AuthConfig {
-    pub fn from_env() -> Self {
+    /// Server auth from `TEMPORAL_MEMORY_API_KEY` / `TELLODB_API_KEY`. Debug
+    /// builds fall back to the test key; release builds require a key.
+    pub fn from_env() -> anyhow::Result<Self> {
         let api_key = env::var("TEMPORAL_MEMORY_API_KEY")
             .ok()
             .filter(|value| !value.trim().is_empty())
@@ -28,25 +30,26 @@ impl AuthConfig {
 
         let api_key = match api_key {
             Some(key) => key.trim().to_string(),
-            None => {
-                // In release builds, API key is required for security.
-                // In debug builds, fall back to the default test key so local dev works out of the box.
-                if cfg!(debug_assertions) {
-                    tracing::warn!(
-                        "WARNING: Using default test API key '{}'. Set TEMPORAL_MEMORY_API_KEY or TELLODB_API_KEY for production.",
-                        DEFAULT_TEST_API_KEY
-                    );
-                    DEFAULT_TEST_API_KEY.to_string()
-                } else {
-                    panic!(
-                        "FATAL: TEMPORAL_MEMORY_API_KEY or TELLODB_API_KEY must be set in production. \
-                         The default test key is not allowed in release builds."
-                    );
-                }
+            None if cfg!(debug_assertions) => {
+                tracing::warn!(
+                    "Using default test API key '{}'. Set TEMPORAL_MEMORY_API_KEY or TELLODB_API_KEY for production.",
+                    DEFAULT_TEST_API_KEY
+                );
+                DEFAULT_TEST_API_KEY.to_string()
             }
+            None => anyhow::bail!(
+                "TEMPORAL_MEMORY_API_KEY or TELLODB_API_KEY must be set to serve the HTTP API"
+            ),
         };
 
-        Self { api_key: Some(Arc::<str>::from(api_key)) }
+        Ok(Self { api_key: Some(Arc::<str>::from(api_key)) })
+    }
+
+    /// For in-process use (embedded API, CLI, stdio MCP), where no request
+    /// ever carries a key: a random key nobody knows.
+    pub fn embedded() -> Self {
+        let key: String = (0..4).map(|_| format!("{:016x}", rand::random::<u64>())).collect();
+        Self { api_key: Some(Arc::<str>::from(key)) }
     }
 
     pub fn is_required(&self) -> bool {
@@ -87,14 +90,8 @@ pub fn request_bearer_token(headers: &HeaderMap) -> Option<&str> {
     }
 }
 
-pub fn cors_allow_origins() -> Vec<HeaderValue> {
-    let configured = env::var("TEMPORAL_MEMORY_CORS_ALLOW_ORIGINS")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            env::var("TELLODB_CORS_ALLOW_ORIGINS").ok().filter(|value| !value.trim().is_empty())
-        })
-        .unwrap_or_else(|| "https://tellodb.com".to_string());
+pub fn parse_cors_allow_origins(raw: Option<&str>) -> Vec<HeaderValue> {
+    let configured = raw.map(str::trim).filter(|v| !v.is_empty()).unwrap_or("https://tellodb.com");
 
     let mut origins = configured
         .split(',')
@@ -113,6 +110,17 @@ pub fn cors_allow_origins() -> Vec<HeaderValue> {
     }
 
     origins
+}
+
+pub fn cors_allow_origins() -> Vec<HeaderValue> {
+    let configured = env::var("TEMPORAL_MEMORY_CORS_ALLOW_ORIGINS")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            env::var("TELLODB_CORS_ALLOW_ORIGINS").ok().filter(|value| !value.trim().is_empty())
+        });
+
+    parse_cors_allow_origins(configured.as_deref())
 }
 
 pub fn build_cors_layer() -> CorsLayer {
@@ -139,11 +147,14 @@ pub fn principal_user_id(principal: &RequestPrincipal) -> Option<&str> {
     }
 }
 
-pub fn principal_namespace_prefix(principal: &RequestPrincipal) -> Option<String> {
-    match principal {
-        RequestPrincipal::UserApiKey(auth) => Some(format!("{}::", auth.user_id)),
-        RequestPrincipal::GlobalApiKey => None,
-    }
+/// Prefix applied to entity and memory ids for this principal.
+///
+/// Always `None`: every user key already maps to its own tenant database
+/// (`principal_user_id`), so ids need no namespacing. The former
+/// `"{user_id}::"` prefix also broke the `entity::session::turn` id layout,
+/// making every platform user's session ids resolve to the entity name.
+pub fn principal_namespace_prefix(_principal: &RequestPrincipal) -> Option<String> {
+    None
 }
 
 pub fn scope_entity_id(entity_id: &str, prefix: Option<&str>) -> String {
@@ -210,7 +221,7 @@ pub fn authorize_request(
 /// migration that lets an attacker-controlled value flow into SQL still fails.
 pub fn is_valid_user_id(user_id: &str) -> bool {
     let len = user_id.len();
-    if len < 8 || len > 128 {
+    if !(8..=128).contains(&len) {
         return false;
     }
     if !user_id.starts_with("usr_") {
@@ -221,29 +232,36 @@ pub fn is_valid_user_id(user_id: &str) -> bool {
 
 // ── Rate limiting ──
 //
-// Per-key token bucket. Each API key (and the global API key) gets a bucket
-// sized at 2x the steady-state RPS with a burst of 8x. The bucket is refilled
-// lazily on every check. Buckets live in process memory; on restart, every
-// key gets a fresh budget. This is intentional: a single-instance engine
-// with in-process state can only enforce in-process quotas.
+// Token buckets held in process memory. Every request is charged to its
+// client address; requests carrying a user API key are additionally charged
+// to that key. The global (operator) key is exempt: it runs benchmarks and
+// admin jobs whose request rate would otherwise trip the limiter mid-run.
+// Idle buckets are pruned so rotating made-up keys cannot grow memory without
+// bound, and the per-address bucket still limits such a client.
 
 const RPS_PER_KEY: f64 = 20.0;
 const BURST_PER_KEY: f64 = 80.0;
+const RPS_PER_ADDR: f64 = 50.0;
+const BURST_PER_ADDR: f64 = 200.0;
+/// Prune idle buckets once the map holds this many entries.
+const PRUNE_THRESHOLD: usize = 4096;
 
 struct TokenBucket {
     tokens: f64,
     last_refill: Instant,
+    rps: f64,
+    burst: f64,
 }
 
 impl TokenBucket {
-    fn new(now: Instant) -> Self {
-        Self { tokens: BURST_PER_KEY, last_refill: now }
+    fn new(now: Instant, rps: f64, burst: f64) -> Self {
+        Self { tokens: burst, last_refill: now, rps, burst }
     }
 
     /// Returns true if the request fits in the current budget.
     fn try_consume(&mut self, now: Instant) -> bool {
         let elapsed = now.saturating_duration_since(self.last_refill).as_secs_f64();
-        self.tokens = (self.tokens + elapsed * RPS_PER_KEY).min(BURST_PER_KEY);
+        self.tokens = (self.tokens + elapsed * self.rps).min(self.burst);
         self.last_refill = now;
         if self.tokens >= 1.0 {
             self.tokens -= 1.0;
@@ -251,6 +269,12 @@ impl TokenBucket {
         } else {
             false
         }
+    }
+
+    /// A bucket idle long enough to be full again carries no state.
+    fn is_refilled(&self, now: Instant) -> bool {
+        self.tokens + now.saturating_duration_since(self.last_refill).as_secs_f64() * self.rps
+            >= self.burst
     }
 }
 
@@ -263,14 +287,29 @@ impl RateLimiter {
         Self { buckets: Mutex::new(HashMap::new()) }
     }
 
-    /// Returns true if the request is allowed. `key` is the API key string
-    /// (or a synthetic "__global__" for the global key). Buckets for unknown
-    /// keys are created on first use.
+    /// Returns true if the request is allowed for `key` (per-key limits).
     pub fn allow(&self, key: &str) -> bool {
+        self.allow_with(key, RPS_PER_KEY, BURST_PER_KEY)
+    }
+
+    fn allow_with(&self, key: &str, rps: f64, burst: f64) -> bool {
         let now = Instant::now();
         let mut guard = self.buckets.lock();
-        let bucket = guard.entry(key.to_string()).or_insert_with(|| TokenBucket::new(now));
+        if guard.len() >= PRUNE_THRESHOLD && !guard.contains_key(key) {
+            // A bucket that has refilled is equivalent to a new one.
+            guard.retain(|_, b| !b.is_refilled(now));
+        }
+        let bucket =
+            guard.entry(key.to_string()).or_insert_with(|| TokenBucket::new(now, rps, burst));
         bucket.try_consume(now)
+    }
+
+    pub fn len(&self) -> usize {
+        self.buckets.lock().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -280,19 +319,50 @@ impl Default for RateLimiter {
     }
 }
 
-pub fn check_rate_limit(state: &EngineState, headers: &HeaderMap) -> Result<(), StatusCode> {
-    // Prefer the API key string for per-key buckets. Fall back to peer IP.
-    let key = if let Some(provided) = request_api_key(headers) {
-        provided.to_string()
-    } else if let Some(addr) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-        format!("ip:{}", addr.split(',').next().unwrap_or("").trim())
-    } else {
-        "__anonymous__".to_string()
-    };
-    if state.rate_limiter.allow(&key) {
+fn trust_forwarded_for() -> bool {
+    static TRUST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRUST.get_or_init(|| {
+        env::var("TELLODB_TRUST_PROXY")
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false)
+    })
+}
+
+/// Client address for rate limiting. `x-forwarded-for` is client-controlled,
+/// so it is only used behind a trusted proxy (`TELLODB_TRUST_PROXY=1`).
+pub fn client_address(headers: &HeaderMap, peer: Option<std::net::SocketAddr>) -> String {
+    if trust_forwarded_for() {
+        if let Some(forwarded) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+            if let Some(first) =
+                forwarded.split(',').next().map(str::trim).filter(|s| !s.is_empty())
+            {
+                return first.to_string();
+            }
+        }
+    }
+    peer.map(|addr| addr.ip().to_string()).unwrap_or_else(|| "unknown".to_string())
+}
+
+pub fn check_rate_limit(
+    state: &EngineState,
+    headers: &HeaderMap,
+    peer: Option<std::net::SocketAddr>,
+) -> Result<(), StatusCode> {
+    let provided = request_api_key(headers);
+    if authorize_global_api_key(headers, &state.auth).is_ok() && state.auth.is_required() {
+        return Ok(());
+    }
+    let addr = client_address(headers, peer);
+    let allowed =
+        state.rate_limiter.allow_with(&format!("addr:{addr}"), RPS_PER_ADDR, BURST_PER_ADDR)
+            && match provided {
+                Some(key) => state.rate_limiter.allow(&format!("key:{key}")),
+                None => true,
+            };
+    if allowed {
         Ok(())
     } else {
-        tracing::warn!(key = %&key[..key.len().min(20)], "rate limit exceeded");
+        tracing::warn!(addr = %addr, "rate limit exceeded");
         Err(StatusCode::TOO_MANY_REQUESTS)
     }
 }
@@ -336,6 +406,34 @@ pub fn session_user_from_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rate_limiter_prunes_idle_buckets() {
+        let limiter = RateLimiter::new();
+        for i in 0..PRUNE_THRESHOLD {
+            limiter.allow(&format!("key:{i}"));
+        }
+        assert_eq!(limiter.len(), PRUNE_THRESHOLD);
+        // Wait until the one-token-spent buckets have refilled, then a new key prunes them.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        limiter.allow("key:new");
+        assert!(limiter.len() < PRUNE_THRESHOLD, "idle buckets should be pruned");
+    }
+
+    #[test]
+    fn rate_limiter_limits_burst_per_key() {
+        let limiter = RateLimiter::new();
+        let allowed = (0..200).filter(|_| limiter.allow("key:k")).count();
+        assert!((80..=82).contains(&allowed), "allowed {allowed}");
+    }
+
+    #[test]
+    fn forwarded_for_is_ignored_without_trusted_proxy() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", HeaderValue::from_static("1.2.3.4"));
+        let peer: std::net::SocketAddr = "10.0.0.7:5555".parse().unwrap();
+        assert_eq!(client_address(&headers, Some(peer)), "10.0.0.7");
+    }
 
     #[test]
     fn constant_time_eq_equal_strings() {
@@ -502,22 +600,14 @@ mod tests {
 
     #[test]
     fn cors_allow_origins_default() {
-        std::env::remove_var("TEMPORAL_MEMORY_CORS_ALLOW_ORIGINS");
-        std::env::remove_var("TELLODB_CORS_ALLOW_ORIGINS");
-        let origins = cors_allow_origins();
+        let origins = parse_cors_allow_origins(None);
         assert_eq!(origins.len(), 1);
         assert_eq!(origins[0], "https://tellodb.com");
     }
 
     #[test]
     fn cors_allow_origins_from_env() {
-        std::env::remove_var("TEMPORAL_MEMORY_CORS_ALLOW_ORIGINS");
-        std::env::set_var(
-            "TELLODB_CORS_ALLOW_ORIGINS",
-            "http://localhost:3000,http://example.com",
-        );
-        let origins = cors_allow_origins();
-        std::env::remove_var("TELLODB_CORS_ALLOW_ORIGINS");
+        let origins = parse_cors_allow_origins(Some("http://localhost:3000,http://example.com"));
         assert_eq!(origins.len(), 2);
         assert_eq!(origins[0], "http://localhost:3000");
         assert_eq!(origins[1], "http://example.com");
@@ -525,23 +615,14 @@ mod tests {
 
     #[test]
     fn cors_allow_origins_empty_falls_back_to_default() {
-        std::env::remove_var("TEMPORAL_MEMORY_CORS_ALLOW_ORIGINS");
-        std::env::set_var("TELLODB_CORS_ALLOW_ORIGINS", "");
-        let origins = cors_allow_origins();
-        std::env::remove_var("TELLODB_CORS_ALLOW_ORIGINS");
+        let origins = parse_cors_allow_origins(Some(""));
         assert_eq!(origins.len(), 1);
         assert_eq!(origins[0], "https://tellodb.com");
     }
 
     #[test]
     fn cors_allow_origins_trims_trailing_slashes() {
-        std::env::remove_var("TEMPORAL_MEMORY_CORS_ALLOW_ORIGINS");
-        std::env::set_var(
-            "TELLODB_CORS_ALLOW_ORIGINS",
-            "http://localhost:3000/,http://example.com/",
-        );
-        let origins = cors_allow_origins();
-        std::env::remove_var("TELLODB_CORS_ALLOW_ORIGINS");
+        let origins = parse_cors_allow_origins(Some("http://localhost:3000/,http://example.com/"));
         assert_eq!(origins.len(), 2);
         assert_eq!(origins[0], "http://localhost:3000");
         assert_eq!(origins[1], "http://example.com");

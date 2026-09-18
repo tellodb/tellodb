@@ -3,9 +3,7 @@ use std::collections::HashSet;
 
 use crate::api::ingest::dialogue::{extract_dialogue_messages, strip_leading_bracketed_prefixes};
 use crate::api::ingest::fact::is_numericish;
-use crate::api::utils::{
-    is_low_signal_keyword, normalize_fact_text, singularize_token,
-};
+use crate::api::utils::{is_low_signal_keyword, normalize_fact_text, singularize_token};
 use crate::fts::tokenize_for_similarity;
 
 pub fn extract_named_phrases(lines: &[String]) -> Vec<String> {

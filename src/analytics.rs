@@ -1,86 +1,29 @@
-#![allow(dead_code)]
-use crate::storage::TenantDatabaseManager;
+//! Numeric memory: quantities stated in memories ("ran 5 miles", "$1,200
+//! rent") extracted deterministically at ingest and aggregated with SQL, so
+//! "how much / how many" answers are computed rather than guessed by an LLM.
+//!
+//! Values are normalised to one canonical unit per dimension (meters,
+//! seconds, kg, celsius, bytes, USD), so a label such as `distance` can be
+//! summed across memories that used different units.
+
+use crate::storage::{TenantDatabaseManager, TenantStore};
 use anyhow::{Context, Result};
 use regex::Regex;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 use std::sync::Arc;
 
-// ── Named Constants ──────────────────────────────────────────────────────────
-
-// Confidence values for extraction sources
-const CONFIDENCE_DETERMINISTIC: f64 = 1.0;
-const CONFIDENCE_NEURAL: f64 = 0.6;
-const CONFIDENCE_MERGED: f64 = 0.7;
-
-// Distance conversion factors (to meters)
-const MILES_TO_METERS: f64 = 1609.344;
-const KM_TO_METERS: f64 = 1000.0;
-const FEET_TO_METERS: f64 = 0.3048;
-const YARDS_TO_METERS: f64 = 0.9144;
-const CM_TO_METERS: f64 = 0.01;
-const MM_TO_METERS: f64 = 0.001;
-const INCHES_TO_METERS: f64 = 0.0254;
-
-// Weight conversion factors (to kg)
-const POUNDS_TO_KG: f64 = 0.453592;
-const OUNCES_TO_KG: f64 = 0.0283495;
-const GRAMS_TO_KG: f64 = 0.001;
-const MILLIGRAMS_TO_KG: f64 = 0.000001;
-const TONS_TO_KG: f64 = 1000.0;
-
-// Temperature conversion constants
-const FAHRENHEIT_OFFSET: f64 = 32.0;
-const FAHRENHEIT_NUMERATOR: f64 = 5.0;
-const FAHRENHEIT_DENOMINATOR: f64 = 9.0;
-const KELVIN_TO_CELSIUS_OFFSET: f64 = 273.15;
-
-// Duration conversion factors (to seconds)
-const HOURS_TO_SECONDS: f64 = 3600.0;
-const MINUTES_TO_SECONDS: f64 = 60.0;
-const MS_TO_SECONDS: f64 = 0.001;
-const DAYS_TO_SECONDS: f64 = 86400.0;
-
-// Data size conversion factors (to bytes)
-const KB_TO_BYTES: f64 = 1024.0;
-const MB_TO_BYTES: f64 = 1_048_576.0;
-const GB_TO_BYTES: f64 = 1_073_741_824.0;
-const TB_TO_BYTES: f64 = 1_099_511_627_776.0;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MetricRecord {
-    pub timestamp_ms: u64,
-    pub entity_id: String,
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExtractedMetric {
+    /// Canonical label: `money`, `distance`, `duration`, `weight`,
+    /// `temperature`, `data_size`, `percentage` or `count_<noun>`.
     pub label: String,
+    /// Value in the canonical unit.
     pub value: f64,
-    pub unit: Option<String>,
-    #[serde(default)]
-    pub confidence: f64,
-    #[serde(default)]
-    pub source: ExtractionSource,
+    pub unit: String,
+    /// Matched text, for provenance.
+    pub source_text: String,
 }
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[derive(Default)]
-pub enum ExtractionSource {
-    #[default]
-    Deterministic,
-    Neural,
-    Merged,
-}
-
-impl ExtractionSource {
-    fn as_str(&self) -> &'static str {
-        match self {
-            ExtractionSource::Deterministic => "deterministic",
-            ExtractionSource::Neural => "neural",
-            ExtractionSource::Merged => "merged",
-        }
-    }
-}
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AggregateResult {
@@ -99,7 +42,7 @@ pub struct BucketedAggregate {
     pub result: AggregateResult,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy)]
 pub enum TemporalBucket {
     Hour,
     Day,
@@ -120,615 +63,465 @@ impl TemporalBucket {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum MetricCategory {
-    Distance,
-    Money,
-    Percentage,
-    Duration,
-    Weight,
-    Count,
+/// At most this many buckets are returned for one aggregation.
+const MAX_BUCKETS: i64 = 10_000;
+
+/// One unit family: a pattern whose captures are `lo` (optional range start),
+/// `value` and `unit`, and a converter to the canonical unit.
+struct Dimension {
+    label: &'static str,
+    unit: &'static str,
+    pattern: Regex,
+    /// Returns the factor/offset conversion for a matched unit word, or `None`
+    /// if the word does not belong to this dimension.
+    convert: fn(&str, f64) -> Option<f64>,
 }
 
-impl MetricCategory {
-    fn from_unit(unit: Option<&str>) -> Self {
-        match unit {
-            Some(u) if u.contains("mile") || u.contains("km") => MetricCategory::Distance,
-            Some(u) if u.contains("dollar") || u == "$" => MetricCategory::Money,
-            Some("%") => MetricCategory::Percentage,
-            Some(u) if u.contains("hour") || u.contains("minute") || u.contains("day") => {
-                MetricCategory::Duration
-            }
-            Some(u) if u.contains("lb") || u.contains("kg") => MetricCategory::Weight,
-            _ => MetricCategory::Count,
+const NUMBER: &str = r"\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?";
+
+fn unit_pattern(units: &str) -> Regex {
+    // Optional range ("5-10 miles", "5 to 10 miles") reported as its midpoint.
+    Regex::new(&format!(
+        r"(?i)\b(?:(?P<lo>{NUMBER})\s*(?:-|–|to)\s*)?(?P<value>{NUMBER})\s*(?P<unit>{units})\b"
+    ))
+    .expect("static metric pattern")
+}
+
+fn parse_number(text: &str) -> Option<f64> {
+    text.replace(',', "").parse::<f64>().ok()
+}
+
+fn singular(word: &str) -> String {
+    let lower = word.to_ascii_lowercase();
+    if let Some(stem) = lower.strip_suffix("ies") {
+        format!("{stem}y")
+    } else if lower.ends_with("ss") {
+        lower
+    } else {
+        lower.strip_suffix('s').map(str::to_string).unwrap_or(lower)
+    }
+}
+
+pub struct MetricExtractor {
+    money_prefixed: Regex,
+    dimensions: Vec<Dimension>,
+    count: Regex,
+}
+
+impl MetricExtractor {
+    pub fn new() -> Self {
+        let dimensions = vec![
+            Dimension {
+                label: "money",
+                unit: "USD",
+                pattern: unit_pattern("dollars?|usd"),
+                convert: |_, v| Some(v),
+            },
+            Dimension {
+                label: "distance",
+                unit: "meters",
+                // Bare "m" and "in" are excluded: "5 in the morning" is not a length.
+                pattern: unit_pattern(
+                    "miles?|mi|kilometers?|kilometres?|km|meters?|metres?|feet|foot|ft|yards?|yd|centimeters?|cm|millimeters?|mm|inches|inch",
+                ),
+                convert: |u, v| {
+                    let f = match u {
+                        "mile" | "miles" | "mi" => 1609.344,
+                        "kilometer" | "kilometers" | "kilometre" | "kilometres" | "km" => 1000.0,
+                        "meter" | "meters" | "metre" | "metres" => 1.0,
+                        "feet" | "foot" | "ft" => 0.3048,
+                        "yard" | "yards" | "yd" => 0.9144,
+                        "centimeter" | "centimeters" | "cm" => 0.01,
+                        "millimeter" | "millimeters" | "mm" => 0.001,
+                        "inch" | "inches" => 0.0254,
+                        _ => return None,
+                    };
+                    Some(v * f)
+                },
+            },
+            Dimension {
+                label: "duration",
+                unit: "seconds",
+                pattern: unit_pattern(
+                    "hours?|hrs?|minutes?|mins?|seconds?|secs?|milliseconds?|ms|days?|weeks?",
+                ),
+                convert: |u, v| {
+                    let f = match u {
+                        "hour" | "hours" | "hr" | "hrs" => 3600.0,
+                        "minute" | "minutes" | "min" | "mins" => 60.0,
+                        "second" | "seconds" | "sec" | "secs" => 1.0,
+                        "millisecond" | "milliseconds" | "ms" => 0.001,
+                        "day" | "days" => 86_400.0,
+                        "week" | "weeks" => 604_800.0,
+                        _ => return None,
+                    };
+                    Some(v * f)
+                },
+            },
+            Dimension {
+                label: "weight",
+                unit: "kg",
+                pattern: unit_pattern(
+                    "pounds?|lbs?|ounces?|oz|kilograms?|kg|grams?|g|milligrams?|mg|tonnes?|tons?",
+                ),
+                convert: |u, v| {
+                    let f = match u {
+                        "pound" | "pounds" | "lb" | "lbs" => 0.453_592,
+                        "ounce" | "ounces" | "oz" => 0.028_349_5,
+                        "kilogram" | "kilograms" | "kg" => 1.0,
+                        "gram" | "grams" | "g" => 0.001,
+                        "milligram" | "milligrams" | "mg" => 0.000_001,
+                        "ton" | "tons" | "tonne" | "tonnes" => 1000.0,
+                        _ => return None,
+                    };
+                    Some(v * f)
+                },
+            },
+            Dimension {
+                label: "temperature",
+                unit: "celsius",
+                // Requires a degree sign or a spelled-out scale: "5 k" or "3 c"
+                // are far more often not temperatures.
+                pattern: Regex::new(&format!(
+                    r"(?i)(?P<value>-?(?:{NUMBER}))\s*(?:°\s*(?P<unit>[fck])\b|degrees?\s+(?P<unit2>fahrenheit|celsius|kelvin)|(?P<unit3>fahrenheit|celsius|kelvin)\b)"
+                ))
+                .expect("static metric pattern"),
+                convert: |u, v| match u {
+                    "f" | "fahrenheit" => Some((v - 32.0) * 5.0 / 9.0),
+                    "c" | "celsius" => Some(v),
+                    "k" | "kelvin" => Some(v - 273.15),
+                    _ => None,
+                },
+            },
+            Dimension {
+                label: "data_size",
+                unit: "bytes",
+                pattern: unit_pattern(
+                    "terabytes?|gigabytes?|megabytes?|kilobytes?|bytes?|tb|gb|mb|kb",
+                ),
+                convert: |u, v| {
+                    let f = match u {
+                        "kb" | "kilobyte" | "kilobytes" => 1024.0,
+                        "mb" | "megabyte" | "megabytes" => 1_048_576.0,
+                        "gb" | "gigabyte" | "gigabytes" => 1_073_741_824.0,
+                        "tb" | "terabyte" | "terabytes" => 1_099_511_627_776.0,
+                        "byte" | "bytes" => 1.0,
+                        _ => return None,
+                    };
+                    Some(v * f)
+                },
+            },
+            Dimension {
+                label: "percentage",
+                unit: "%",
+                pattern: Regex::new(&format!(
+                    r"(?i)(?P<value>{NUMBER})\s*(?P<unit>%|percent\b|pct\b)"
+                ))
+                .expect("static metric pattern"),
+                convert: |_, v| Some(v),
+            },
+        ];
+        Self {
+            money_prefixed: Regex::new(&format!(
+                r"(?i)(?:\$|\busd\s*)(?P<lo>{NUMBER})(?:\s*(?:-|–|to)\s*\$?(?P<value>{NUMBER}))?"
+            ))
+            .expect("static metric pattern"),
+            dimensions,
+            count: Regex::new(&format!(
+                r"(?i)\b(?P<value>{NUMBER})\s+(?P<unit>times|people|persons|items|units|cars|houses|books|files|projects|tasks|events|meetings|emails|messages|calls|visits|orders|products|customers|users|accounts|transactions|countries|cities|games|movies|songs|miles run|pages|classes|lessons|trips|photos|pets|kids|children)\b"
+            ))
+            .expect("static metric pattern"),
         }
     }
 
-    fn label(&self, suffix: &str) -> String {
-        match self {
-            MetricCategory::Distance => format!("distance_{}", suffix),
-            MetricCategory::Money => format!("money_{}", suffix),
-            MetricCategory::Percentage => format!("percentage_{}", suffix),
-            MetricCategory::Duration => format!("duration_{}", suffix),
-            MetricCategory::Weight => format!("weight_{}", suffix),
-            MetricCategory::Count => format!("count_{}", suffix),
+    /// Extracts quantities in text order. Overlapping matches are resolved in
+    /// favour of the earlier-checked, more specific pattern, so a quantity is
+    /// never counted twice (e.g. "about 5 miles" once, not as distance and as
+    /// an approximate value).
+    pub fn extract(&self, text: &str) -> Vec<ExtractedMetric> {
+        let mut accepted: Vec<(usize, usize, ExtractedMetric)> = Vec::new();
+        let overlaps = |accepted: &[(usize, usize, ExtractedMetric)], s: usize, e: usize| {
+            accepted.iter().any(|(as_, ae, _)| s < *ae && *as_ < e)
+        };
+
+        for cap in self.money_prefixed.captures_iter(text) {
+            let whole = cap.get(0).expect("match");
+            let lo = cap.name("lo").and_then(|m| parse_number(m.as_str()));
+            let hi = cap.name("value").and_then(|m| parse_number(m.as_str()));
+            let value = match (lo, hi) {
+                (Some(lo), Some(hi)) => (lo + hi) / 2.0,
+                (Some(v), None) => v,
+                _ => continue,
+            };
+            if !overlaps(&accepted, whole.start(), whole.end()) {
+                accepted.push((
+                    whole.start(),
+                    whole.end(),
+                    ExtractedMetric {
+                        label: "money".into(),
+                        value,
+                        unit: "USD".into(),
+                        source_text: whole.as_str().to_string(),
+                    },
+                ));
+            }
         }
+
+        for dim in &self.dimensions {
+            for cap in dim.pattern.captures_iter(text) {
+                let whole = cap.get(0).expect("match");
+                if overlaps(&accepted, whole.start(), whole.end()) {
+                    continue;
+                }
+                let Some(unit_word) = ["unit", "unit2", "unit3"]
+                    .iter()
+                    .find_map(|n| cap.name(n))
+                    .map(|m| m.as_str().to_ascii_lowercase())
+                else {
+                    continue;
+                };
+                let Some(raw) = cap.name("value").and_then(|m| parse_number(m.as_str())) else {
+                    continue;
+                };
+                let raw = match cap.name("lo").and_then(|m| parse_number(m.as_str())) {
+                    Some(lo) => (lo + raw) / 2.0,
+                    None => raw,
+                };
+                let Some(value) = (dim.convert)(unit_word.as_str(), raw) else {
+                    continue;
+                };
+                accepted.push((
+                    whole.start(),
+                    whole.end(),
+                    ExtractedMetric {
+                        label: dim.label.into(),
+                        value,
+                        unit: dim.unit.into(),
+                        source_text: whole.as_str().to_string(),
+                    },
+                ));
+            }
+        }
+
+        for cap in self.count.captures_iter(text) {
+            let whole = cap.get(0).expect("match");
+            if overlaps(&accepted, whole.start(), whole.end()) {
+                continue;
+            }
+            let (Some(value), Some(noun)) =
+                (cap.name("value").and_then(|m| parse_number(m.as_str())), cap.name("unit"))
+            else {
+                continue;
+            };
+            let noun = singular(noun.as_str().split_whitespace().last().unwrap_or_default());
+            accepted.push((
+                whole.start(),
+                whole.end(),
+                ExtractedMetric {
+                    label: format!("count_{noun}"),
+                    value,
+                    unit: noun,
+                    source_text: whole.as_str().to_string(),
+                },
+            ));
+        }
+
+        accepted.sort_by_key(|(start, _, _)| *start);
+        accepted.into_iter().map(|(_, _, metric)| metric).collect()
+    }
+}
+
+impl Default for MetricExtractor {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 pub struct MetricVault {
     tenant_manager: Arc<TenantDatabaseManager>,
     extractor: MetricExtractor,
-    semantic: Arc<crate::semantic::SemanticInference>,
 }
 
 impl MetricVault {
-    pub fn new(
-        tenant_manager: Arc<TenantDatabaseManager>,
-        semantic: Arc<crate::semantic::SemanticInference>,
-    ) -> Result<Self> {
-        Ok(Self {
-            tenant_manager,
-            extractor: MetricExtractor::new().context("failed to create MetricExtractor")?,
-            semantic,
-        })
+    pub fn new(tenant_manager: Arc<TenantDatabaseManager>) -> Self {
+        Self { tenant_manager, extractor: MetricExtractor::new() }
     }
 
-    pub fn process_text(
+    pub fn extractor(&self) -> &MetricExtractor {
+        &self.extractor
+    }
+
+    /// Replaces the metrics recorded for `memory_id` with those extracted from
+    /// `text`. Idempotent, so re-ingesting a memory never double-counts.
+    pub fn record_memory(
         &self,
-        user_id: &str,
+        tenant: &TenantStore,
         entity_id: &str,
+        memory_id: &str,
         timestamp_ms: u64,
         text: &str,
-    ) -> Result<()> {
-        let tenant =
-            self.tenant_manager.get_tenant(user_id).context("failed to get tenant for user")?;
-        let lower_text = text.to_lowercase();
-
-        let is_preference = lower_text.contains("love")
-            || lower_text.contains("hate")
-            || lower_text.contains("favorite")
-            || lower_text.contains("always")
-            || lower_text.contains("never")
-            || lower_text.contains("prefer");
-
-        let deterministic_metrics = self.extractor.extract(text);
-
-        let mut neural_metrics: Vec<(String, f64, Option<String>)> = Vec::new();
-        let mut entities: Vec<(String, String)> = Vec::new();
-
-        if let Ok(extracted) = self.semantic.extract_entities(text) {
-            entities = extracted;
-            for (etype, ename) in &entities {
-                neural_metrics.push((
-                    format!("entity_{}", etype.to_lowercase()),
-                    1.0,
-                    Some(ename.clone()),
-                ));
+    ) -> Result<usize> {
+        let metrics = self.extractor.extract(text);
+        let mut conn = tenant.get_conn()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute("DELETE FROM metrics WHERE memory_id = ?1", params![memory_id])?;
+        {
+            let mut insert = tx.prepare_cached(
+                "INSERT INTO metrics (memory_id, ordinal, entity_id, timestamp_ms, label, value, unit, source_text)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )?;
+            for (ordinal, m) in metrics.iter().enumerate() {
+                insert.execute(params![
+                    memory_id,
+                    ordinal as i64,
+                    entity_id,
+                    timestamp_ms as i64,
+                    m.label,
+                    m.value,
+                    m.unit,
+                    m.source_text
+                ])?;
             }
         }
-
-        let merged = Self::merge_extractions(&deterministic_metrics, &neural_metrics);
-
-        for (label, value, unit, source, confidence) in merged {
-            let (norm_value, norm_unit) = normalize_unit(&label, value, unit.as_deref());
-            let record = MetricRecord {
-                timestamp_ms,
-                entity_id: entity_id.to_string(),
-                label: if norm_unit != unit { format!("{}_normalized", label) } else { label },
-                value: norm_value,
-                unit: norm_unit,
-                confidence,
-                source,
-            };
-            self.insert_metric(user_id, &record).context("failed to insert merged metric")?;
-        }
-
-        if is_preference {
-            let mut triples = Vec::new();
-            for (_, name) in &entities {
-                triples.push((
-                    entity_id.to_string(),
-                    "has_preference".to_string(),
-                    name.clone(),
-                    timestamp_ms,
-                ));
-            }
-            if !triples.is_empty() {
-                let conn =
-                    tenant.get_conn().context("failed to get connection for preference edges")?;
-                let mut stmt = conn.prepare_cached("
-                    INSERT OR REPLACE INTO edges (edge_id, source, target, edge_type, label, weight, timestamp_ms)
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                ").context("failed to prepare edge insert statement")?;
-                for (src, rel, dst, ts) in triples {
-                    let edge_id = format!("{}:{}:{}", src, rel, dst);
-                    stmt.execute(params![edge_id, src, dst, rel, rel, 1.0, ts])
-                        .context("failed to execute edge insert")?;
-                }
-            }
-        }
-
-        if entities.len() > 1 {
-            let mut triples = Vec::new();
-            for i in 0..entities.len() {
-                for j in i + 1..entities.len() {
-                    let (label_a, name_a) = &entities[i];
-                    let (label_b, name_b) = &entities[j];
-                    let predicate = match (label_a.as_str(), label_b.as_str()) {
-                        ("PER", "ORG") => Some("associated_with"),
-                        ("PER", "LOC") => Some("located_in"),
-                        ("ORG", "LOC") => Some("headquartered_in"),
-                        ("PER", "PER") => Some("knows"),
-                        _ => None,
-                    };
-                    if let Some(pred) = predicate {
-                        triples.push((
-                            name_a.clone(),
-                            pred.to_string(),
-                            name_b.clone(),
-                            timestamp_ms,
-                        ));
-                    }
-                }
-            }
-            if !triples.is_empty() {
-                let conn =
-                    tenant.get_conn().context("failed to get connection for entity edges")?;
-                let mut stmt = conn.prepare_cached("
-                    INSERT OR REPLACE INTO edges (edge_id, source, target, edge_type, label, weight, timestamp_ms)
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                ").context("failed to prepare entity edge insert statement")?;
-                for (src, rel, dst, ts) in triples {
-                    let edge_id = format!("{}:{}:{}", src, rel, dst);
-                    stmt.execute(params![edge_id, src, dst, rel, rel, 1.0, ts])
-                        .context("failed to execute entity edge insert")?;
-                }
-            }
-        }
-
-        Ok(())
+        tx.commit()?;
+        Ok(metrics.len())
     }
 
-    fn merge_extractions(
-        deterministic: &[(String, f64, Option<String>)],
-        neural: &[(String, f64, Option<String>)],
-    ) -> Vec<(String, f64, Option<String>, ExtractionSource, f64)> {
-        let mut det_map: HashMap<String, Vec<(f64, Option<String>)>> = HashMap::new();
-        for (label, value, unit) in deterministic {
-            det_map.entry(label.clone()).or_default().push((*value, unit.clone()));
-        }
-
-        let mut neu_map: HashMap<String, Vec<(f64, Option<String>)>> = HashMap::new();
-        for (label, value, unit) in neural {
-            neu_map.entry(label.clone()).or_default().push((*value, unit.clone()));
-        }
-
-        let mut merged = Vec::new();
-
-        for (label, det_vals) in &det_map {
-            for (value, unit) in det_vals {
-                merged.push((
-                    label.clone(),
-                    *value,
-                    unit.clone(),
-                    ExtractionSource::Deterministic,
-                    CONFIDENCE_DETERMINISTIC,
-                ));
-            }
-        }
-
-        for (label, neu_vals) in &neu_map {
-            if det_map.contains_key(label) {
-                if let Some(det_vals) = det_map.get(label) {
-                    for (n_val, n_unit) in neu_vals {
-                        let dominated =
-                            det_vals.iter().any(|(d_val, _)| (d_val - n_val).abs() < f64::EPSILON);
-                        if !dominated {
-                            merged.push((
-                                label.clone(),
-                                *n_val,
-                                n_unit.clone(),
-                                ExtractionSource::Merged,
-                                CONFIDENCE_MERGED,
-                            ));
-                        }
-                    }
-                }
-            } else {
-                for (value, unit) in neu_vals {
-                    merged.push((
-                        label.clone(),
-                        *value,
-                        unit.clone(),
-                        ExtractionSource::Neural,
-                        CONFIDENCE_NEURAL,
-                    ));
-                }
-            }
-        }
-
-        merged
-    }
-
-    pub fn insert_metric(&self, user_id: &str, record: &MetricRecord) -> Result<()> {
-        let tenant = self
-            .tenant_manager
-            .get_tenant(user_id)
-            .context("failed to get tenant for metric insert")?;
-        let conn = tenant.get_conn().context("failed to get connection for metric insert")?;
-
-        let content_hash = compute_content_hash(
-            record.timestamp_ms,
-            &record.entity_id,
-            &record.label,
-            record.value,
-        );
-
-        let existing: Option<String> = conn.query_row(
-            "SELECT content_hash FROM metrics WHERE timestamp_ms = ?1 AND entity_id = ?2 AND label = ?3",
-            params![record.timestamp_ms, record.entity_id, record.label],
-            |row| row.get(0),
-        ).ok();
-
-        if let Some(existing_hash) = existing {
-            if existing_hash == content_hash {
-                return Ok(());
-            }
-        }
-
-        conn.execute(
-            "INSERT OR REPLACE INTO metrics (timestamp_ms, entity_id, label, value, unit, content_hash, confidence, source)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                record.timestamp_ms,
-                record.entity_id,
-                record.label,
-                record.value,
-                record.unit,
-                content_hash,
-                record.confidence,
-                record.source.as_str(),
-            ],
-        ).context("failed to upsert metric record")?;
-        Ok(())
+    fn tenant(&self, tenant_id: &str) -> Result<Arc<TenantStore>> {
+        self.tenant_manager.get_tenant(tenant_id).context("failed to get tenant for aggregation")
     }
 
     pub fn aggregate_range(
         &self,
-        user_id: &str,
+        tenant_id: &str,
         entity_id: &str,
         label: &str,
         start_ms: u64,
         end_ms: u64,
     ) -> Result<AggregateResult> {
-        let tenant = self
-            .tenant_manager
-            .get_tenant(user_id)
-            .context("failed to get tenant for aggregation")?;
-        let conn = tenant.get_conn().context("failed to get connection for aggregation")?;
-        let mut stmt = conn
-            .prepare(
-                "
-            SELECT
-                COALESCE(SUM(value), 0.0),
-                COUNT(*),
-                COALESCE(AVG(value), 0.0),
-                COALESCE(MIN(value), 0.0),
-                COALESCE(MAX(value), 0.0)
-            FROM metrics
-            WHERE entity_id = ?1 AND label = ?2 AND timestamp_ms >= ?3 AND timestamp_ms <= ?4
-        ",
-            )
-            .context("failed to prepare aggregate query")?;
-        let (sum, count, avg, min, max): (f64, usize, f64, f64, f64) = stmt
-            .query_row(params![entity_id, label, start_ms, end_ms], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
-            })
-            .context("failed to execute aggregate query")?;
-
-        let stddev = if count > 1 {
-            let mut var_stmt = conn
-                .prepare(
-                    "
-                SELECT value FROM metrics
-                WHERE entity_id = ?1 AND label = ?2 AND timestamp_ms >= ?3 AND timestamp_ms <= ?4
-            ",
-                )
-                .context("failed to prepare variance query")?;
-            let values: Vec<f64> = var_stmt
-                .query_map(params![entity_id, label, start_ms, end_ms], |row| row.get(0))
-                .context("failed to execute variance query")?
-                .filter_map(|r| r.ok())
-                .collect();
-            let mean = avg;
-            let variance: f64 =
-                values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (count as f64);
-            variance.sqrt()
-        } else {
-            0.0
-        };
-
-        Ok(AggregateResult { sum, count, avg, min, max, stddev })
+        let tenant = self.tenant(tenant_id)?;
+        let conn = tenant.get_conn()?;
+        let row = conn.query_row(
+            "SELECT COALESCE(SUM(value), 0), COUNT(*), COALESCE(MIN(value), 0),
+                    COALESCE(MAX(value), 0), COALESCE(SUM(value * value), 0)
+             FROM metrics
+             WHERE entity_id = ?1 AND label = ?2 AND timestamp_ms >= ?3 AND timestamp_ms <= ?4",
+            params![entity_id, label, clamp_ms(start_ms), clamp_ms(end_ms)],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )?;
+        Ok(aggregate_from(row))
     }
 
+    /// Aggregates per time bucket in a single query; only non-empty buckets
+    /// are returned. (The previous implementation looped over every bucket
+    /// between `start` and `end`, which never finished for an open-ended
+    /// range.)
     pub fn aggregate_bucketed(
         &self,
-        user_id: &str,
+        tenant_id: &str,
         entity_id: &str,
         label: &str,
         start_ms: u64,
         end_ms: u64,
         bucket: TemporalBucket,
     ) -> Result<Vec<BucketedAggregate>> {
-        let bucket_ms = bucket.duration_ms();
-        let aligned_start = (start_ms / bucket_ms) * bucket_ms;
-        let mut results = Vec::new();
-        let mut cursor = aligned_start;
-
-        while cursor < end_ms {
-            let bucket_end = cursor + bucket_ms;
-            let result = self
-                .aggregate_range(user_id, entity_id, label, cursor, bucket_end.min(end_ms))
-                .context("failed to compute bucket aggregate")?;
-            if result.count > 0 {
-                results.push(BucketedAggregate {
-                    bucket_start_ms: cursor,
-                    bucket_end_ms: bucket_end,
-                    result,
-                });
-            }
-            cursor = bucket_end;
+        let bucket_ms = bucket.duration_ms() as i64;
+        let aligned_start = (clamp_ms(start_ms) / bucket_ms) * bucket_ms;
+        let tenant = self.tenant(tenant_id)?;
+        let conn = tenant.get_conn()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT (timestamp_ms - ?3) / ?5 AS bucket,
+                    SUM(value), COUNT(*), MIN(value), MAX(value), SUM(value * value)
+             FROM metrics
+             WHERE entity_id = ?1 AND label = ?2 AND timestamp_ms >= ?3 AND timestamp_ms <= ?4
+             GROUP BY bucket ORDER BY bucket LIMIT ?6",
+        )?;
+        let rows = stmt.query_map(
+            params![entity_id, label, aligned_start, clamp_ms(end_ms), bucket_ms, MAX_BUCKETS],
+            |row| {
+                let bucket: i64 = row.get(0)?;
+                Ok((bucket, (row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)))
+            },
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (bucket, stats) = row?;
+            let start = (aligned_start + bucket * bucket_ms) as u64;
+            out.push(BucketedAggregate {
+                bucket_start_ms: start,
+                bucket_end_ms: start + bucket_ms as u64,
+                result: aggregate_from(stats),
+            });
         }
-
-        Ok(results)
+        Ok(out)
     }
 }
 
-fn compute_content_hash(timestamp_ms: u64, entity_id: &str, label: &str, value: f64) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(timestamp_ms.to_le_bytes());
-    hasher.update(entity_id.as_bytes());
-    hasher.update(label.as_bytes());
-    hasher.update(value.to_le_bytes());
-    let result = hasher.finalize();
-    result.iter().map(|b| format!("{:02x}", b)).collect()
+fn clamp_ms(ms: u64) -> i64 {
+    ms.min(i64::MAX as u64) as i64
 }
 
-fn normalize_unit(label: &str, value: f64, unit: Option<&str>) -> (f64, Option<String>) {
-    let unit_str = match unit {
-        Some(u) => u.to_lowercase(),
-        None => return (value, unit.map(|s| s.to_string())),
-    };
-
-    if label.starts_with("distance_") {
-        match unit_str.as_str() {
-            "mile" | "miles" | "mi" => (value * MILES_TO_METERS, Some("meters".to_string())),
-            "km" | "kilometer" | "kilometers" => (value * KM_TO_METERS, Some("meters".to_string())),
-            "m" | "meter" | "meters" => (value, Some("meters".to_string())),
-            "ft" | "foot" | "feet" => (value * FEET_TO_METERS, Some("meters".to_string())),
-            "yd" | "yard" | "yards" => (value * YARDS_TO_METERS, Some("meters".to_string())),
-            "cm" | "centimeter" | "centimeters" => {
-                (value * CM_TO_METERS, Some("meters".to_string()))
-            }
-            "mm" | "millimeter" | "millimeters" => {
-                (value * MM_TO_METERS, Some("meters".to_string()))
-            }
-            "in" | "inch" | "inches" => (value * INCHES_TO_METERS, Some("meters".to_string())),
-            _ => (value, unit.map(|s| s.to_string())),
-        }
-    } else if label.starts_with("weight_") {
-        match unit_str.as_str() {
-            "lb" | "lbs" | "pound" | "pounds" => (value * POUNDS_TO_KG, Some("kg".to_string())),
-            "oz" | "ounce" | "ounces" => (value * OUNCES_TO_KG, Some("kg".to_string())),
-            "g" | "gram" | "grams" => (value * GRAMS_TO_KG, Some("kg".to_string())),
-            "mg" | "milligram" | "milligrams" => (value * MILLIGRAMS_TO_KG, Some("kg".to_string())),
-            "ton" | "tons" | "tonne" | "tonnes" => (value * TONS_TO_KG, Some("kg".to_string())),
-            "kg" | "kilogram" | "kilograms" => (value, Some("kg".to_string())),
-            _ => (value, unit.map(|s| s.to_string())),
-        }
-    } else if label.starts_with("temperature_") {
-        match unit_str.as_str() {
-            "f" | "fahrenheit" => (
-                (value - FAHRENHEIT_OFFSET) * FAHRENHEIT_NUMERATOR / FAHRENHEIT_DENOMINATOR,
-                Some("celsius".to_string()),
-            ),
-            "k" | "kelvin" => (value - KELVIN_TO_CELSIUS_OFFSET, Some("celsius".to_string())),
-            "c" | "celsius" => (value, Some("celsius".to_string())),
-            _ => (value, unit.map(|s| s.to_string())),
-        }
-    } else if label.starts_with("duration_") {
-        match unit_str.as_str() {
-            "hour" | "hours" | "hr" | "hrs" | "h" => {
-                (value * HOURS_TO_SECONDS, Some("seconds".to_string()))
-            }
-            "minute" | "minutes" | "min" | "mins" => {
-                (value * MINUTES_TO_SECONDS, Some("seconds".to_string()))
-            }
-            "second" | "seconds" | "sec" | "secs" | "s" => (value, Some("seconds".to_string())),
-            "ms" | "millisecond" | "milliseconds" => {
-                (value * MS_TO_SECONDS, Some("seconds".to_string()))
-            }
-            "day" | "days" => (value * DAYS_TO_SECONDS, Some("seconds".to_string())),
-            _ => (value, unit.map(|s| s.to_string())),
-        }
-    } else if label.starts_with("data_") {
-        match unit_str.as_str() {
-            "kb" | "kilobyte" | "kilobytes" => (value * KB_TO_BYTES, Some("bytes".to_string())),
-            "mb" | "megabyte" | "megabytes" => (value * MB_TO_BYTES, Some("bytes".to_string())),
-            "gb" | "gigabyte" | "gigabytes" => (value * GB_TO_BYTES, Some("bytes".to_string())),
-            "tb" | "terabyte" | "terabytes" => (value * TB_TO_BYTES, Some("bytes".to_string())),
-            "byte" | "bytes" | "b" => (value, Some("bytes".to_string())),
-            _ => (value, unit.map(|s| s.to_string())),
-        }
-    } else {
-        (value, unit.map(|s| s.to_string()))
-    }
+fn aggregate_from((sum, count, min, max, sum_sq): (f64, i64, f64, f64, f64)) -> AggregateResult {
+    let n = count.max(0) as usize;
+    let avg = if n > 0 { sum / n as f64 } else { 0.0 };
+    let variance = if n > 1 { (sum_sq / n as f64 - avg * avg).max(0.0) } else { 0.0 };
+    AggregateResult { sum, count: n, avg, min, max, stddev: variance.sqrt() }
 }
 
-pub struct MetricExtractor {
-    money_re: Regex,
-    distance_re: Regex,
-    count_re: Regex,
-    percentage_re: Regex,
-    duration_re: Regex,
-    temperature_re: Regex,
-    weight_re: Regex,
-    data_size_re: Regex,
-    range_re: Regex,
-    approx_re: Regex,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl MetricExtractor {
-    pub fn new() -> Result<Self> {
-        Ok(Self {
-            money_re: Regex::new(
-                r"(?i)(?:\$|USD)\s*(\d+(?:[,\d]{1,3})*(?:\.\d+)?)|(\d+(?:[,\d]{1,3})*(?:\.\d+)?)\s*(?:\$|USD|dollars)",
-            )?,
-            distance_re: Regex::new(
-                r"(?i)(\d+(?:\.\d+)?)\s*(miles?|mi|km|kilometers?|m|meters?|ft|feet|foot|yd|yards?|cm|centimeters?|mm|millimeters?|in|inches?|inch)\b",
-            )?,
-            count_re: Regex::new(
-                r"(?i)(\d+(?:\.\d+)?)\s*(times?|people|persons?|items?|units?|cars?|houses?|books?|files?|projects?|tasks?|events?|meetings?|emails?|messages?|calls?|visits?|orders?|products?|customers?|users?|accounts?|transactions?)\b",
-            )?,
-            percentage_re: Regex::new(r"(?i)(\d+(?:\.\d+)?)\s*(%|percent|pct)\b")?,
-            duration_re: Regex::new(
-                r"(?i)(\d+(?:\.\d+)?)\s*(hours?|hrs?|minutes?|mins?|seconds?|secs?|ms|milliseconds?|days?)\b",
-            )?,
-            temperature_re: Regex::new(
-                r"(?i)(\d+(?:\.\d+)?)\s*(?:°?\s*)(f|fahrenheit|c|celsius|k|kelvin)\b",
-            )?,
-            weight_re: Regex::new(
-                r"(?i)(\d+(?:\.\d+)?)\s*(lbs?|pounds?|oz|ounces?|kg|kilograms?|g|grams?|mg|milligrams?|tons?|tonnes?)\b",
-            )?,
-            data_size_re: Regex::new(
-                r"(?i)(\d+(?:\.\d+)?)\s*(kb|mb|gb|tb|bytes?|kilobytes?|megabytes?|gigabytes?|terabytes?)\b",
-            )?,
-            range_re: Regex::new(
-                r"(?i)(?:between\s+)?(\d+(?:\.\d+)?)\s*(?:[-–]\s*|to\s+|and\s+)(\d+(?:\.\d+)?)\s*(miles?|km|dollars?|\$|%|hours?|minutes?|days?|lbs?|kg|items?|people|times?)?\b",
-            )?,
-            approx_re: Regex::new(
-                r"(?i)(?:about|approximately|around|roughly|nearly|~)\s*(\d+(?:\.\d+)?)\s*(miles?|km|dollars?|\$|%|hours?|minutes?|days?|lbs?|kg|items?|people|times?)?\b",
-            )?,
-        })
+    fn labels(text: &str) -> Vec<(String, f64)> {
+        MetricExtractor::new().extract(text).into_iter().map(|m| (m.label, m.value)).collect()
     }
 
-    pub fn extract(&self, text: &str) -> Vec<(String, f64, Option<String>)> {
-        let mut results = Vec::new();
+    #[test]
+    fn extracts_normalized_quantities_once() {
+        let got = labels("I ran about 5 miles, paid $1,200 rent and slept 8 hours.");
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].0, "distance");
+        assert!((got[0].1 - 8046.72).abs() < 1e-6);
+        assert_eq!(got[1], ("money".to_string(), 1200.0));
+        assert_eq!(got[2], ("duration".to_string(), 28_800.0));
+    }
 
-        for cap in self.money_re.captures_iter(text) {
-            let val_str = cap.get(1).or_else(|| cap.get(2)).map(|m| m.as_str());
-            if let Some(s) = val_str {
-                let cleaned = s.replace(',', "");
-                if let Ok(v) = cleaned.parse::<f64>() {
-                    results.push(("money".to_string(), v, Some("USD".to_string())));
-                }
-            }
-        }
+    #[test]
+    fn ranges_use_midpoint_and_counts_are_singular() {
+        assert_eq!(labels("It costs 10-20 dollars"), vec![("money".to_string(), 15.0)]);
+        assert_eq!(
+            labels("I have visited 12 countries"),
+            vec![("count_country".to_string(), 12.0)]
+        );
+    }
 
-        for cap in self.distance_re.captures_iter(text) {
-            if let (Some(v_match), Some(u_match)) = (cap.get(1), cap.get(2)) {
-                if let Ok(v) = v_match.as_str().parse::<f64>() {
-                    results.push((
-                        format!("distance_{}", u_match.as_str().to_lowercase()),
-                        v,
-                        Some(u_match.as_str().to_string()),
-                    ));
-                }
-            }
-        }
+    #[test]
+    fn ambiguous_units_are_not_metrics() {
+        assert!(labels("I woke up at 5 in the morning and read 3 c chapters").is_empty());
+        assert_eq!(labels("It was 72°F")[0].0, "temperature");
+    }
 
-        for cap in self.count_re.captures_iter(text) {
-            if let (Some(v_match), Some(u_match)) = (cap.get(1), cap.get(2)) {
-                if let Ok(v) = v_match.as_str().parse::<f64>() {
-                    results.push((
-                        format!("count_{}", u_match.as_str().to_lowercase()),
-                        v,
-                        Some(u_match.as_str().to_string()),
-                    ));
-                }
-            }
-        }
+    #[test]
+    fn record_is_idempotent_and_aggregates_by_bucket() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = crate::runtime_paths::RuntimePaths::from_root(temp.path().to_path_buf());
+        let manager =
+            Arc::new(TenantDatabaseManager::new(paths, crate::vector_index::VectorConfig::new(3)));
+        let vault = MetricVault::new(manager.clone());
+        let tenant = manager.get_tenant("default").unwrap();
+        let day = 86_400_000;
+        vault.record_memory(&tenant, "u", "m1", day, "I spent $10 and $20").unwrap();
+        vault.record_memory(&tenant, "u", "m1", day, "I spent $10 and $20").unwrap();
+        vault.record_memory(&tenant, "u", "m2", 3 * day, "Then $5").unwrap();
 
-        for cap in self.percentage_re.captures_iter(text) {
-            if let Some(v_match) = cap.get(1) {
-                if let Ok(v) = v_match.as_str().parse::<f64>() {
-                    results.push(("percentage".to_string(), v, Some("%".to_string())));
-                }
-            }
-        }
+        let total = vault.aggregate_range("default", "u", "money", 0, u64::MAX).unwrap();
+        assert_eq!((total.sum, total.count), (35.0, 3));
 
-        for cap in self.duration_re.captures_iter(text) {
-            if let (Some(v_match), Some(u_match)) = (cap.get(1), cap.get(2)) {
-                if let Ok(v) = v_match.as_str().parse::<f64>() {
-                    results.push((
-                        format!("duration_{}", u_match.as_str().to_lowercase()),
-                        v,
-                        Some(u_match.as_str().to_string()),
-                    ));
-                }
-            }
-        }
-
-        for cap in self.temperature_re.captures_iter(text) {
-            if let (Some(v_match), Some(u_match)) = (cap.get(1), cap.get(2)) {
-                if let Ok(v) = v_match.as_str().parse::<f64>() {
-                    results.push((
-                        format!("temperature_{}", u_match.as_str().to_lowercase()),
-                        v,
-                        Some(u_match.as_str().to_string()),
-                    ));
-                }
-            }
-        }
-
-        for cap in self.weight_re.captures_iter(text) {
-            if let (Some(v_match), Some(u_match)) = (cap.get(1), cap.get(2)) {
-                if let Ok(v) = v_match.as_str().parse::<f64>() {
-                    results.push((
-                        format!("weight_{}", u_match.as_str().to_lowercase()),
-                        v,
-                        Some(u_match.as_str().to_string()),
-                    ));
-                }
-            }
-        }
-
-        for cap in self.data_size_re.captures_iter(text) {
-            if let (Some(v_match), Some(u_match)) = (cap.get(1), cap.get(2)) {
-                if let Ok(v) = v_match.as_str().parse::<f64>() {
-                    results.push((
-                        format!("data_{}", u_match.as_str().to_lowercase()),
-                        v,
-                        Some(u_match.as_str().to_string()),
-                    ));
-                }
-            }
-        }
-
-        for cap in self.range_re.captures_iter(text) {
-            if let (Some(lo_match), Some(hi_match)) = (cap.get(1), cap.get(2)) {
-                if let (Ok(lo), Ok(hi)) =
-                    (lo_match.as_str().parse::<f64>(), hi_match.as_str().parse::<f64>())
-                {
-                    let midpoint = (lo + hi) / 2.0;
-                    let unit_str = cap.get(3).map(|m| m.as_str().to_string());
-                    let category = MetricCategory::from_unit(unit_str.as_deref());
-                    results.push((category.label("range"), midpoint, unit_str));
-                }
-            }
-        }
-
-        for cap in self.approx_re.captures_iter(text) {
-            if let Some(v_match) = cap.get(1) {
-                if let Ok(v) = v_match.as_str().parse::<f64>() {
-                    let unit_str = cap.get(2).map(|m| m.as_str().to_string());
-                    let category = MetricCategory::from_unit(unit_str.as_deref());
-                    results.push((category.label("approx"), v, unit_str));
-                }
-            }
-        }
-
-        results
+        let buckets = vault
+            .aggregate_bucketed("default", "u", "money", 0, u64::MAX, TemporalBucket::Day)
+            .unwrap();
+        assert_eq!(buckets.len(), 2);
+        assert_eq!(buckets[0].result.sum, 30.0);
+        assert_eq!(buckets[1].bucket_start_ms, 3 * day);
     }
 }

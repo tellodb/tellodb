@@ -107,6 +107,7 @@ impl QueryIntentClassifier {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub fn with_threshold(mut self, threshold: f32) -> Self {
         self.threshold = threshold;
         self
@@ -164,15 +165,27 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(all(debug_assertions, not(test)))]
     {
         if sqrt_a != 0.0 {
-            debug_assert!((sqrt_a - 1.0).abs() < 1e-2, "vector a is not L2 normalized: norm={}", sqrt_a);
+            debug_assert!(
+                (sqrt_a - 1.0).abs() < 1e-2,
+                "vector a is not L2 normalized: norm={}",
+                sqrt_a
+            );
         }
         if sqrt_b != 0.0 {
-            debug_assert!((sqrt_b - 1.0).abs() < 1e-2, "vector b is not L2 normalized: norm={}", sqrt_b);
+            debug_assert!(
+                (sqrt_b - 1.0).abs() < 1e-2,
+                "vector b is not L2 normalized: norm={}",
+                sqrt_b
+            );
         }
     }
 
     let denom = sqrt_a * sqrt_b;
-    if denom == 0.0 { 0.0 } else { dot / denom }
+    if denom == 0.0 {
+        0.0
+    } else {
+        dot / denom
+    }
 }
 
 #[cfg(test)]

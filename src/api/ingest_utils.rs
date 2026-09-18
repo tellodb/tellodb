@@ -524,7 +524,7 @@ mod tests {
     fn test_extract_dialogue_messages_json_role_content() {
         let text = r#"{"role": "user", "content": "hello"}"#;
         let msgs = extract_dialogue_messages(text);
-        assert!(msgs.len() >= 1);
+        assert!(!msgs.is_empty());
         assert!(msgs.iter().any(|(r, c)| r == "user" && c == "hello"));
     }
 
@@ -1211,14 +1211,18 @@ mod tests {
     fn test_build_chunk_memory_id_with_split() {
         let p = make_payload("");
         let id = build_chunk_memory_id(&p, 0);
-        assert_eq!(id, "user::session1::0");
+        assert_eq!(id, format!("{}::c0", p.memory_id));
+        assert_eq!(
+            crate::api::utils::turn_index_from_memory_id(&id),
+            crate::api::utils::turn_index_from_memory_id(&p.memory_id)
+        );
     }
 
     #[test]
     fn test_build_chunk_memory_id_increments() {
         let p = make_payload("");
         let id = build_chunk_memory_id(&p, 3);
-        assert_eq!(id, "user::session1::3");
+        assert_eq!(id, format!("{}::c3", p.memory_id));
     }
 
     #[test]
@@ -1226,7 +1230,7 @@ mod tests {
         let mut p = make_payload("");
         p.memory_id = "invalid".to_string();
         let id = build_chunk_memory_id(&p, 0);
-        assert_eq!(id, "invalid::ct0");
+        assert_eq!(id, "invalid::c0");
     }
 
     #[test]

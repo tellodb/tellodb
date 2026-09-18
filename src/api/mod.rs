@@ -20,11 +20,9 @@ use crate::ml::QueryIntentClassifier;
 use crate::platform::PlatformStore;
 use crate::semantic::SemanticInference;
 use crate::storage::{TenantDatabaseManager, TenantStore};
-use crate::vector_index::VectorIndex;
 
 #[derive(Clone)]
 pub struct EngineState {
-    pub vector_index: VectorIndex,
     pub tenant_manager: Arc<TenantDatabaseManager>,
     pub analytics: Arc<MetricVault>,
     pub semantic: Arc<SemanticInference>,

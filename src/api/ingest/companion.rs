@@ -6,9 +6,9 @@ use crate::api::ingest::salient::{
     truncate_for_companion,
 };
 use crate::api::types::IngestPayload;
+use crate::api::utils::derived_memory_id;
 use crate::api::utils::extract_temporal_terms;
 use crate::api::utils::normalize_fact_text;
-use crate::api::utils::split_memory_id;
 
 pub fn build_event_companion_text(payload: &IngestPayload) -> Option<String> {
     let dialogue_lines =
@@ -60,12 +60,7 @@ pub fn build_event_companion_text(payload: &IngestPayload) -> Option<String> {
     Some(parts.join(": "))
 }
 
-pub fn build_relation_companion_payloads(
-    payload: &IngestPayload,
-    entity_id: &str,
-    session_id: &str,
-    turn_index: usize,
-) -> Vec<IngestPayload> {
+pub fn build_relation_companion_payloads(payload: &IngestPayload) -> Vec<IngestPayload> {
     payload
         .relations
         .iter()
@@ -74,12 +69,7 @@ pub fn build_relation_companion_payloads(
             let human_predicate = predicate.replace('_', " ");
             IngestPayload {
                 entity_id: payload.entity_id.clone(),
-                memory_id: format!(
-                    "{}::{}::{}",
-                    entity_id,
-                    session_id,
-                    2_700_000 + turn_index * 20 + idx
-                ),
+                memory_id: derived_memory_id(&payload.memory_id, &format!("rel{idx}")),
                 timestamp: payload.timestamp,
                 textual_content: format!(
                     "Canonical relation: {} {} {}",
@@ -105,9 +95,11 @@ pub fn build_relation_companion_payloads(
 }
 
 pub fn build_companion_payloads(payload: &IngestPayload) -> Vec<IngestPayload> {
-    let Some((entity_id, session_id, turn_index)) = split_memory_id(&payload.memory_id) else {
+    // Companions are per conversation turn; memories outside a session get none.
+    if payload.session_id.as_deref().map_or(true, str::is_empty) {
         return Vec::new();
-    };
+    }
+    let turn_index = payload.turn_index.unwrap_or(0);
 
     let session_focus = extract_bracketed_header_value(&payload.textual_content, "Session Focus");
     let (fallback_gist, fact_texts) =
@@ -125,7 +117,7 @@ pub fn build_companion_payloads(payload: &IngestPayload) -> Vec<IngestPayload> {
         if let Some(gist_text) = gist {
             companions.push(IngestPayload {
                 entity_id: payload.entity_id.clone(),
-                memory_id: format!("{}::{}::{}", entity_id, session_id, 1_000_000 + turn_index),
+                memory_id: derived_memory_id(&payload.memory_id, "gist"),
                 timestamp: payload.timestamp,
                 textual_content: gist_text,
                 relations: payload.relations.clone(),
@@ -148,7 +140,7 @@ pub fn build_companion_payloads(payload: &IngestPayload) -> Vec<IngestPayload> {
         if let Some(keyword_text) = keyword_index {
             companions.push(IngestPayload {
                 entity_id: payload.entity_id.clone(),
-                memory_id: format!("{}::{}::{}", entity_id, session_id, 1_500_000 + turn_index),
+                memory_id: derived_memory_id(&payload.memory_id, "kw"),
                 timestamp: payload.timestamp,
                 textual_content: keyword_text,
                 relations: payload.relations.clone(),
@@ -178,12 +170,7 @@ pub fn build_companion_payloads(payload: &IngestPayload) -> Vec<IngestPayload> {
         };
         companions.push(IngestPayload {
             entity_id: payload.entity_id.clone(),
-            memory_id: format!(
-                "{}::{}::{}",
-                entity_id,
-                session_id,
-                2_000_000 + turn_index * 10 + idx
-            ),
+            memory_id: derived_memory_id(&payload.memory_id, &format!("fact{idx}")),
             timestamp: payload.timestamp,
             textual_content: fact_content,
             relations: payload.relations.clone(),
@@ -202,16 +189,18 @@ pub fn build_companion_payloads(payload: &IngestPayload) -> Vec<IngestPayload> {
             fact_object: None,
             visual_description: None,
             visual_query: None,
+            session_id: payload.session_id.clone(),
+            turn_index: payload.turn_index,
+            role: payload.role.clone(),
         });
     }
 
-    companions
-        .extend(build_atomic_memory_card_payloads(payload, entity_id, session_id, turn_index));
+    companions.extend(build_atomic_memory_card_payloads(payload));
 
     if let Some(event_text) = build_event_companion_text(payload) {
         companions.push(IngestPayload {
             entity_id: payload.entity_id.clone(),
-            memory_id: format!("{}::{}::{}", entity_id, session_id, 2_500_000 + turn_index),
+            memory_id: derived_memory_id(&payload.memory_id, "event"),
             timestamp: payload.timestamp,
             textual_content: event_text,
             relations: payload.relations.clone(),
@@ -230,11 +219,13 @@ pub fn build_companion_payloads(payload: &IngestPayload) -> Vec<IngestPayload> {
             fact_object: None,
             visual_description: None,
             visual_query: None,
+            session_id: payload.session_id.clone(),
+            turn_index: payload.turn_index,
+            role: payload.role.clone(),
         });
     }
 
-    companions
-        .extend(build_relation_companion_payloads(payload, entity_id, session_id, turn_index));
+    companions.extend(build_relation_companion_payloads(payload));
 
     companions
 }
@@ -273,5 +264,35 @@ pub fn build_context_header(prev_text: Option<&str>, next_text: Option<&str>) ->
         String::new()
     } else {
         format!("[{}] ", parts.join(" | "))
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    #[test]
+    fn opaque_memory_ids_get_companions_from_explicit_identity() {
+        let text = "I just moved to Denver and started a new job at Acme Corp.";
+        let conventional = IngestPayload {
+            entity_id: "alice".into(),
+            memory_id: "alice::s1::0".into(),
+            session_id: Some("s1".into()),
+            turn_index: Some(0),
+            textual_content: text.into(),
+            ..Default::default()
+        };
+        let opaque = IngestPayload {
+            memory_id: "0b7c5e0e-3f1a-4d2b-9c61-2a7d8f0e4b11".into(),
+            ..conventional.clone()
+        };
+        let kinds = |p: &IngestPayload| -> Vec<Option<String>> {
+            build_companion_payloads(p).into_iter().map(|c| c.kind).collect()
+        };
+        assert!(!kinds(&conventional).is_empty());
+        assert_eq!(kinds(&opaque), kinds(&conventional));
+
+        let no_session = IngestPayload { session_id: None, ..opaque };
+        assert!(build_companion_payloads(&no_session).is_empty());
     }
 }
