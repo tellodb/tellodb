@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use std::collections::HashSet;
 
 use crate::api::types::EvidenceCard;

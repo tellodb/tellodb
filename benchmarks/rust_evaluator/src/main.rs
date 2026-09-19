@@ -210,7 +210,6 @@ struct IngestTimings {
     pub graph: u64,
     pub fact: u64,
     pub derived_embed: u64,
-    pub derived_ner: u64,
     pub total: u64,
 }
 
@@ -2185,7 +2184,6 @@ async fn ingest_instance(
                     vector: header_u64(headers, "x-tm-vector-ms"),
                     graph: header_u64(headers, "x-tm-graph-ms"),
                     fact: header_u64(headers, "x-tm-fact-bridge-ms"),
-                    derived_ner: header_u64(headers, "x-tm-ner-ms"),
                     total: header_u64(headers, "x-tm-total-ms"),
                 };
                 let counts = headers
@@ -2218,7 +2216,6 @@ async fn ingest_instance(
         }
         total_diag.embed += t.embed;
         total_diag.derived_embed += t.derived_embed;
-        total_diag.derived_ner += t.derived_ner;
         total_diag.storage += t.storage;
         total_diag.fts += t.fts;
         total_diag.vector += t.vector;
@@ -2245,11 +2242,10 @@ async fn ingest_instance(
     }
     if ingest_count > 0 {
         println!(
-            "Ingestion complete. Avg Batch Ingest: {}ms (embed={}ms, derived={}ms, ner={}ms, storage={}ms, fts={}ms, vector={}ms, graph={}ms, fact={}ms)",
+            "Ingestion complete. Avg Batch Ingest: {}ms (embed={}ms, derived={}ms, storage={}ms, fts={}ms, vector={}ms, graph={}ms, fact={}ms)",
             total_diag.total / ingest_count,
             total_diag.embed / ingest_count,
             total_diag.derived_embed / ingest_count,
-            total_diag.derived_ner / ingest_count,
             total_diag.storage / ingest_count,
             total_diag.fts / ingest_count,
             total_diag.vector / ingest_count,

@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use anyhow::{anyhow, Context, Result};
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;

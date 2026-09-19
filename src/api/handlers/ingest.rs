@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use axum::http::{HeaderMap, HeaderValue};
 use axum::{
     extract::{Json, State},
@@ -18,8 +17,6 @@ use crate::api::{EngineState, PlatformWriteOp};
 use crate::graph::EdgeType;
 use crate::ml::cosine_similarity;
 use std::sync::Arc;
-
-type GraphEdgeRecord = crate::storage::GraphEdgeEntry<'static>;
 
 /// Compute a deterministic content hash for dedup.
 /// Uses the text content, entity_id, and kind so that re-ingesting
@@ -63,8 +60,6 @@ pub(crate) struct IngestDiagnostics {
     analytics_ms: u64,
     analytics_us: u64,
     artifact_build_ms: u64,
-    ner_ms: u64,
-    ner_us: u64,
     derived_embed_ms: u64,
     derived_embed_us: u64,
     memory_cards_ms: u64,
@@ -125,7 +120,6 @@ impl IngestDiagnostics {
             + self.storage_ms
             + self.analytics_ms
             + self.artifact_build_ms
-            + self.ner_ms
             + self.memory_cards_ms
             + self.session_router_ms
             + self.fts_ms
@@ -148,7 +142,6 @@ impl IngestDiagnostics {
             ("observation insert (sqlite)", self.storage_ms),
             ("analytics processing", self.analytics_ms),
             ("artifact building (per-rec)", self.artifact_build_ms),
-            ("entity resolution", self.ner_ms),
             ("memory card upserts", self.memory_cards_ms),
             ("session router + embed", self.session_router_ms),
             ("FTS indexing", self.fts_ms),
@@ -1434,111 +1427,6 @@ fn truncate_router_value(text: &str, max_chars: usize) -> String {
     } else {
         text.chars().take(max_chars).collect::<String>().trim().to_string()
     }
-}
-
-fn infer_event_relation(lower: &str, terms: &[String]) -> String {
-    for (needle, relation) in [
-        ("volunteer", "volunteered"),
-        ("adopt", "adopted"),
-        ("watch", "watched"),
-        ("visit", "visited"),
-        ("went", "went"),
-        ("buy", "bought"),
-        ("bought", "bought"),
-        ("meet", "met"),
-        ("met", "met"),
-        ("move", "moved"),
-        ("started", "started"),
-        ("finished", "finished"),
-        ("won", "won"),
-        ("read", "read"),
-        ("study", "studied"),
-    ] {
-        if lower.contains(needle) {
-            return relation.to_string();
-        }
-    }
-    terms.first().cloned().unwrap_or_else(|| "event".to_string())
-}
-
-fn infer_place_hint(text: &str) -> Option<String> {
-    let lower = text.to_ascii_lowercase();
-    for marker in [" at ", " in ", " near ", " from ", " to "] {
-        if let Some(idx) = lower.find(marker) {
-            let tail = text[idx + marker.len()..].trim();
-            let place = tail
-                .split(['.', ',', ';', '\n'])
-                .next()
-                .unwrap_or("")
-                .split_whitespace()
-                .take(4)
-                .collect::<Vec<_>>()
-                .join(" ");
-            if place.len() >= 3 {
-                return Some(place);
-            }
-        }
-    }
-    None
-}
-
-fn infer_shadow_answer_type(kind: MemoryKind, lower: &str) -> String {
-    if lower.contains("when") || lower.contains(" on ") || lower.contains("date") {
-        "date"
-    } else if lower.contains("where") || lower.contains("visited") || lower.contains("went") {
-        "place"
-    } else if lower.contains("how many") || lower.contains("number") {
-        "count"
-    } else if matches!(kind, MemoryKind::Preference)
-        || lower.contains("favorite")
-        || lower.contains("likes")
-        || lower.contains("loves")
-    {
-        "preference"
-    } else if matches!(kind, MemoryKind::Decision) {
-        "decision"
-    } else {
-        "fact"
-    }
-    .to_string()
-}
-
-fn compute_memory_saliency(text: &str, kind: MemoryKind) -> f32 {
-    let lower = text.to_ascii_lowercase();
-    let named = !extract_named_phrases(&[text.to_string()]).is_empty();
-    let temporal = !extract_temporal_terms(text).is_empty();
-    let life_event = [
-        "adopted",
-        "moved",
-        "married",
-        "graduated",
-        "started",
-        "finished",
-        "won",
-        "lost",
-        "allergy",
-        "health",
-        "job",
-        "birthday",
-        "favorite",
-        "decided",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle));
-    let mut score: f32 = 0.20;
-    if named {
-        score += 0.20;
-    }
-    if temporal {
-        score += 0.20;
-    }
-    if life_event {
-        score += 0.25;
-    }
-    if matches!(kind, MemoryKind::Fact | MemoryKind::Preference | MemoryKind::Decision) {
-        score += 0.15;
-    }
-    score.min(1.0)
 }
 
 fn build_retrospective_links(
