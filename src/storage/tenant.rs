@@ -367,13 +367,14 @@ impl crate::vector_index::VectorSource for SqliteVectorSource {
     fn vectors_by_id(&self, ids: &[u64]) -> Result<HashMap<u64, Vec<f32>>> {
         let conn = self.pool.get().context("failed to get connection")?;
         let mut out = HashMap::with_capacity(ids.len());
-        for chunk in ids.chunks(500) {
+        for chunk in ids.chunks(crate::storage::repo::IN_CHUNK) {
+            let values = crate::storage::repo::padded_in_chunk(chunk);
             let mut stmt = conn.prepare_cached(&format!(
                 "SELECT vector_id, embedding FROM vector_lookup
                  WHERE embedding IS NOT NULL AND vector_id IN ({})",
-                vec!["?"; chunk.len()].join(",")
+                crate::storage::repo::in_placeholders(crate::storage::repo::IN_CHUNK)
             ))?;
-            let params: Vec<i64> = chunk.iter().map(|id| *id as i64).collect();
+            let params = values.into_iter().map(|id| *id as i64);
             let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
                 Ok((row.get::<_, i64>(0)? as u64, bytes_to_vec_f32(&row.get::<_, Vec<u8>>(1)?)))
             })?;
@@ -781,6 +782,31 @@ mod tests {
 
         assert_eq!(mem_id, "mem-001");
         assert_eq!(ts, 2000);
+    }
+
+    #[test]
+    fn lookup_by_memory_ids_batch_handles_two_thousand_ids() {
+        let temp = tempdir().unwrap();
+        let store = TenantStore::new(&temp.path().join("tenant.db")).unwrap();
+        let items: Vec<(u64, String, AgentObservation)> = (0..2_000)
+            .map(|index| {
+                (
+                    index as u64,
+                    format!("memory-{index}"),
+                    AgentObservation {
+                        entity_id: "alice".to_string(),
+                        textual_content: format!("memory {index}"),
+                        created_at_ms: index as u64,
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        store.insert_observations_batch(&items).unwrap();
+        let ids: Vec<String> = items.into_iter().map(|(_, memory_id, _)| memory_id).collect();
+        let found = store.lookup_by_memory_ids_batch(&ids).unwrap();
+        assert_eq!(found.len(), 2_000);
+        assert_eq!(found["memory-1999"].0, 1_999);
     }
 
     #[test]

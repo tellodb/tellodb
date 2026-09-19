@@ -10,8 +10,8 @@ impl TenantStore {
         }
         let conn = self.get_conn()?;
         let mut rows_by_memory: HashMap<String, (String, FactVersionRow)> = HashMap::new();
-        for chunk in memory_ids.chunks(200) {
-            let placeholders = vec!["?"; chunk.len()].join(",");
+        for chunk in memory_ids.chunks(IN_CHUNK) {
+            let values = padded_in_chunk(chunk);
             let mut stmt = conn.prepare_cached(&format!(
                 "SELECT COALESCE(m.parent_memory_id, v.memory_id) AS asked_for,
                         v.memory_id, v.fact_key, v.entity_id, v.object, v.status,
@@ -30,16 +30,14 @@ impl TenantStore {
                           WHERE s.fact_key = v.fact_key AND s.memory_id = v.superseded_by LIMIT 1)
                  FROM fact_versions v
                  LEFT JOIN memories m ON m.memory_id = v.memory_id
-                 WHERE v.memory_id IN ({placeholders})
-                    OR m.parent_memory_id IN ({placeholders})
-                 ORDER BY v.valid_from_ms, v.memory_id"
+                 WHERE v.memory_id IN ({})
+                    OR m.parent_memory_id IN ({})
+                 ORDER BY v.valid_from_ms, v.memory_id",
+                in_placeholders(IN_CHUNK),
+                in_placeholders(IN_CHUNK)
             ))?;
-            let params: Vec<&dyn rusqlite::types::ToSql> = chunk
-                .iter()
-                .chain(chunk.iter())
-                .map(|s| s as &dyn rusqlite::types::ToSql)
-                .collect();
-            let mapped = stmt.query_map(params.as_slice(), |row| {
+            let params = values.iter().chain(values.iter());
+            let mapped = stmt.query_map(rusqlite::params_from_iter(params), |row| {
                 let status: String = row.get(5)?;
                 Ok((
                     row.get::<_, String>(0)?,
@@ -509,28 +507,29 @@ impl TenantStore {
         condition: &str,
         point_in_time_ms: Option<u64>,
     ) -> Result<std::collections::HashSet<String>> {
-        const CHUNK: usize = 500;
         let mut set = std::collections::HashSet::new();
         if memory_ids.is_empty() {
             return Ok(set);
         }
         let conn = self.get_conn()?;
-        for chunk in memory_ids.chunks(CHUNK) {
-            let first_id_param = if point_in_time_ms.is_some() { 2 } else { 1 };
-            let placeholders: Vec<String> =
-                (0..chunk.len()).map(|i| format!("?{}", i + first_id_param)).collect();
+        for chunk in memory_ids.chunks(IN_CHUNK) {
+            let values = padded_in_chunk(chunk);
             let sql = format!(
                 "SELECT DISTINCT memory_id FROM fact_versions WHERE {condition} AND memory_id IN ({})",
-                placeholders.join(",")
+                in_placeholders(IN_CHUNK)
             );
             let mut stmt = conn.prepare_cached(&sql)?;
-            let mut values: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() + 1);
+            let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(IN_CHUNK + 1);
             if let Some(pit) = point_in_time_ms {
-                values.push(rusqlite::types::Value::Integer(pit as i64));
+                params.push(rusqlite::types::Value::Integer(pit as i64));
             }
-            values.extend(chunk.iter().map(|m| rusqlite::types::Value::Text(m.clone())));
+            params.extend(
+                values
+                    .into_iter()
+                    .map(|memory_id| rusqlite::types::Value::Text(memory_id.to_string())),
+            );
             let rows =
-                stmt.query_map(rusqlite::params_from_iter(values), |row| row.get::<_, String>(0))?;
+                stmt.query_map(rusqlite::params_from_iter(params), |row| row.get::<_, String>(0))?;
             for row in rows {
                 set.insert(row?);
             }

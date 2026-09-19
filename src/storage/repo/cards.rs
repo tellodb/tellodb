@@ -288,57 +288,57 @@ impl TenantStore {
             return Ok(std::collections::HashMap::new());
         }
         let conn = self.get_conn()?;
-        let placeholders: Vec<String> = card_ids.iter().map(|_| "?".to_string()).collect();
-        let sql = format!(
-            "SELECT card_id, entity_id, user_id, source_memory_id, source_session_id,
-                    subject, predicate, object, memory_text, card_type, confidence,
-                    is_latest, is_static, is_inference, expires_at, root_card_id, parent_card_id,
-                    lifecycle, created_at_ms, updated_at_ms
-             FROM memory_cards WHERE card_id IN ({})",
-            placeholders.join(",")
-        );
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            card_ids.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
-        let rows = stmt.query_map(
-            param_refs.as_slice(),
-            |row| -> rusqlite::Result<(String, MemoryCard)> {
-                let lifecycle_str: Option<String> = row.get(17)?;
-                Ok((
-                    row.get::<_, String>(0)?,
-                    MemoryCard {
-                        card_id: row.get(0)?,
-                        entity_id: row.get(1)?,
-                        user_id: row.get(2)?,
-                        source_memory_id: row.get(3)?,
-                        source_session_id: row.get(4)?,
-                        subject: row.get(5)?,
-                        predicate: row.get(6)?,
-                        object: row.get(7)?,
-                        memory_text: row.get(8)?,
-                        card_type: row.get(9)?,
-                        confidence: row.get(10)?,
-                        is_latest: row.get::<_, i32>(11)? != 0,
-                        is_static: row.get::<_, i32>(12)? != 0,
-                        is_inference: row.get::<_, i32>(13)? != 0,
-                        expires_at: row.get(14)?,
-                        root_card_id: row.get(15)?,
-                        parent_card_id: row.get(16)?,
-                        lifecycle: lifecycle_str.and_then(|s| serde_json::from_str(&s).ok()),
-                        source_turn_index: 0,
-                        document_time: 0,
-                        conversation_time: 0,
-                        event_time: None,
-                        created_at_ms: row.get(18)?,
-                        updated_at_ms: row.get(19)?,
-                    },
-                ))
-            },
-        )?;
         let mut results = std::collections::HashMap::new();
-        for row in rows {
-            let (card_id, card) = row?;
-            results.insert(card_id, card);
+        for chunk in card_ids.chunks(IN_CHUNK) {
+            let values = padded_in_chunk(chunk);
+            let sql = format!(
+                "SELECT card_id, entity_id, user_id, source_memory_id, source_session_id,
+                        subject, predicate, object, memory_text, card_type, confidence,
+                        is_latest, is_static, is_inference, expires_at, root_card_id, parent_card_id,
+                        lifecycle, created_at_ms, updated_at_ms
+                 FROM memory_cards WHERE card_id IN ({})",
+                in_placeholders(IN_CHUNK)
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
+            let rows = stmt.query_map(
+                rusqlite::params_from_iter(values),
+                |row| -> rusqlite::Result<(String, MemoryCard)> {
+                    let lifecycle_str: Option<String> = row.get(17)?;
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        MemoryCard {
+                            card_id: row.get(0)?,
+                            entity_id: row.get(1)?,
+                            user_id: row.get(2)?,
+                            source_memory_id: row.get(3)?,
+                            source_session_id: row.get(4)?,
+                            subject: row.get(5)?,
+                            predicate: row.get(6)?,
+                            object: row.get(7)?,
+                            memory_text: row.get(8)?,
+                            card_type: row.get(9)?,
+                            confidence: row.get(10)?,
+                            is_latest: row.get::<_, i32>(11)? != 0,
+                            is_static: row.get::<_, i32>(12)? != 0,
+                            is_inference: row.get::<_, i32>(13)? != 0,
+                            expires_at: row.get(14)?,
+                            root_card_id: row.get(15)?,
+                            parent_card_id: row.get(16)?,
+                            lifecycle: lifecycle_str.and_then(|s| serde_json::from_str(&s).ok()),
+                            source_turn_index: 0,
+                            document_time: 0,
+                            conversation_time: 0,
+                            event_time: None,
+                            created_at_ms: row.get(18)?,
+                            updated_at_ms: row.get(19)?,
+                        },
+                    ))
+                },
+            )?;
+            for row in rows {
+                let (card_id, card) = row?;
+                results.insert(card_id, card);
+            }
         }
         Ok(results)
     }

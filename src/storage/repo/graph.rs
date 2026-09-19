@@ -159,18 +159,17 @@ impl TenantStore {
         limit: usize,
         max_node_degree: usize,
     ) -> Result<HashMap<String, Vec<EdgeNeighbour>>> {
-        const CHUNK: usize = 400;
         let conn = self.get_conn()?;
-        let placeholders = |n: usize| vec!["?"; n].join(",");
 
         // Node multiset per memory (a node listed once per edge endpoint).
         let mut nodes_of: HashMap<String, Vec<String>> = HashMap::new();
-        for ids in memory_ids.chunks(CHUNK) {
+        for ids in memory_ids.chunks(IN_CHUNK) {
+            let values = padded_in_chunk(ids);
             let mut stmt = conn.prepare_cached(&format!(
                 "SELECT memory_id, source, target FROM edges WHERE memory_id IN ({})",
-                placeholders(ids.len())
+                in_placeholders(IN_CHUNK)
             ))?;
-            let rows = stmt.query_map(rusqlite::params_from_iter(ids), |row| {
+            let rows = stmt.query_map(rusqlite::params_from_iter(values), |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
             })?;
             for row in rows {
@@ -187,12 +186,13 @@ impl TenantStore {
         // Degree = edges with the node as source + as target; hubs are skipped.
         let mut degree: HashMap<String, usize> = HashMap::new();
         for column in ["source", "target"] {
-            for nodes in unique.chunks(CHUNK) {
+            for nodes in unique.chunks(IN_CHUNK) {
+                let values = padded_in_chunk(nodes);
                 let mut stmt = conn.prepare_cached(&format!(
                     "SELECT {column}, COUNT(*) FROM edges WHERE {column} IN ({}) GROUP BY {column}",
-                    placeholders(nodes.len())
+                    in_placeholders(IN_CHUNK)
                 ))?;
-                let rows = stmt.query_map(rusqlite::params_from_iter(nodes), |row| {
+                let rows = stmt.query_map(rusqlite::params_from_iter(values), |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
                 })?;
                 for row in rows {
@@ -209,17 +209,18 @@ impl TenantStore {
         type Incident = HashMap<String, Vec<(String, f32, String)>>;
         let mut incident: [Incident; 2] = [HashMap::new(), HashMap::new()];
         for (slot, column) in ["source", "target"].into_iter().enumerate() {
-            for nodes in traversable.chunks(CHUNK) {
+            for nodes in traversable.chunks(IN_CHUNK) {
                 // The filter is bound last: bare `?` markers number from 1.
-                let filter_idx = nodes.len() + 1;
+                let filter_idx = IN_CHUNK + 1;
+                let values = padded_in_chunk(nodes);
                 let mut stmt = conn.prepare_cached(&format!(
                     "SELECT {column}, memory_id, weight, edge_type FROM edges
                      WHERE {column} IN ({}) AND memory_id IS NOT NULL
                        AND (?{filter_idx} IS NULL OR edge_type = ?{filter_idx})",
-                    placeholders(nodes.len())
+                    in_placeholders(IN_CHUNK)
                 ))?;
                 let mut params: Vec<&dyn rusqlite::types::ToSql> =
-                    nodes.iter().map(|n| n as &dyn rusqlite::types::ToSql).collect();
+                    values.iter().map(|n| *n as &dyn rusqlite::types::ToSql).collect();
                 params.push(&edge_type_filter);
                 let rows = stmt.query_map(params.as_slice(), |row| {
                     Ok((

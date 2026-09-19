@@ -46,28 +46,27 @@ impl TenantStore {
             return Ok(Vec::new());
         }
         let conn = self.get_conn()?;
-        let placeholders: Vec<String> = vector_ids.iter().map(|_| "?".to_string()).collect();
-        let sql = format!(
-            "SELECT vector_id, memory_id, timestamp_ms FROM vector_lookup WHERE vector_id IN ({})",
-            placeholders.join(",")
-        );
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let params: Vec<i64> = vector_ids.iter().map(|v| *v as i64).collect();
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
-        let rows = stmt.query_map(param_refs.as_slice(), |row| {
-            Ok((
-                row.get::<_, i64>(0)? as u64,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)? as u64,
-            ))
-        })?;
-
         let mut lookup: std::collections::HashMap<u64, (u64, String)> =
             std::collections::HashMap::with_capacity(vector_ids.len());
-        for row in rows {
-            let (vid, memory_id, ts) = row?;
-            lookup.insert(vid, (ts, memory_id));
+        for chunk in vector_ids.chunks(IN_CHUNK) {
+            let values = padded_in_chunk(chunk);
+            let sql = format!(
+                "SELECT vector_id, memory_id, timestamp_ms FROM vector_lookup WHERE vector_id IN ({})",
+                in_placeholders(IN_CHUNK)
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
+            let params = values.into_iter().map(|value| *value as i64);
+            let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)? as u64,
+                ))
+            })?;
+            for row in rows {
+                let (vid, memory_id, ts) = row?;
+                lookup.insert(vid, (ts, memory_id));
+            }
         }
         let results: Vec<Option<(u64, String)>> =
             vector_ids.iter().map(|vid| lookup.get(vid).cloned()).collect();
@@ -86,28 +85,28 @@ impl TenantStore {
         }
         let mut result = std::collections::HashMap::with_capacity(memory_ids.len());
         let conn = self.get_conn()?;
-        let placeholders: Vec<String> = memory_ids.iter().map(|_| "?".to_string()).collect();
-        let sql = format!(
-            "SELECT m.memory_id, v.vector_id, m.created_at_ms
-             FROM memories m
-             LEFT JOIN vector_lookup v ON v.memory_id = m.memory_id
-             WHERE m.memory_id IN ({})",
-            placeholders.join(",")
-        );
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            memory_ids.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
-        let rows = stmt.query_map(param_refs.as_slice(), |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<i64>>(1)?.map(|v| v as u64),
-                row.get::<_, i64>(2)? as u64,
-            ))
-        })?;
+        for chunk in memory_ids.chunks(IN_CHUNK) {
+            let values = padded_in_chunk(chunk);
+            let sql = format!(
+                "SELECT m.memory_id, v.vector_id, m.created_at_ms
+                 FROM memories m
+                 LEFT JOIN vector_lookup v ON v.memory_id = m.memory_id
+                 WHERE m.memory_id IN ({})",
+                in_placeholders(IN_CHUNK)
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(values), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?.map(|v| v as u64),
+                    row.get::<_, i64>(2)? as u64,
+                ))
+            })?;
 
-        for row in rows {
-            let (mid, vid_opt, ts) = row?;
-            result.insert(mid, (ts, vid_opt.unwrap_or(0)));
+            for row in rows {
+                let (mid, vid_opt, ts) = row?;
+                result.insert(mid, (ts, vid_opt.unwrap_or(0)));
+            }
         }
         Ok(result)
     }
@@ -121,12 +120,13 @@ impl TenantStore {
             return Ok(out);
         }
         let conn = self.get_conn()?;
-        for chunk in memory_ids.chunks(256) {
-            let placeholders = vec!["?"; chunk.len()].join(",");
+        for chunk in memory_ids.chunks(IN_CHUNK) {
+            let values = padded_in_chunk(chunk);
             let mut stmt = conn.prepare_cached(&format!(
-                "SELECT memory_id, session_id, turn_index FROM memories WHERE memory_id IN ({placeholders})"
+                "SELECT memory_id, session_id, turn_index FROM memories WHERE memory_id IN ({})",
+                in_placeholders(IN_CHUNK)
             ))?;
-            let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+            let rows = stmt.query_map(rusqlite::params_from_iter(values), |row| {
                 Ok((row.get::<_, String>(0)?, (row.get::<_, String>(1)?, row.get::<_, u32>(2)?)))
             })?;
             for row in rows {
@@ -175,38 +175,38 @@ impl TenantStore {
         if keys.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
-        let memory_ids: Vec<&str> = keys.iter().map(|(_, mid)| mid.as_str()).collect();
         let conn = self.get_conn()?;
-        let placeholders: Vec<String> = memory_ids.iter().map(|_| "?".to_string()).collect();
-        let sql = format!(
-            "SELECT memory_id, entity_id, content, kind, created_at_ms, session_id, turn_index, role, parent_memory_id
-             FROM memories WHERE memory_id IN ({})",
-            placeholders.join(",")
-        );
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            memory_ids.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
-        let rows = stmt.query_map(param_refs.as_slice(), |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                AgentObservation {
-                    entity_id: row.get::<_, String>(1)?,
-                    textual_content: row.get::<_, String>(2)?,
-                    embedding: Vec::new(),
-                    kind: MemoryKind::parse(row.get::<_, String>(3)?.as_str()),
-                    content_hash: String::new(),
-                    created_at_ms: row.get::<_, i64>(4)? as u64,
-                    session_id: row.get(5)?,
-                    turn_index: row.get(6)?,
-                    role: row.get(7)?,
-                    parent_memory_id: row.get(8)?,
-                },
-            ))
-        })?;
         let mut result = std::collections::HashMap::new();
-        for row in rows {
-            let (memory_id, obs) = row?;
-            result.insert(memory_id, obs);
+        for chunk in keys.chunks(IN_CHUNK) {
+            let memory_ids: Vec<&str> = chunk.iter().map(|(_, mid)| mid.as_str()).collect();
+            let values = padded_in_chunk(&memory_ids);
+            let sql = format!(
+                "SELECT memory_id, entity_id, content, kind, created_at_ms, session_id, turn_index, role, parent_memory_id
+                 FROM memories WHERE memory_id IN ({})",
+                in_placeholders(IN_CHUNK)
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(values), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    AgentObservation {
+                        entity_id: row.get::<_, String>(1)?,
+                        textual_content: row.get::<_, String>(2)?,
+                        embedding: Vec::new(),
+                        kind: MemoryKind::parse(row.get::<_, String>(3)?.as_str()),
+                        content_hash: String::new(),
+                        created_at_ms: row.get::<_, i64>(4)? as u64,
+                        session_id: row.get(5)?,
+                        turn_index: row.get(6)?,
+                        role: row.get(7)?,
+                        parent_memory_id: row.get(8)?,
+                    },
+                ))
+            })?;
+            for row in rows {
+                let (memory_id, obs) = row?;
+                result.insert(memory_id, obs);
+            }
         }
         Ok(result)
     }
@@ -214,12 +214,13 @@ impl TenantStore {
     pub fn stored_content_hashes(&self, memory_ids: &[String]) -> Result<HashMap<String, String>> {
         let mut out = HashMap::with_capacity(memory_ids.len());
         let conn = self.get_conn()?;
-        for chunk in memory_ids.chunks(256) {
-            let placeholders = vec!["?"; chunk.len()].join(",");
+        for chunk in memory_ids.chunks(IN_CHUNK) {
+            let values = padded_in_chunk(chunk);
             let mut stmt = conn.prepare_cached(&format!(
-                "SELECT memory_id, content_hash FROM memories WHERE memory_id IN ({placeholders})"
+                "SELECT memory_id, content_hash FROM memories WHERE memory_id IN ({})",
+                in_placeholders(IN_CHUNK)
             ))?;
-            let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+            let rows = stmt.query_map(rusqlite::params_from_iter(values), |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?;
             for row in rows {

@@ -11,12 +11,29 @@ pub mod schema;
 pub mod sessions;
 pub mod traits;
 
+pub const IN_CHUNK: usize = 500;
+
+pub fn in_placeholders(n: usize) -> String {
+    (0..n).map(|_| "?").collect::<Vec<_>>().join(",")
+}
+
+pub fn padded_in_chunk<T>(chunk: &[T]) -> Vec<&T> {
+    let Some(last) = chunk.last() else {
+        return Vec::new();
+    };
+    let mut padded = Vec::with_capacity(IN_CHUNK);
+    padded.extend(chunk);
+    padded.resize(IN_CHUNK, last);
+    padded
+}
+
 pub(super) mod prelude {
     pub(super) use anyhow::{Context, Result};
     pub(super) use rusqlite::params;
     pub(super) use std::collections::HashMap;
     pub(super) use std::time::{SystemTime, UNIX_EPOCH};
 
+    pub(super) use super::{in_placeholders, padded_in_chunk, IN_CHUNK};
     pub(super) use crate::storage::tenant::{
         bytes_to_vec_f32, contains_term_count, fts_entity_tok, fts_quote, fts_rowid,
         memory_turn_row, merge_router_records, merge_turn, same_fact_object, unix_timestamp_ms,

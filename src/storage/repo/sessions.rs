@@ -348,21 +348,22 @@ impl TenantStore {
         }
         let conn = self.get_conn()?;
         let wanted: std::collections::HashSet<&str> = turn_ids.iter().map(String::as_str).collect();
-        for ids in turn_ids.chunks(400) {
-            let placeholders = vec!["?"; ids.len()].join(",");
+        for ids in turn_ids.chunks(IN_CHUNK) {
+            let values = padded_in_chunk(ids);
             let sql = format!(
                 "SELECT memory_id, parent_memory_id, entity_id, session_id, role, turn_index,
                         content, created_at_ms, content_hash
                  FROM memories
-                 WHERE memory_id IN ({placeholders})
-                    OR (parent_memory_id IN ({placeholders})
+                 WHERE memory_id IN ({})
+                    OR (parent_memory_id IN ({})
                         AND memory_id GLOB parent_memory_id || '::c[0-9]*')
-                 ORDER BY rowid"
+                 ORDER BY rowid",
+                in_placeholders(IN_CHUNK),
+                in_placeholders(IN_CHUNK)
             );
             let mut stmt = conn.prepare_cached(&sql)?;
-            let params: Vec<&dyn rusqlite::types::ToSql> =
-                ids.iter().chain(ids.iter()).map(|s| s as &dyn rusqlite::types::ToSql).collect();
-            let rows = stmt.query_map(params.as_slice(), memory_turn_row)?;
+            let params = values.iter().chain(values.iter());
+            let rows = stmt.query_map(rusqlite::params_from_iter(params), memory_turn_row)?;
             for row in rows {
                 let (memory_id, parent, turn) = row?;
                 let key = if wanted.contains(memory_id.as_str()) {
