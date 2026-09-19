@@ -1674,7 +1674,12 @@ fn route_phase(s: &mut QueryPipelineState) {
             handles.push(sc.spawn(move || {
                 let hits = tenant
                     .fts_search(probe_query.as_str(), hit_limit, eid.as_deref())
-                    .unwrap_or_default();
+                    .unwrap_or_else(|err| {
+                        // An empty lane and a failed lane look identical
+                        // downstream, and the difference is a recall bug.
+                        tracing::warn!(error = %err, probe = %probe_query, "route probe FTS failed");
+                        Vec::new()
+                    });
                 (probe_idx, hits)
             }));
         }
@@ -2068,7 +2073,10 @@ fn retrieval_fts(s: &mut QueryPipelineState) {
                 handles.push(sc.spawn(move || {
                     let hits = tenant
                         .fts_search(fts_query.as_str(), fts_top, eid.as_deref())
-                        .unwrap_or_default();
+                        .unwrap_or_else(|err| {
+                            tracing::warn!(error = %err, query = %fts_query, "FTS lane failed");
+                            Vec::new()
+                        });
                     (idx, hits)
                 }));
             }

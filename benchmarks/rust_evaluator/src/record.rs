@@ -418,6 +418,38 @@ pub fn report(paths: &[String]) -> Result<String> {
         ));
     }
 
+    // Latency is only interpretable next to the embedding cache state: a warm
+    // cache turns encoder inference into a SQLite lookup, and `embed` then
+    // measures the lookup. The heuristics profile and lane set decide what the
+    // quality columns above even mean.
+    out.push_str("\n### Configuration\n\n");
+    out.push_str("| run | heuristics | lanes | rerank | embed cache hit % | device |\n");
+    out.push_str("|---|---|---|---|---|---|\n");
+    for path in paths {
+        let data = fs::read_to_string(path).with_context(|| format!("Failed to read {path}"))?;
+        let r: Value = serde_json::from_str(&data).with_context(|| format!("Bad record {path}"))?;
+        let e = &r["engine"];
+        let hits = e["embed_cache_hits"].as_u64().unwrap_or(0);
+        let misses = e["embed_cache_misses"].as_u64().unwrap_or(0);
+        let hit_rate = match hits + misses {
+            0 => "–".to_string(),
+            total => format!("{:.1}", (hits as f64 / total as f64) * 100.0),
+        };
+        let lanes = e["lanes"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join("+"))
+            .unwrap_or_else(|| "–".to_string());
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} |\n",
+            Path::new(path).file_stem().map(|s| s.to_string_lossy()).unwrap_or_default(),
+            e["heuristics"].as_str().unwrap_or("–"),
+            if lanes.is_empty() { "–".to_string() } else { lanes },
+            e["rerank"].as_str().unwrap_or("–"),
+            hit_rate,
+            e["device"].as_str().unwrap_or("–"),
+        ));
+    }
+
     out.push_str("\n### Query Latency Breakdown (Mean ms)\n\n");
     out.push_str("| run | tier | plan | route | embed | ann | fts | cards | rerank | pref | graph | session | fuse | hydr | total |\n");
     out.push_str("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
@@ -487,7 +519,8 @@ fn question_scores(record: &Value) -> BTreeMap<String, (f64, f64)> {
 fn ablation_label(path: &str, record: &Value) -> String {
     if let Some(dir) = Path::new(path).parent().and_then(|p| p.file_name()) {
         let dir = dir.to_string_lossy();
-        if !dir.is_empty() && dir != "runs" && !dir.chars().all(|c| c.is_ascii_digit() || c == '_') {
+        if !dir.is_empty() && dir != "runs" && !dir.chars().all(|c| c.is_ascii_digit() || c == '_')
+        {
             return dir.into_owned();
         }
     }
@@ -495,11 +528,7 @@ fn ablation_label(path: &str, record: &Value) -> String {
         .as_array()
         .map(|a| a.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default();
-    if disabled.is_empty() {
-        "(none)".to_string()
-    } else {
-        format!("-{}", disabled.join(",-"))
-    }
+    if disabled.is_empty() { "(none)".to_string() } else { format!("-{}", disabled.join(",-")) }
 }
 
 /// Markdown table of each run's change against `baseline`: paired deltas on
@@ -590,7 +619,9 @@ fn rerank_reasons(rows: &[&QuestionRecord]) -> Value {
         *counts.entry(name).or_default() += 1;
     }
     let total = rows.len().max(1) as f64;
-    Value::Object(counts.into_iter().map(|(k, v)| (k.to_string(), json!(v as f64 / total))).collect())
+    Value::Object(
+        counts.into_iter().map(|(k, v)| (k.to_string(), json!(v as f64 / total))).collect(),
+    )
 }
 
 fn mean(values: &[f64]) -> Option<f64> {
