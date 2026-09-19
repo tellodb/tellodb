@@ -7,7 +7,7 @@ pub mod system;
 
 use axum::{
     extract::{Request, State},
-    http::StatusCode,
+    http::{header::HeaderValue, StatusCode},
     middleware::{self, Next},
     response::Response,
     routing::{delete, get, post},
@@ -34,6 +34,45 @@ use self::system::{
     storage_stats_handler, version_handler, warmup_handler,
 };
 use crate::api::{auth, EngineState};
+
+const UNTIMED: &[&str] = &[
+    "/health",
+    "/healthz",
+    "/version",
+    "/metrics",
+    "/ingest",
+    "/ingest/batch",
+    "/batch-ingest",
+    "/reset",
+    "/admin/reset",
+    "/v1/admin/reset",
+];
+
+const DEPRECATED_ROUTE_PATHS: &[&str] = &[
+    "/reset",
+    "/admin/reset",
+    "/batch-ingest",
+    "/memory/inspect",
+    "/memory/delete",
+    "/query/semantic",
+];
+
+fn is_deprecated_route(path: &str) -> bool {
+    DEPRECATED_ROUTE_PATHS.contains(&path)
+}
+
+fn mark_deprecated_response(path: &str, response: &mut axum::response::Response) {
+    if is_deprecated_route(path) {
+        response.headers_mut().insert("Deprecation", HeaderValue::from_static("true"));
+    }
+}
+
+async fn deprecation_middleware(req: Request, next: Next) -> Response {
+    let path = req.uri().path().to_string();
+    let mut response = next.run(req).await;
+    mark_deprecated_response(&path, &mut response);
+    response
+}
 
 async fn rate_limit_middleware(
     State(state): State<EngineState>,
@@ -68,21 +107,7 @@ async fn request_timeout_middleware(
     next: Next,
 ) -> Result<Response, StatusCode> {
     let path = req.uri().path().to_string();
-    // Health probes never time out. Ingest and reset are exempt too: the
-    // timeout drops the response but not the blocking work behind it, so a
-    // timed-out ingest kept running while the client retried it.
-    const UNTIMED: [&str; 9] = [
-        "/health",
-        "/healthz",
-        "/version",
-        "/metrics",
-        "/ingest",
-        "/ingest/batch",
-        "/batch-ingest",
-        "/reset",
-        "/admin/reset",
-    ];
-    if UNTIMED.contains(&path.as_str()) || path == "/v1/admin/reset" {
+    if UNTIMED.contains(&path.as_str()) {
         return Ok(next.run(req).await);
     }
     let timeout_secs = state.config.server.request_timeout_secs;
@@ -146,8 +171,57 @@ pub fn build_api(state: EngineState) -> Router {
         .route("/metrics", get(metrics_handler))
         .merge(platform)
         .merge(protected)
-        .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024)) // 10MB max body
+        .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024))
+        .layer(middleware::from_fn(deprecation_middleware))
         .layer(middleware::from_fn_with_state(state.clone(), request_timeout_middleware))
         .layer(auth::build_cors_layer(&state.config.server.cors_origins))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+
+    #[test]
+    fn deprecated_aliases_are_marked_without_marking_canonical_routes() {
+        for path in DEPRECATED_ROUTE_PATHS {
+            let mut response = Response::new(Body::empty());
+            mark_deprecated_response(path, &mut response);
+            assert_eq!(
+                response.headers().get("Deprecation").and_then(|value| value.to_str().ok()),
+                Some("true")
+            );
+        }
+
+        for path in [
+            "/v1/admin/reset",
+            "/ingest/batch",
+            "/v1/memory/inspect",
+            "/v1/memory/delete",
+            "/query",
+        ] {
+            let mut response = Response::new(Body::empty());
+            mark_deprecated_response(path, &mut response);
+            assert!(response.headers().get("Deprecation").is_none());
+        }
+    }
+
+    #[test]
+    fn every_untimed_path_is_present_in_one_exemption_list() {
+        for path in [
+            "/health",
+            "/healthz",
+            "/version",
+            "/metrics",
+            "/ingest",
+            "/ingest/batch",
+            "/batch-ingest",
+            "/reset",
+            "/admin/reset",
+            "/v1/admin/reset",
+        ] {
+            assert!(UNTIMED.contains(&path));
+        }
+    }
 }
