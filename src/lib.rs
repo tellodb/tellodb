@@ -17,6 +17,7 @@ pub mod mcp_stdio;
 pub mod metrics;
 pub mod ml;
 pub mod platform;
+pub mod query;
 pub mod retrieval;
 pub mod runtime_paths;
 pub mod semantic;
