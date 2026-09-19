@@ -75,7 +75,7 @@ harness = false
 [profile.release]
 lto = "fat"
 codegen-units = 1
-panic = "abort"
+panic = "unwind"
 strip = true
 debug = true
 
