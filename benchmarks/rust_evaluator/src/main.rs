@@ -657,6 +657,16 @@ pub struct QueryTimings {
     pub preference_ms: u64,
     pub graph_ms: u64,
     #[serde(default)]
+    pub score_loop_us: u64,
+    #[serde(default)]
+    pub factver_us: u64,
+    #[serde(default)]
+    pub build_cards_us: u64,
+    #[serde(default)]
+    pub proof_us: u64,
+    #[serde(default)]
+    pub confidence_us: u64,
+    #[serde(default)]
     pub graph_links_us: u64,
     #[serde(default)]
     pub graph_edges_us: u64,
@@ -2342,6 +2352,11 @@ fn parse_query_timings(headers: &reqwest::header::HeaderMap) -> QueryTimings {
         hydrate_ms: header_u64(headers, "x-tm-hydrate-ms"),
         preference_ms: header_u64(headers, "x-tm-preference-ms"),
         graph_ms: header_u64(headers, "x-tm-graph-bridge-ms"),
+        score_loop_us: header_u64(headers, "x-tm-score-loop-us"),
+        factver_us: header_u64(headers, "x-tm-factver-us"),
+        build_cards_us: header_u64(headers, "x-tm-build-cards-us"),
+        proof_us: header_u64(headers, "x-tm-proof-us"),
+        confidence_us: header_u64(headers, "x-tm-confidence-us"),
         graph_links_us: header_u64(headers, "x-tm-graph-links-us"),
         graph_edges_us: header_u64(headers, "x-tm-graph-edges-us"),
         graph_seeds_wall_us: header_u64(headers, "x-tm-graph-seeds-wall-us"),

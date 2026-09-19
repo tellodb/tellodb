@@ -188,7 +188,7 @@ fn quality_block(rows: &[&QuestionRecord]) -> Value {
 
 fn stage_latencies(rows: &[&QuestionRecord]) -> Value {
     type Getter = fn(&QueryTimings) -> u64;
-    let stages: [(&str, Getter); 19] = [
+    let stages: [(&str, Getter); 24] = [
         ("planning", |t| t.planning_ms),
         ("route", |t| t.route_ms),
         ("embed", |t| t.embed_ms),
@@ -198,6 +198,11 @@ fn stage_latencies(rows: &[&QuestionRecord]) -> Value {
         ("rerank", |t| t.rerank_ms),
         ("preference", |t| t.preference_ms),
         ("graph", |t| t.graph_ms),
+        ("score_loop", |t| t.score_loop_us / 1000),
+        ("factver", |t| t.factver_us / 1000),
+        ("build_cards", |t| t.build_cards_us / 1000),
+        ("proof", |t| t.proof_us / 1000),
+        ("confidence", |t| t.confidence_us / 1000),
         ("graph_seeds_wall", |t| t.graph_seeds_wall_us / 1000),
         ("graph_links", |t| t.graph_links_us / 1000),
         ("graph_edges", |t| t.graph_edges_us / 1000),

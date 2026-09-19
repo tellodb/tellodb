@@ -67,6 +67,13 @@ pub struct QueryDiagnostics {
     graph_expanded: u64,
     session_ms: u64,
     session_us: u64,
+    /// Sub-stages of scoring and response building (µs), so a slow query can
+    /// be attributed without guessing.
+    score_loop_us: u64,
+    factver_us: u64,
+    build_cards_us: u64,
+    proof_us: u64,
+    confidence_us: u64,
     card_ms: u64,
     card_us: u64,
     planning_ms: u64,
@@ -333,6 +340,11 @@ pub async fn query_handler(
         diagnostics.graph_ms,
         diagnostics.graph_us,
     );
+    insert_u64_header(&mut h, "x-tm-score-loop-us", diagnostics.score_loop_us);
+    insert_u64_header(&mut h, "x-tm-factver-us", diagnostics.factver_us);
+    insert_u64_header(&mut h, "x-tm-build-cards-us", diagnostics.build_cards_us);
+    insert_u64_header(&mut h, "x-tm-proof-us", diagnostics.proof_us);
+    insert_u64_header(&mut h, "x-tm-confidence-us", diagnostics.confidence_us);
     insert_u64_header(&mut h, "x-tm-graph-links-us", diagnostics.graph_links_us);
     insert_u64_header(&mut h, "x-tm-graph-edges-us", diagnostics.graph_edges_us);
     insert_u64_header(&mut h, "x-tm-graph-seeds-wall-us", diagnostics.graph_seeds_wall_us);
@@ -2549,8 +2561,14 @@ fn fusion_phase(s: &mut QueryPipelineState) {
 }
 
 fn score_phase(s: &mut QueryPipelineState) -> Result<Vec<QueryResult>, StatusCode> {
+    let hydrate_start = Instant::now();
     score_hydrate(s)?;
+    (s.diag.hydrate_ms, s.diag.hydrate_us) = elapsed_ms_and_us(hydrate_start);
+
+    let loop_start = Instant::now();
     let evidence_cards = score_loop(s);
+    s.diag.score_loop_us = loop_start.elapsed().as_micros() as u64;
+
     score_build_response(s, evidence_cards)
 }
 
@@ -2868,8 +2886,6 @@ fn score_build_response(
     s: &mut QueryPipelineState,
     mut evidence_cards: Vec<EvidenceCard>,
 ) -> Result<Vec<QueryResult>, StatusCode> {
-    (s.diag.hydrate_ms, s.diag.hydrate_us) = elapsed_ms_and_us(Instant::now());
-
     let stage_start = Instant::now();
 
     // Pre-synthesized Phase 1: direct fact lookup.
@@ -2998,15 +3014,20 @@ fn score_build_response(
         }
     }
 
+    let factver_start = Instant::now();
     let fact_versions = s
         .tenant
         .fact_versions_for_memories(&fact_memory_ids)
         .map_err(read_failed("fact_versions"))?;
+    s.diag.factver_us = factver_start.elapsed().as_micros() as u64;
+    let cards_start = Instant::now();
     let memory_cards =
         s.tenant.get_memory_cards_batch(&card_ids).map_err(read_failed("memory_cards"))?;
+    s.diag.build_cards_us = cards_start.elapsed().as_micros() as u64;
 
     (s.diag.hydrate_obs_ms, s.diag.hydrate_obs_us) = elapsed_ms_and_us(hydrate_obs_start);
 
+    let proof_us = std::sync::atomic::AtomicU64::new(0);
     let mut queries: Vec<QueryResult> = selected
         .into_iter()
         .map(|card| {
@@ -3016,7 +3037,8 @@ fn score_build_response(
                 card.claim_text.clone()
             };
             let evidence = if s.include_evidence && s.proof_mode != "off" {
-                Some(build_proof_packet(
+                let proof_start = Instant::now();
+                let packet = Some(build_proof_packet(
                     &s.tenant,
                     &s.query_text,
                     &s.plan,
@@ -3024,7 +3046,12 @@ fn score_build_response(
                     &s.proof_mode,
                     s.verify_evidence,
                     s.evidence_radius,
-                ))
+                ));
+                proof_us.fetch_add(
+                    proof_start.elapsed().as_micros() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                packet
             } else {
                 None
             };
@@ -3066,8 +3093,11 @@ fn score_build_response(
             }
         })
         .collect();
+    s.diag.proof_us = proof_us.load(std::sync::atomic::Ordering::Relaxed);
+    let confidence_start = Instant::now();
     let evidence_conf =
         compute_evidence_confidence(&queries, &s.query_text, s.state.intent_classifier.as_deref());
+    s.diag.confidence_us = confidence_start.elapsed().as_micros() as u64;
     s.diag.evidence_confidence_bp = (evidence_conf * 10_000.0) as u64;
     s.diag.abstain_recommended = evidence_conf < 0.24 && !queries.is_empty();
     (s.diag.session_ms, s.diag.session_us) = elapsed_ms_and_us(stage_start);
