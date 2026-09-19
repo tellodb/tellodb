@@ -20,8 +20,8 @@ use self::ingest::{batch_ingest_handler, ingest_handler};
 use self::mcp::mcp_handler;
 use self::platform::{
     platform_create_api_key_handler, platform_list_api_keys_handler, platform_login_handler,
-    platform_me_handler, platform_profile_handler, platform_revoke_api_key_handler,
-    platform_signup_handler, platform_stats_handler,
+    platform_logout_handler, platform_me_handler, platform_profile_handler,
+    platform_revoke_api_key_handler, platform_signup_handler, platform_stats_handler,
 };
 use self::query::{
     analytics_query_handler, graph_export_handler, graph_query_handler, graph_walk_handler,
@@ -102,6 +102,7 @@ pub fn build_api(state: EngineState) -> Router {
         .route("/admin/api_keys/{key_id}", delete(admin_revoke_api_key_handler))
         .route("/signup", post(platform_signup_handler))
         .route("/login", post(platform_login_handler))
+        .route("/logout", post(platform_logout_handler))
         .route("/me", get(platform_me_handler))
         .route("/api-keys", post(platform_create_api_key_handler))
         .route("/api-keys", get(platform_list_api_keys_handler))

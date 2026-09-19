@@ -74,6 +74,18 @@ pub async fn platform_login_handler(
     Ok((StatusCode::OK, Json(PlatformAuthResponse { token, user })))
 }
 
+pub async fn platform_logout_handler(
+    State(state): State<EngineState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, StatusCode> {
+    let token = auth::request_bearer_token(&headers).ok_or(StatusCode::UNAUTHORIZED)?;
+    state.platform.delete_session(token).map_err(|error| {
+        tracing::warn!(error = ?error, "platform logout failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub async fn platform_me_handler(
     State(state): State<EngineState>,
     headers: HeaderMap,

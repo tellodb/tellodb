@@ -202,6 +202,7 @@ async fn serve(paths: &RuntimePaths) -> anyhow::Result<()> {
         .or_else(|| env::var("TEMPORAL_MEMORY_PORT").ok().filter(|value| !value.trim().is_empty()))
         .unwrap_or_else(|| "3000".to_string());
     let bind_address = format!("{}:{}", host, port);
+    let platform = state.platform.clone();
     let app = api::build_api(state);
 
     let maintenance = tenant_manager.clone();
@@ -210,6 +211,7 @@ async fn serve(paths: &RuntimePaths) -> anyhow::Result<()> {
         loop {
             ticker.tick().await;
             let tenants = maintenance.all_tenants();
+            let platform = platform.clone();
             let _ = tokio::task::spawn_blocking(move || {
                 let now_ms = match std::time::SystemTime::now()
                     .duration_since(std::time::SystemTime::UNIX_EPOCH)
@@ -217,6 +219,9 @@ async fn serve(paths: &RuntimePaths) -> anyhow::Result<()> {
                     Ok(duration) => duration.as_millis() as u64,
                     Err(_) => return,
                 };
+                if let Err(error) = platform.purge_expired_sessions(now_ms) {
+                    error!(error = ?error, "Expired session purge failed");
+                }
                 for tenant in tenants {
                     if let Err(error) = tenant.checkpoint() {
                         error!(error = ?error, "WAL checkpoint failed");

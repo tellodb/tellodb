@@ -285,6 +285,19 @@ impl PlatformStore {
         }
     }
 
+    pub fn delete_session(&self, token: &str) -> Result<()> {
+        let conn = self.get_conn()?;
+        conn.execute("DELETE FROM sessions WHERE token = ?1", params![token])
+            .context("failed to delete session")?;
+        Ok(())
+    }
+
+    pub fn purge_expired_sessions(&self, now_ms: u64) -> Result<usize> {
+        let conn = self.get_conn()?;
+        conn.execute("DELETE FROM sessions WHERE expires_at_ms <= ?1", params![now_ms])
+            .context("failed to purge expired sessions")
+    }
+
     pub fn create_api_key(&self, user_id: &str, name: &str) -> Result<(PublicApiKey, String)> {
         self.create_api_key_for_cluster(user_id, name, None).context("failed to create API key")
     }
@@ -1068,6 +1081,15 @@ mod tests {
         let token = store.create_session(&user.user_id, 0).unwrap();
         let resolved = store.resolve_session(&token).unwrap();
         assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn purge_expired_sessions_removes_expired_rows() {
+        let (store, _tmp) = make_store();
+        let user = create_test_user(&store, "bob", "password123");
+        let token = store.create_session(&user.user_id, 0).unwrap();
+        assert!(store.resolve_session(&token).unwrap().is_none());
+        assert_eq!(store.purge_expired_sessions(now_ms().unwrap()).unwrap(), 1);
     }
 
     #[test]
