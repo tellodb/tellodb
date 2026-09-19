@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use tokio::net::TcpListener;
 use tokio::signal;
@@ -133,28 +134,13 @@ async fn ingest_command(paths: &RuntimePaths, cli: &Cli) -> anyhow::Result<()> {
     };
     let mut lines = tokio::io::BufReader::new(reader).lines();
     let mut memories = Vec::new();
-    let mut turn = 0u32;
     while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() {
             continue;
         }
-        let mut memory = match serde_json::from_str::<serde_json::Value>(&line) {
-            Ok(value) if value.is_object() => {
-                let mut value = value;
-                value["entity_id"] = serde_json::Value::String(entity.clone());
-                serde_json::from_value::<Memory>(value)?
-            }
-            _ => Memory::new(entity.clone(), line),
-        };
-        if memory.session_id.is_none() {
-            if let Some(session) = &session {
-                memory.session_id = Some(session.clone());
-                memory.turn_index.get_or_insert(turn);
-            }
-        }
-        turn += 1;
-        memories.push(memory);
+        memories.push(parse_ingest_line(&entity, &line)?);
     }
+    assign_missing_turn_indices(&mut memories, session.as_deref());
     let engine = Engine::from_paths(paths, "default").await?;
     let mut total = tellodb::db::IngestReport::default();
     for batch in memories.chunks(64) {
@@ -167,6 +153,37 @@ async fn ingest_command(paths: &RuntimePaths, cli: &Cli) -> anyhow::Result<()> {
     engine.checkpoint()?;
     println!("{}", serde_json::to_string_pretty(&total)?);
     Ok(())
+}
+
+fn parse_ingest_line(entity: &str, line: &str) -> anyhow::Result<Memory> {
+    match serde_json::from_str::<serde_json::Value>(line) {
+        Ok(value) if value.is_object() => {
+            let mut value = value;
+            value["entity_id"] = serde_json::Value::String(entity.to_string());
+            Ok(serde_json::from_value::<Memory>(value)?)
+        }
+        _ => Ok(Memory::new(entity, line)),
+    }
+}
+
+fn assign_missing_turn_indices(memories: &mut [Memory], default_session: Option<&str>) {
+    let mut next_turn_by_session = HashMap::<String, u32>::new();
+    for memory in memories {
+        let session_id = memory.session_id.clone().or_else(|| default_session.map(str::to_owned));
+        let Some(session_id) = session_id else {
+            continue;
+        };
+        if memory.session_id.is_none() {
+            memory.session_id = Some(session_id.clone());
+        }
+        let next_turn = next_turn_by_session.entry(session_id).or_default();
+        if let Some(turn_index) = memory.turn_index {
+            *next_turn = (*next_turn).max(turn_index.saturating_add(1));
+        } else {
+            memory.turn_index = Some(*next_turn);
+            *next_turn = next_turn.saturating_add(1);
+        }
+    }
 }
 
 async fn serve(paths: &RuntimePaths) -> anyhow::Result<()> {
@@ -259,4 +276,23 @@ async fn shutdown_signal() {
     }
 
     info!("Shutting down...");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{assign_missing_turn_indices, parse_ingest_line};
+
+    #[test]
+    fn cli_turns_are_tracked_per_session() {
+        let lines = ["plain", r#"{"text":"json","session_id":"other"}"#, "plain"];
+        let mut memories =
+            lines.iter().map(|line| parse_ingest_line("alice", line).unwrap()).collect::<Vec<_>>();
+
+        assign_missing_turn_indices(&mut memories, Some("default"));
+
+        assert_eq!(
+            memories.iter().map(|memory| memory.turn_index).collect::<Vec<_>>(),
+            vec![Some(0), Some(0), Some(1)]
+        );
+    }
 }
