@@ -79,7 +79,7 @@ pub(crate) fn lifecycle_rank_adjustment(
 }
 
 pub(crate) fn attractor_negative_penalty(
-    scorable: &ScorableObservation<'_>,
+    scorable: &ScorableObservation,
     plan: &QueryPlan,
     query_text: &str,
     entity_hits: usize,

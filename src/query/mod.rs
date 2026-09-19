@@ -171,6 +171,7 @@ pub(crate) struct Fused {
 pub(crate) struct ScoringContext {
     pub(crate) graph_scores: HashMap<String, f32>,
     pub(crate) observations: HashMap<String, AgentObservation>,
+    pub(crate) scorables: HashMap<String, ScorableObservation>,
     pub(crate) memory_cards: HashMap<String, MemoryCard>,
     pub(crate) invalidated_facts: HashSet<String>,
 }
@@ -286,6 +287,7 @@ mod tests {
         let context = ScoringContext::default();
         assert!(context.graph_scores.is_empty());
         assert!(context.observations.is_empty());
+        assert!(context.scorables.is_empty());
         assert!(context.memory_cards.is_empty());
         assert!(context.invalidated_facts.is_empty());
     }

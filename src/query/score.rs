@@ -39,6 +39,14 @@ pub(crate) fn score_hydrate(s: &mut QueryPipelineState) -> EngineResult<()> {
     };
     let us = |d: Duration| (d.as_millis() as u64, d.as_micros() as u64);
     s.scoring.observations = obs.0.map_err(fail("observations"))?;
+    s.scoring.scorables = s
+        .scoring
+        .observations
+        .iter()
+        .map(|(memory_id, observation)| {
+            (memory_id.clone(), ScorableObservation::new(&observation.textual_content))
+        })
+        .collect();
     (s.diag.fetch_obs_ms, s.diag.fetch_obs_us) = us(obs.1);
     s.scoring.memory_cards = cards.0.map_err(fail("cards"))?;
     (s.diag.fetch_cards_ms, s.diag.fetch_cards_us) = us(cards.1);
@@ -58,6 +66,7 @@ pub(crate) fn score_hydrate(s: &mut QueryPipelineState) -> EngineResult<()> {
         let kept: HashSet<String> =
             s.data.fused.items.iter().map(|(mid, _, _)| mid.clone()).collect();
         s.data.scoring.observations.retain(|mid, _| kept.contains(mid));
+        s.data.scoring.scorables.retain(|mid, _| kept.contains(mid));
     }
     Ok(())
 }
@@ -70,6 +79,7 @@ pub(crate) fn score_loop(s: &mut QueryPipelineState) -> Vec<EvidenceCard> {
     let memory_cards = &s.scoring.memory_cards;
     let observations = &s.scoring.observations;
     let invalidated_facts = &s.scoring.invalidated_facts;
+    let scorables = &s.scoring.scorables;
     let plan = &s.plan;
     let plan_intent = s.plan.intent;
     let query_text = &s.query_text;
@@ -94,11 +104,13 @@ pub(crate) fn score_loop(s: &mut QueryPipelineState) -> Vec<EvidenceCard> {
                 continue;
             }
         }
-        let scorable = ScorableObservation::new(&obs.textual_content);
-        let entity_hits = entity_hit_count(&scorable, plan);
-        let lexical_hits = lexical_hit_count(&scorable, plan);
-        let temporal_hits = temporal_hit_count(&scorable, plan);
-        let facet_mask = facet_match_mask(&scorable, plan);
+        let Some(scorable) = scorables.get(mid) else {
+            continue;
+        };
+        let entity_hits = entity_hit_count(scorable, plan);
+        let lexical_hits = lexical_hit_count(scorable, plan);
+        let temporal_hits = temporal_hit_count(scorable, plan);
+        let facet_mask = facet_match_mask(scorable, plan);
         // Cross-encoder scores are unbounded logits; they enter through their
         // own lane in the rank fusion above. Using them directly here put
         // reranked candidates on a different scale from everything else.
@@ -136,7 +148,7 @@ pub(crate) fn score_loop(s: &mut QueryPipelineState) -> Vec<EvidenceCard> {
             fs *= s.weights.stale_fact_decay;
         }
         fs -= attractor_negative_penalty(
-            &scorable,
+            scorable,
             plan,
             query_text,
             entity_hits,
@@ -144,11 +156,11 @@ pub(crate) fn score_loop(s: &mut QueryPipelineState) -> Vec<EvidenceCard> {
             temporal_hits,
             facet_mask,
         );
-        fs += kind_query_bonus(obs.kind, plan, &scorable);
-        fs += lexical_overlap_bonus(&scorable, plan);
-        fs += entity_coverage_bonus(&scorable, plan);
-        fs += numeric_signal_bonus(&obs.textual_content, &scorable.lower, plan_intent);
-        fs += ordinal_signal_bonus(obs.kind, &scorable, plan);
+        fs += kind_query_bonus(obs.kind, plan, scorable);
+        fs += lexical_overlap_bonus(scorable, plan);
+        fs += entity_coverage_bonus(scorable, plan);
+        fs += numeric_signal_bonus(&scorable.lower, &scorable.numeric_tokens, plan_intent);
+        fs += ordinal_signal_bonus(obs.kind, scorable, plan);
 
         let graph_score = graph_scores.get(mid).copied().unwrap_or(0.0);
         let temporal_adjust = if s.state.config.temporal.recency_scoring {

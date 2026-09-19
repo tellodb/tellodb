@@ -69,6 +69,7 @@ pub fn compute_evidence_confidence(
     results: &[QueryResult],
     query: &str,
     classifier: Option<&QueryIntentClassifier>,
+    scorables: &HashMap<String, ScorableObservation>,
 ) -> f32 {
     use super::builder::build_query_plan;
     let lexical = build_query_plan(query, classifier);
@@ -82,8 +83,14 @@ pub fn compute_evidence_confidence(
         .iter()
         .take(6)
         .filter(|r| {
-            let scorable = ScorableObservation::new(&r.textual_content);
-            lexical_hit_count(&scorable, &lexical) >= 2
+            let fallback;
+            let scorable = if let Some(scorable) = scorables.get(&r.memory_id) {
+                scorable
+            } else {
+                fallback = ScorableObservation::new(&r.textual_content);
+                &fallback
+            };
+            lexical_hit_count(scorable, &lexical) >= 2
         })
         .count() as f32
         / 6.0;
@@ -115,11 +122,10 @@ pub fn extract_numeric_tokens(text: &str) -> Vec<f32> {
     values
 }
 
-pub fn numeric_signal_bonus(text: &str, lower: &str, intent: QueryIntent) -> f32 {
+pub fn numeric_signal_bonus(lower: &str, nums: &[f32], intent: QueryIntent) -> f32 {
     if !matches!(intent, QueryIntent::NumericAggregation | QueryIntent::TemporalAggregation) {
         return 0.0;
     }
-    let nums = extract_numeric_tokens(text);
     if nums.is_empty() {
         return -0.01;
     }
@@ -317,7 +323,7 @@ pub fn ordinal_signal_bonus(kind: MemoryKind, obs: &ScorableObservation, plan: &
         bonus += 0.05;
     }
 
-    if extract_numeric_tokens(obs._text_ref).iter().any(|value| (*value).round() as usize == rank) {
+    if obs.numeric_tokens.iter().any(|value| (*value).round() as usize == rank) {
         bonus += 0.02;
     }
 

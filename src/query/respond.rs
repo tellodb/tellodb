@@ -388,8 +388,12 @@ pub(crate) fn score_build_response(
         .collect();
     s.diag.proof_us = proof_us.load(std::sync::atomic::Ordering::Relaxed);
     let confidence_start = Instant::now();
-    let evidence_conf =
-        compute_evidence_confidence(&queries, &s.query_text, s.state.intent_classifier.as_deref());
+    let evidence_conf = compute_evidence_confidence(
+        &queries,
+        &s.query_text,
+        s.state.intent_classifier.as_deref(),
+        &s.scoring.scorables,
+    );
     s.diag.confidence_us = confidence_start.elapsed().as_micros() as u64;
     s.diag.evidence_confidence_bp = (evidence_conf * 10_000.0) as u64;
     s.diag.abstain_recommended = evidence_conf < 0.24 && !queries.is_empty();

@@ -100,16 +100,17 @@ impl FourSignalWeights {
     }
 }
 
-pub struct ScorableObservation<'a> {
+#[derive(Debug, Clone)]
+pub struct ScorableObservation {
     pub lower: String,
     pub tokens: Vec<String>,
     pub temporal_terms: Vec<String>,
     pub entities: Vec<String>,
-    pub _text_ref: &'a str,
+    pub numeric_tokens: Vec<f32>,
 }
 
-impl<'a> ScorableObservation<'a> {
-    pub fn new(text: &'a str) -> Self {
+impl ScorableObservation {
+    pub fn new(text: &str) -> Self {
         use crate::api::utils::{
             extract_named_phrases, extract_temporal_terms, normalize_alpha_tokens,
         };
@@ -117,7 +118,8 @@ impl<'a> ScorableObservation<'a> {
         let tokens = normalize_alpha_tokens(text);
         let temporal_terms = extract_temporal_terms(text);
         let entities = extract_named_phrases(&[text.to_string()]);
-        Self { lower, tokens, temporal_terms, entities, _text_ref: text }
+        let numeric_tokens = super::scoring::extract_numeric_tokens(text);
+        Self { lower, tokens, temporal_terms, entities, numeric_tokens }
     }
 }
 
