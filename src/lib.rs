@@ -1,5 +1,6 @@
 pub mod analytics;
 pub mod api;
+pub mod config;
 pub mod db;
 pub mod doctor;
 pub mod engine;
