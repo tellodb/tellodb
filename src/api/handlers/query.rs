@@ -1,14 +1,14 @@
 use crate::api::auth::{principal_user_id, record_usage_for_principal, RequestPrincipal};
+use crate::api::http::{
+    clip_profile_to_budget, insert_f32_header, insert_stage_timing_headers, insert_u64_header,
+};
 use crate::api::plan::build_observation_block;
 use crate::api::types::{
     AnalyticsQueryPayload, AnalyticsQueryResult, BucketedResult, GraphExportPayload,
     GraphQueryPayload, GraphWalkPayload, QueryPayload, QueryResult, ResultOrigin,
 };
-use crate::api::utils::{
-    clip_profile_to_budget, extract_named_phrases, insert_f32_header, insert_stage_timing_headers,
-    insert_u64_header,
-};
 use crate::api::{EngineState, PlatformWriteOp};
+use crate::core::text::extract_named_phrases;
 use crate::error::{EngineError, EngineResult};
 use crate::graph::Direction;
 use crate::metrics;

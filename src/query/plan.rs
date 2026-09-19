@@ -1,5 +1,7 @@
 use super::*;
 
+const SEMANTIC_TOP_DEFAULT: usize = 100;
+
 fn deterministic_subqueries(query: &str) -> Vec<String> {
     let normalized = query
         .replace(" and ", " | ")

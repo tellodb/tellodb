@@ -5,11 +5,12 @@ use super::types::{
     ScorableObservation, SessionBucket,
 };
 use crate::api::types::{EvidenceCard, QueryResult, RankedItem};
-use crate::api::utils::{
-    dedupe_preserve_order, extract_named_phrases, extract_temporal_terms, has_token,
-    normalize_alpha_tokens, singularize_token,
-};
+use crate::core::calendar::extract_temporal_terms;
 use crate::core::memory_id::MemoryId;
+use crate::core::text::{
+    dedupe_preserve_order, extract_named_phrases, has_token, normalize_alpha_tokens,
+    singularize_token,
+};
 use crate::fts::tokenize_for_similarity;
 use crate::ml::QueryIntentClassifier;
 use crate::storage::MemoryKind;

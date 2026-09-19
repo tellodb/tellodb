@@ -36,13 +36,14 @@ impl MemoryKind {
     }
 
     pub fn parse(s: &str) -> MemoryKind {
-        match s {
-            "conversational" | "Conversational" => MemoryKind::Conversational,
-            "decision" | "Decision" => MemoryKind::Decision,
-            "lesson" | "Lesson" => MemoryKind::Lesson,
-            "preference" | "Preference" => MemoryKind::Preference,
-            "session_summary" | "SessionSummary" => MemoryKind::SessionSummary,
-            "fact" | "Fact" => MemoryKind::Fact,
+        let normalized = s.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "conversational" => MemoryKind::Conversational,
+            "decision" => MemoryKind::Decision,
+            "lesson" => MemoryKind::Lesson,
+            "preference" => MemoryKind::Preference,
+            "session_summary" | "session-summary" | "sessionsummary" => MemoryKind::SessionSummary,
+            "fact" => MemoryKind::Fact,
             _ => MemoryKind::Conversational,
         }
     }
@@ -335,5 +336,43 @@ mod tests {
         for (value, expected) in legacy {
             assert_eq!(MemoryKind::parse(value), expected);
         }
+    }
+
+    #[test]
+    fn memory_kind_decision_variants_parse() {
+        assert_eq!(MemoryKind::parse("decision"), MemoryKind::Decision);
+        assert_eq!(MemoryKind::parse("Decision"), MemoryKind::Decision);
+    }
+
+    #[test]
+    fn memory_kind_lesson_variants_parse() {
+        assert_eq!(MemoryKind::parse("lesson"), MemoryKind::Lesson);
+        assert_eq!(MemoryKind::parse("Lesson"), MemoryKind::Lesson);
+    }
+
+    #[test]
+    fn memory_kind_preference_variants_parse() {
+        assert_eq!(MemoryKind::parse("preference"), MemoryKind::Preference);
+        assert_eq!(MemoryKind::parse("Preference"), MemoryKind::Preference);
+    }
+
+    #[test]
+    fn memory_kind_session_summary_variants_parse() {
+        assert_eq!(MemoryKind::parse("session_summary"), MemoryKind::SessionSummary);
+        assert_eq!(MemoryKind::parse("session-summary"), MemoryKind::SessionSummary);
+        assert_eq!(MemoryKind::parse("SessionSummary"), MemoryKind::SessionSummary);
+    }
+
+    #[test]
+    fn memory_kind_fact_variants_parse() {
+        assert_eq!(MemoryKind::parse("fact"), MemoryKind::Fact);
+        assert_eq!(MemoryKind::parse("Fact"), MemoryKind::Fact);
+    }
+
+    #[test]
+    fn memory_kind_unknown_values_default_to_conversational() {
+        assert_eq!(MemoryKind::parse(""), MemoryKind::Conversational);
+        assert_eq!(MemoryKind::parse("DECISIONS"), MemoryKind::Conversational);
+        assert_eq!(MemoryKind::parse("UNKNOWN"), MemoryKind::Conversational);
     }
 }

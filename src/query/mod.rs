@@ -1,12 +1,15 @@
+pub(crate) use crate::api::http::elapsed_ms_and_us;
 pub use crate::api::plan::*;
 pub use crate::api::types::{
     EvidenceCard, ProofCheck, ProofPacket, ProofTurn, QueryPayload, QueryResult, RankedItem,
     ResultOrigin,
 };
-pub use crate::api::utils::*;
 pub use crate::api::EngineState;
 pub use crate::config::{RerankPolicy, RetrievalProfile};
+pub(crate) use crate::core::calendar::parse_temporal_window;
+pub(crate) use crate::core::decay::{apply_decay_with_policy, cosine_similarity_from_distance};
 pub use crate::core::memory_id::{MemoryId, Tag};
+pub(crate) use crate::core::text::*;
 pub use crate::error::{EngineError, EngineResult};
 pub use crate::features::Feature;
 pub use crate::metrics;

@@ -1,10 +1,10 @@
 pub mod auth;
 pub mod error;
 pub mod handlers;
+pub mod http;
 pub mod ingest;
 pub mod plan;
 pub mod types;
-pub mod utils;
 
 use std::collections::HashMap;
 use std::sync::Arc;

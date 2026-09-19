@@ -3,9 +3,10 @@ use std::collections::HashSet;
 use super::types::CoverageFacet;
 use super::types::QueryIntent;
 use super::types::QueryRequirement;
-use crate::api::utils::{
-    dedupe_preserve_order, extract_salient_terms, extract_temporal_terms, has_token,
-    is_low_signal_keyword, normalize_alpha_tokens, normalize_fact_text, singularize_token,
+use crate::core::calendar::extract_temporal_terms;
+use crate::core::text::{
+    dedupe_preserve_order, extract_salient_terms, has_token, is_low_signal_keyword,
+    normalize_alpha_tokens, normalize_fact_text, singularize_token,
 };
 use crate::fts::tokenize_for_similarity;
 use crate::heuristics::{benchmark_tuned_rules, Profile};

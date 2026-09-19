@@ -7,12 +7,14 @@ use axum::{
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::api::auth::{principal_user_id, record_usage_for_principal, RequestPrincipal};
+use crate::api::http::{elapsed_ms_and_us, insert_stage_timing_headers};
 use crate::api::ingest::salient::{extract_named_phrases, extract_salient_terms};
 use crate::api::ingest::{alias::*, chunking::*, companion::*, datetime::*, dialogue::*, fact::*};
 use crate::api::types::{BatchIngestPayload, IngestPayload};
-use crate::api::utils::*;
 use crate::api::{EngineState, PlatformWriteOp};
+use crate::core::calendar::extract_temporal_terms;
 use crate::core::memory_id::MemoryId;
+use crate::core::text::{dedupe_preserve_order, normalize_fact_text};
 use crate::error::{EngineError, EngineResult};
 use crate::graph::EdgeType;
 use crate::ml::cosine_similarity;
@@ -518,7 +520,7 @@ fn build_observations(
 
     for payload in expanded_payloads.into_iter() {
         let mut payload = payload;
-        let kind = parse_kind(payload.kind.as_deref());
+        let kind = payload.kind.as_deref().map(MemoryKind::parse).unwrap_or_default();
         if (kind == MemoryKind::Preference
             || kind == MemoryKind::Decision
             || kind == MemoryKind::Fact)
@@ -1372,7 +1374,7 @@ async fn execute_ingest_pipeline(
                 let hash = content_hash(
                     &p.textual_content,
                     &p.entity_id,
-                    &format!("{:?}", parse_kind(p.kind.as_deref())),
+                    &format!("{:?}", MemoryKind::parse(p.kind.as_deref().unwrap_or_default())),
                 );
                 stored.get(&p.memory_id) != Some(&hash)
             })

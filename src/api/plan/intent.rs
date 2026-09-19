@@ -113,7 +113,7 @@ pub fn ordinal_word(rank: usize) -> Option<&'static str> {
 }
 
 pub fn strip_ordinal_tokens(query: &str) -> String {
-    use crate::api::utils::normalize_fact_text;
+    use crate::core::text::normalize_fact_text;
     let drop = [
         "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth",
         "tenth", "1st", "2nd", "3rd", "4th", "5th", "6th", "7th", "8th", "9th", "10th",

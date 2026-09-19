@@ -1,5 +1,5 @@
 use super::types::QueryPlan;
-use crate::api::utils::{normalize_alpha_tokens, singularize_token};
+use crate::core::text::{normalize_alpha_tokens, singularize_token};
 
 pub fn rewrite_query_for_retrieval(query: &str) -> String {
     let q = query.trim();

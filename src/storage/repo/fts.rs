@@ -14,7 +14,7 @@ impl TenantStore {
             .split_whitespace()
             .filter(|t| t.len() > FTS_MIN_TERM_LEN)
             .map(|t| t.to_lowercase())
-            .filter(|t| !crate::api::utils::is_low_signal_keyword(t))
+            .filter(|t| !crate::core::text::is_low_signal_keyword(t))
             .map(fts_quote)
             .collect();
 

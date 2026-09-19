@@ -7,7 +7,6 @@ use std::time::Instant;
 
 use crate::api::auth::{principal_user_id, record_usage_for_principal, RequestPrincipal};
 use crate::api::types::*;
-use crate::api::utils::RESET_CONFIRM_PHRASE;
 use crate::api::EngineState;
 use crate::metrics;
 
@@ -26,6 +25,7 @@ const DELETION_TOMBSTONE_HOURS: usize = 8;
 const WARMUP_PROBE_TEXT: &str = "warmup probe";
 const API_DELETE_REASON: &str = "api_delete";
 const GRAPH_EDGE_LIMIT: usize = 1000;
+const RESET_CONFIRM_PHRASE: &str = "delete-all-data";
 
 fn require_global_principal(principal: &RequestPrincipal) -> Result<(), StatusCode> {
     if matches!(principal, RequestPrincipal::GlobalApiKey) {

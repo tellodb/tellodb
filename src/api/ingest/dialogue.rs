@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::api::utils::normalize_fact_text;
+use crate::core::text::normalize_fact_text;
 
 pub fn extract_bracketed_header_value(text: &str, label: &str) -> Option<String> {
     let needle = format!("[{}:", label.to_ascii_lowercase());

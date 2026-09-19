@@ -2,9 +2,8 @@ use super::expansions::*;
 use super::intent::*;
 use super::scoring::*;
 use super::types::*;
-use crate::api::utils::{
-    dedupe_preserve_order, extract_temporal_terms, is_low_signal_keyword, singularize_token,
-};
+use crate::core::calendar::extract_temporal_terms;
+use crate::core::text::{dedupe_preserve_order, is_low_signal_keyword, singularize_token};
 use crate::fts::tokenize_for_similarity;
 use crate::heuristics::Profile;
 use crate::ml::QueryIntentClassifier;

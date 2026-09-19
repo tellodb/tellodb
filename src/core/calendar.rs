@@ -261,3 +261,176 @@ pub fn parse_temporal_window(query: &str, reference_time_ms: Option<u64>) -> Opt
 
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_temporal_terms_finds_years() {
+        let result = extract_temporal_terms("events in 2023 and 1999");
+        assert!(result.contains(&"2023".to_string()));
+        assert!(result.contains(&"1999".to_string()));
+    }
+
+    #[test]
+    fn extract_temporal_terms_finds_months() {
+        let result = extract_temporal_terms("meeting in January and March");
+        assert!(result.contains(&"january".to_string()));
+        assert!(result.contains(&"march".to_string()));
+    }
+
+    #[test]
+    fn extract_temporal_terms_finds_seasons() {
+        let result = extract_temporal_terms("summer vacation 2024");
+        assert_eq!(&*result, &["2024".to_string(), "summer".to_string()]);
+    }
+
+    #[test]
+    fn extract_temporal_terms_special_terms() {
+        let result = extract_temporal_terms("what happened yesterday and today");
+        assert!(result.contains(&"yesterday".to_string()));
+        assert!(result.contains(&"today".to_string()));
+    }
+
+    #[test]
+    fn extract_temporal_terms_deduplicates() {
+        let result = extract_temporal_terms("2024 in January and 2024 also january");
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn extract_temporal_terms_no_temporal_terms_returns_empty() {
+        assert!(extract_temporal_terms("hello world").is_empty());
+    }
+
+    #[test]
+    fn parse_temporal_window_month_year() {
+        let result = parse_temporal_window("October 2023", None).unwrap();
+        let expected = (month_to_ms(2023, 10, 1), month_to_ms(2023, 10, 31) + MILLIS_PER_DAY);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn parse_temporal_window_season_year() {
+        let result = parse_temporal_window("summer 2022", None).unwrap();
+        let expected = (month_to_ms(2022, 6, 1), month_to_ms(2022, 8, 31) + MILLIS_PER_DAY);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn parse_temporal_window_winter_wraps_year() {
+        let result = parse_temporal_window("winter 2024", None).unwrap();
+        let expected = (
+            month_to_ms(2024, 12, 1),
+            month_to_ms(2025, 2, days_in_month(2025, 2)) + MILLIS_PER_DAY,
+        );
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn parse_temporal_window_last_week_of_month() {
+        let result = parse_temporal_window("last week of October 2023", None).unwrap();
+        let expected = (month_to_ms(2023, 10, 25), month_to_ms(2023, 10, 31) + MILLIS_PER_DAY);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn parse_temporal_window_specific_day() {
+        let result = parse_temporal_window("May 1 2022", None).unwrap();
+        let expected = (month_to_ms(2022, 5, 1), month_to_ms(2022, 5, 1) + MILLIS_PER_DAY);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn parse_temporal_window_iso_formatted_date() {
+        let result = parse_temporal_window("Where was I living as of 2024/05/12?", None).unwrap();
+        let expected_start = month_to_ms(2024, 5, 12);
+        assert_eq!(result, (expected_start, expected_start + MILLIS_PER_DAY));
+
+        let result2 = parse_temporal_window("events on 2023-11-05", None).unwrap();
+        let expected_start2 = month_to_ms(2023, 11, 5);
+        assert_eq!(result2, (expected_start2, expected_start2 + MILLIS_PER_DAY));
+    }
+
+    #[test]
+    fn parse_temporal_window_no_temporal_info_returns_none() {
+        assert_eq!(parse_temporal_window("no time mentioned here", None), None);
+    }
+
+    #[test]
+    fn parse_temporal_window_first_week_of_month() {
+        let result = parse_temporal_window("first week of March 2023", None).unwrap();
+        let expected = (month_to_ms(2023, 3, 1), month_to_ms(2023, 3, 7) + MILLIS_PER_DAY);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn parse_temporal_window_relative_yesterday() {
+        let ref_ms = 1_700_000_000_000_u64;
+        let ref_day = (ref_ms / MILLIS_PER_DAY) * MILLIS_PER_DAY;
+        let result = parse_temporal_window("what did I do yesterday?", Some(ref_ms)).unwrap();
+        assert_eq!(result, (ref_day - MILLIS_PER_DAY, ref_day));
+    }
+
+    #[test]
+    fn parse_temporal_window_relative_last_week() {
+        let ref_ms = 1_700_000_000_000_u64;
+        let result = parse_temporal_window("what happened last week?", Some(ref_ms)).unwrap();
+        assert_eq!(result, (ref_ms - 7 * MILLIS_PER_DAY, ref_ms));
+    }
+
+    #[test]
+    fn parse_temporal_window_relative_diff_ref_times() {
+        let t1 = 1_650_000_000_000_u64;
+        let t2 = 1_720_000_000_000_u64;
+        let query = "show activities from last week";
+        let win1 = parse_temporal_window(query, Some(t1)).unwrap();
+        let win2 = parse_temporal_window(query, Some(t2)).unwrap();
+        assert_ne!(win1, win2);
+        assert_eq!(win1.1, t1);
+        assert_eq!(win2.1, t2);
+    }
+
+    #[test]
+    fn parse_temporal_window_past_n_days() {
+        let ref_ms = 1_700_000_000_000_u64;
+        let result = parse_temporal_window("updates in the past 5 days", Some(ref_ms)).unwrap();
+        assert_eq!(result, (ref_ms - 5 * MILLIS_PER_DAY, ref_ms));
+    }
+
+    #[test]
+    fn days_in_month_all_months() {
+        assert_eq!(days_in_month(2023, 1), 31);
+        assert_eq!(days_in_month(2023, 2), 28);
+        assert_eq!(days_in_month(2023, 3), 31);
+        assert_eq!(days_in_month(2023, 4), 30);
+        assert_eq!(days_in_month(2023, 5), 31);
+        assert_eq!(days_in_month(2023, 6), 30);
+        assert_eq!(days_in_month(2023, 7), 31);
+        assert_eq!(days_in_month(2023, 8), 31);
+        assert_eq!(days_in_month(2023, 9), 30);
+        assert_eq!(days_in_month(2023, 10), 31);
+        assert_eq!(days_in_month(2023, 11), 30);
+        assert_eq!(days_in_month(2023, 12), 31);
+    }
+
+    #[test]
+    fn days_in_month_leap_year_feb() {
+        assert_eq!(days_in_month(2024, 2), 29);
+        assert_eq!(days_in_month(2000, 2), 29);
+    }
+
+    #[test]
+    fn days_in_month_non_leap_feb() {
+        assert_eq!(days_in_month(2023, 2), 28);
+        assert_eq!(days_in_month(1900, 2), 28);
+    }
+
+    #[test]
+    fn month_index_accepts_full_and_short_names() {
+        assert_eq!(month_index("January"), Some(1));
+        assert_eq!(month_index("sept"), Some(9));
+        assert_eq!(month_index("unknown"), None);
+    }
+}

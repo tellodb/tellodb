@@ -46,6 +46,39 @@ pub(crate) fn rerank_gate_uncertain(hnsw_raw: &[(u64, f32)], margin: f32) -> boo
     (top - other) / top < margin
 }
 
+pub(crate) fn should_apply_neural_rerank(
+    query_text: &str,
+    hnsw_raw: &[(u64, f32)],
+    requested: bool,
+) -> bool {
+    if hnsw_raw.len() < 2 {
+        return false;
+    }
+
+    let token_count = query_text.split_whitespace().count();
+    let lower = query_text.to_ascii_lowercase();
+    let implicit_hard_query = token_count >= 6
+        || lower.starts_with("when ")
+        || lower.contains(" before ")
+        || lower.contains(" after ")
+        || lower.contains(" both ")
+        || lower.contains(" and ")
+        || lower.contains("would")
+        || lower.contains("might")
+        || lower.contains("why ");
+    if !requested && !implicit_hard_query {
+        return false;
+    }
+    if token_count <= 2 {
+        return true;
+    }
+
+    let top = 1.0 - hnsw_raw[0].1;
+    let second = 1.0 - hnsw_raw[1].1;
+    let fifth = hnsw_raw.get(4).map(|(_, dist)| 1.0 - dist).unwrap_or(second);
+    (top - second).abs() < 0.05 || (top - fifth).abs() < 0.10
+}
+
 pub(crate) fn rerank_phase(s: &mut QueryPipelineState) {
     s.candidates.neural_scores = HashMap::new();
     if !s.state.config.lanes.enabled(Lane::Rerank) {
@@ -185,5 +218,57 @@ mod tests {
         assert!(!rerank_policy_name(&config).is_empty());
         assert!(rerank_margin(&config) >= 0.0);
         assert!(rerank_top(&config) > 0);
+    }
+
+    #[test]
+    fn should_apply_neural_rerank_empty_results() {
+        assert!(!should_apply_neural_rerank("test", &[], false));
+    }
+
+    #[test]
+    fn should_apply_neural_rerank_single_result() {
+        assert!(!should_apply_neural_rerank("test", &[(1, 0.5)], false));
+    }
+
+    #[test]
+    fn should_apply_neural_rerank_not_requested_not_hard() {
+        assert!(!should_apply_neural_rerank("hello world", &[(1, 0.1), (2, 0.2)], false));
+    }
+
+    #[test]
+    fn should_apply_neural_rerank_requested_short_query() {
+        assert!(should_apply_neural_rerank("hello world", &[(1, 0.1), (2, 0.2)], true));
+    }
+
+    #[test]
+    fn should_apply_neural_rerank_implicit_hard_when_prefix() {
+        assert!(should_apply_neural_rerank("when did this", &[(1, 0.1), (2, 0.2)], false));
+    }
+
+    #[test]
+    fn should_apply_neural_rerank_convergence_close_similarities() {
+        assert!(should_apply_neural_rerank(
+            "when did this happen here now",
+            &[(1, 0.10), (2, 0.11)],
+            false,
+        ));
+    }
+
+    #[test]
+    fn should_apply_neural_rerank_no_convergence_distant_similarities() {
+        assert!(!should_apply_neural_rerank(
+            "when did this happen here",
+            &[(1, 0.10), (2, 0.30)],
+            false,
+        ));
+    }
+
+    #[test]
+    fn should_apply_neural_rerank_six_or_more_tokens_triggers_hard() {
+        assert!(should_apply_neural_rerank(
+            "this is a six word query string",
+            &[(1, 0.10), (2, 0.12)],
+            false,
+        ));
     }
 }

@@ -1,9 +1,10 @@
 use crate::api::types::IngestPayload;
-use crate::api::utils::{
-    extract_named_phrases, extract_temporal_terms, has_token, normalize_alpha_tokens,
-    normalize_fact_text, singularize_token,
-};
+use crate::core::calendar::extract_temporal_terms;
 use crate::core::memory_id::MemoryId;
+use crate::core::text::{
+    extract_named_phrases, has_token, normalize_alpha_tokens, normalize_fact_text,
+    singularize_token,
+};
 use crate::heuristics::{benchmark_tuned_rules, Profile};
 
 use super::dialogue::strip_leading_bracketed_prefixes;

@@ -111,9 +111,8 @@ pub struct ScorableObservation {
 
 impl ScorableObservation {
     pub fn new(text: &str) -> Self {
-        use crate::api::utils::{
-            extract_named_phrases, extract_temporal_terms, normalize_alpha_tokens,
-        };
+        use crate::core::calendar::extract_temporal_terms;
+        use crate::core::text::{extract_named_phrases, normalize_alpha_tokens};
         let lower = text.to_ascii_lowercase();
         let tokens = normalize_alpha_tokens(text);
         let temporal_terms = extract_temporal_terms(text);

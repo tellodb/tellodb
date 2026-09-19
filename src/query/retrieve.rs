@@ -3,6 +3,54 @@ use super::*;
 const NEURAL_TOP: usize = 25;
 const MIN_HIT_SIMILARITY: f32 = 0.30;
 
+pub(crate) struct ScopedAnnState {
+    pub attempt: usize,
+    pub current_top: usize,
+    pub max_top: usize,
+    pub hit_count: usize,
+    pub min_hits: usize,
+    pub top_similarity: Option<f32>,
+    pub prev_hit_count: Option<usize>,
+    pub prev_top_similarity: Option<f32>,
+}
+
+fn scoped_semantic_start(config: &crate::config::RetrievalConfig, max_top: usize) -> usize {
+    config.scoped_semantic_start.min(max_top)
+}
+
+fn scoped_semantic_min_hits(
+    config: &crate::config::RetrievalConfig,
+    limit: usize,
+    max_top: usize,
+) -> usize {
+    config.scoped_min_hits.unwrap_or_else(|| limit.saturating_mul(2).max(24)).min(max_top)
+}
+
+fn should_stop_scoped_ann(config: &crate::config::RetrievalConfig, state: &ScopedAnnState) -> bool {
+    if state.current_top >= state.max_top || state.attempt >= config.scoped_stop_max_attempts {
+        return true;
+    }
+    if state.hit_count < state.min_hits {
+        return false;
+    }
+    let strong_enough =
+        state.top_similarity.map(|sim| sim >= config.scoped_stop_min_similarity).unwrap_or(false);
+    if !strong_enough {
+        return false;
+    }
+    let Some(prev_hits) = state.prev_hit_count else {
+        return false;
+    };
+    let low_hit_gain = state.hit_count.saturating_sub(prev_hits) <= config.scoped_stop_max_hit_gain;
+    let low_similarity_gain = match (state.top_similarity, state.prev_top_similarity) {
+        (Some(current), Some(previous)) => {
+            (current - previous).abs() <= config.scoped_stop_min_similarity_gain
+        }
+        _ => false,
+    };
+    low_hit_gain || low_similarity_gain
+}
+
 pub(crate) fn retrieval_phase(s: &mut QueryPipelineState) {
     retrieval_ann(s);
     retrieval_fts(s);
@@ -145,7 +193,7 @@ fn retrieval_ann(s: &mut QueryPipelineState) {
                                 }
                             }
 
-                            let scoped_state = crate::api::utils::ScopedAnnState {
+                            let scoped_state = ScopedAnnState {
                                 attempt: attempts,
                                 current_top,
                                 max_top: scoped_max_top,
@@ -155,12 +203,10 @@ fn retrieval_ann(s: &mut QueryPipelineState) {
                                 prev_hit_count,
                                 prev_top_similarity,
                             };
-                            if crate::api::utils::should_stop_scoped_ann(
-                                &retrieval_config,
-                                &scoped_state,
-                            ) || (attempts >= 2
-                                && cumulative_hnsw_hits.len() >= scoped_min_hits
-                                && new_scoped_hits == 0)
+                            if should_stop_scoped_ann(&retrieval_config, &scoped_state)
+                                || (attempts >= 2
+                                    && cumulative_hnsw_hits.len() >= scoped_min_hits
+                                    && new_scoped_hits == 0)
                             {
                                 break scoped_last_raw;
                             }
@@ -365,4 +411,86 @@ fn retrieval_cards(s: &mut QueryPipelineState) {
     }
     s.candidates.card_ranked_items = card_ranked_items;
     (s.diag.card_ms, s.diag.card_us) = elapsed_ms_and_us(stage_start);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[allow(clippy::too_many_arguments)]
+    fn make_ann_state(
+        attempt: usize,
+        current_top: usize,
+        max_top: usize,
+        hit_count: usize,
+        min_hits: usize,
+        top_similarity: Option<f32>,
+        prev_hit_count: Option<usize>,
+        prev_top_similarity: Option<f32>,
+    ) -> ScopedAnnState {
+        ScopedAnnState {
+            attempt,
+            current_top,
+            max_top,
+            hit_count,
+            min_hits,
+            top_similarity,
+            prev_hit_count,
+            prev_top_similarity,
+        }
+    }
+
+    #[test]
+    fn should_stop_scoped_ann_max_top_reached() {
+        let state = make_ann_state(0, 100, 100, 0, 1, None, None, None);
+        assert!(should_stop_scoped_ann(&crate::config::RetrievalConfig::default(), &state));
+    }
+
+    #[test]
+    fn should_stop_scoped_ann_max_attempts_reached() {
+        let state = make_ann_state(10, 50, 100, 50, 10, Some(0.9), Some(40), Some(0.8));
+        assert!(should_stop_scoped_ann(&crate::config::RetrievalConfig::default(), &state));
+    }
+
+    #[test]
+    fn should_stop_scoped_ann_not_enough_hits() {
+        let state = make_ann_state(0, 50, 100, 5, 10, None, None, None);
+        assert!(!should_stop_scoped_ann(&crate::config::RetrievalConfig::default(), &state));
+    }
+
+    #[test]
+    fn should_stop_scoped_ann_not_strong_enough_similarity() {
+        let state = make_ann_state(0, 50, 100, 20, 10, Some(0.6), Some(10), Some(0.5));
+        assert!(!should_stop_scoped_ann(&crate::config::RetrievalConfig::default(), &state));
+    }
+
+    #[test]
+    fn should_stop_scoped_ann_none_similarity_not_strong() {
+        let state = make_ann_state(0, 50, 100, 20, 10, None, Some(10), Some(0.5));
+        assert!(!should_stop_scoped_ann(&crate::config::RetrievalConfig::default(), &state));
+    }
+
+    #[test]
+    fn should_stop_scoped_ann_no_prev_hit_count_returns_false() {
+        let state = make_ann_state(0, 50, 100, 20, 10, Some(0.8), None, Some(0.79));
+        assert!(!should_stop_scoped_ann(&crate::config::RetrievalConfig::default(), &state));
+    }
+
+    #[test]
+    fn should_stop_scoped_ann_convergence_low_hit_gain() {
+        let state = make_ann_state(0, 50, 100, 12, 10, Some(0.8), Some(10), Some(0.7));
+        assert!(should_stop_scoped_ann(&crate::config::RetrievalConfig::default(), &state));
+    }
+
+    #[test]
+    fn should_stop_scoped_ann_convergence_low_similarity_gain() {
+        let state = make_ann_state(0, 50, 100, 20, 10, Some(0.71), Some(10), Some(0.70));
+        assert!(should_stop_scoped_ann(&crate::config::RetrievalConfig::default(), &state));
+    }
+
+    #[test]
+    fn should_stop_scoped_ann_no_convergence() {
+        let state = make_ann_state(0, 50, 100, 20, 10, Some(0.8), Some(10), Some(0.7));
+        assert!(!should_stop_scoped_ann(&crate::config::RetrievalConfig::default(), &state));
+    }
 }

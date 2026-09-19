@@ -6,9 +6,9 @@ use crate::api::ingest::salient::{
     truncate_for_companion,
 };
 use crate::api::types::IngestPayload;
-use crate::api::utils::extract_temporal_terms;
-use crate::api::utils::normalize_fact_text;
+use crate::core::calendar::extract_temporal_terms;
 use crate::core::memory_id::MemoryId;
+use crate::core::text::normalize_fact_text;
 use crate::heuristics::Profile;
 
 pub fn build_event_companion_text(payload: &IngestPayload) -> Option<String> {
