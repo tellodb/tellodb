@@ -272,8 +272,7 @@ impl TenantStore {
             let exists: bool = stmt
                 .query_row(params![h], |row| row.get::<_, String>(0))
                 .ok()
-                .map(|s| !s.is_empty())
-                .unwrap_or(false);
+                .is_some_and(|s| !s.is_empty());
             if exists {
                 found.insert(h.clone());
             }
@@ -312,7 +311,7 @@ impl TenantStore {
         };
 
         // Create tombstone
-        let tombstone_id_val = format!("tombstone::{}", memory_id);
+        let tombstone_id_val = format!("tombstone::{memory_id}");
         let now = unix_timestamp_ms()?;
         let tombstone = crate::lifecycle::DeletionTombstone {
             tombstone_id: tombstone_id_val.clone(),
@@ -346,7 +345,7 @@ impl TenantStore {
         // Cascade to every record derived from this memory (chunks, companions,
         // cards): their ids extend "{parent}::". Match the prefix literally
         // (LIKE would treat `%`/`_` inside the id as wildcards).
-        let chunk_prefix = format!("{}::", memory_id);
+        let chunk_prefix = format!("{memory_id}::");
         let chunks: Vec<(String, Option<i64>)> = {
             let mut stmt = tx.prepare(
                 "SELECT m.memory_id, v.vector_id FROM memories m

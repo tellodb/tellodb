@@ -110,7 +110,7 @@ impl TenantStore {
     }
 
     fn proposal_id(entity_id: &str, from: &str, to: &str, now_ms: u64) -> String {
-        format!("merge::{}::{}::{}::{}", entity_id, from, to, now_ms)
+        format!("merge::{entity_id}::{from}::{to}::{now_ms}")
     }
 
     pub fn create_merge_proposal(
@@ -128,7 +128,7 @@ impl TenantStore {
         let inserted = conn.execute(
             "INSERT OR IGNORE INTO merge_proposals (proposal_id, entity_id, from_name, to_name, tier, confidence, status, created_at_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7)",
-            params![pid, entity_id, from_name, to_name, tier, confidence as f64, now as i64],
+            params![pid, entity_id, from_name, to_name, tier, f64::from(confidence), now as i64],
         )?;
         if inserted > 0 {
             Ok(Some(pid))

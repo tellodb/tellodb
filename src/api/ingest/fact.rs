@@ -54,7 +54,7 @@ pub fn sanitize_key_parts(parts: &[&str]) -> Option<String> {
 }
 
 pub fn sanitize_key_parts_owned(parts: &[String]) -> Option<String> {
-    let borrowed = parts.iter().map(|part| part.as_str()).collect::<Vec<_>>();
+    let borrowed = parts.iter().map(std::string::String::as_str).collect::<Vec<_>>();
     sanitize_key_parts(&borrowed)
 }
 

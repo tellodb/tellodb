@@ -43,7 +43,7 @@ pub fn parse_date_to_epoch_ms(text: &str, reference_ms: u64) -> Option<u64> {
     let tokens = text
         .split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|token| !token.is_empty())
-        .map(|token| token.to_ascii_lowercase())
+        .map(str::to_ascii_lowercase)
         .collect::<Vec<_>>();
     if tokens.is_empty() {
         return None;
@@ -157,26 +157,26 @@ pub fn civil_from_epoch_ms(ms: u64) -> (i32, u32, u32) {
 }
 
 pub fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
-    let year = year - if month <= 2 { 1 } else { 0 };
+    let year = year - i32::from(month <= 2);
     let era = if year >= 0 { year } else { year - 399 } / 400;
     let yoe = year - era * 400;
     let mp = month as i32 + if month > 2 { -3 } else { 9 };
     let doy = (153 * mp + 2) / 5 + day as i32 - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    (era * 146097 + doe - 719468) as i64
+    i64::from(era * 146_097 + doe - 719_468)
 }
 
 pub fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
-    let z = days_since_epoch + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
     let y = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = mp + if mp < 10 { 3 } else { -9 };
-    ((y + if m <= 2 { 1 } else { 0 }) as i32, m as u32, d as u32)
+    ((y + i64::from(m <= 2)) as i32, m as u32, d as u32)
 }
 #[cfg(test)]
 mod moved_tests {
@@ -355,8 +355,8 @@ mod moved_tests {
     #[test]
     fn test_extract_document_time_ms_fallback() {
         let text = "no header here";
-        let ms = extract_document_time_ms(text, 5000000);
-        assert_eq!(ms, 5000000);
+        let ms = extract_document_time_ms(text, 5_000_000);
+        assert_eq!(ms, 5_000_000);
     }
 
     #[test]

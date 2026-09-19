@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use crate::api::types::EvidenceCard;
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Default)]
 pub struct QueryPlan {
     pub semantic_queries: Vec<String>,

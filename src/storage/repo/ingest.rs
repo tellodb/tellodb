@@ -296,9 +296,9 @@ fn insert_cards_tx(tx: &Transaction<'_>, cards: &[MemoryCard]) -> Result<()> {
             card.memory_text,
             card.card_type,
             card.confidence,
-            card.is_latest as i32,
-            card.is_static as i32,
-            card.is_inference as i32,
+            i32::from(card.is_latest),
+            i32::from(card.is_static),
+            i32::from(card.is_inference),
             card.expires_at,
             card.root_card_id,
             card.parent_card_id,
@@ -338,9 +338,10 @@ fn merge_router_records_tx(
         let merged = match select_stmt
             .query_row(params![record.session_id, record.entity_id], |row| row.get::<_, String>(0))
         {
-            Ok(existing) => serde_json::from_str::<SessionRouterRecord>(&existing)
-                .map(|previous| merge_router_records(&previous, record))
-                .unwrap_or_else(|_| record.clone()),
+            Ok(existing) => serde_json::from_str::<SessionRouterRecord>(&existing).map_or_else(
+                |_| record.clone(),
+                |previous| merge_router_records(&previous, record),
+            ),
             Err(_) => record.clone(),
         };
         let json = serde_json::to_string(&merged)?;
@@ -500,7 +501,7 @@ fn update_card_latest_tx(tx: &Transaction<'_>, updates: &[(String, bool, u64)]) 
         "UPDATE memory_cards SET is_latest = ?1, updated_at_ms = ?2 WHERE card_id = ?3",
     )?;
     for (card_id, is_latest, timestamp) in updates {
-        stmt.execute(params![*is_latest as i32, *timestamp as i64, card_id])?;
+        stmt.execute(params![i32::from(*is_latest), *timestamp as i64, card_id])?;
     }
     Ok(())
 }
@@ -576,7 +577,7 @@ fn insert_graph_entries_tx(tx: &Transaction<'_>, entries: &[IngestGraphEdge]) ->
             entry.ref_info.as_ref().map(|(_, target)| target),
             entry.timestamp as i64,
             entry.memory_id,
-            weight as f64
+            f64::from(weight)
         ])?;
     }
     Ok(())

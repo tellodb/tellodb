@@ -45,7 +45,22 @@ jobs:
           toolchain: stable
           components: clippy
       - name: cargo clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: >
+          cargo clippy --all-targets -- -D warnings -W clippy::pedantic
+          -A clippy::missing_errors_doc -A clippy::missing_panics_doc
+          -A clippy::module_name_repetitions -A clippy::must_use_candidate
+          -A clippy::doc_markdown -A clippy::cast_precision_loss
+          -A clippy::cast_possible_truncation -A clippy::cast_sign_loss
+          -A clippy::cast_possible_wrap
+
+  no-blanket-allows:
+    name: No blanket allows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: no blanket allows
+        run: |
+          ! grep -rn '#!\[allow' src/ crates/
 
   test:
     name: Test
@@ -56,7 +71,7 @@ jobs:
         with:
           toolchain: stable
       - name: cargo test
-        run: cargo test --no-fail-fast
+        run: cargo test --all-targets --no-fail-fast
 
   deny:
     name: Deny

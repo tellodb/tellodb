@@ -6,6 +6,8 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MIN_USERNAME_LENGTH: usize = 3;
@@ -164,7 +166,7 @@ impl PlatformStore {
         )
         .context("failed to initialize platform database schema")?;
 
-        Ok(Self { pool, key_touched: Default::default() })
+        Ok(Self { pool, key_touched: Arc::default() })
     }
 
     fn get_conn(&self) -> Result<r2d2::PooledConnection<SqliteConnectionManager>> {
@@ -174,16 +176,16 @@ impl PlatformStore {
     pub fn create_user(&self, username: &str, password: &str) -> Result<PublicUser> {
         let username = username.trim().to_ascii_lowercase();
         if username.len() > MAX_USERNAME_LENGTH {
-            return Err(anyhow!("username must be at most {} bytes", MAX_USERNAME_LENGTH));
+            return Err(anyhow!("username must be at most {MAX_USERNAME_LENGTH} bytes"));
         }
         if username.is_empty() || username.len() < MIN_USERNAME_LENGTH {
-            return Err(anyhow!("username must be at least {} characters", MIN_USERNAME_LENGTH));
+            return Err(anyhow!("username must be at least {MIN_USERNAME_LENGTH} characters"));
         }
         if password.len() > MAX_PASSWORD_LENGTH {
-            return Err(anyhow!("password must be at most {} bytes", MAX_PASSWORD_LENGTH));
+            return Err(anyhow!("password must be at most {MAX_PASSWORD_LENGTH} bytes"));
         }
         if password.len() < MIN_PASSWORD_LENGTH {
-            return Err(anyhow!("password must be at least {} characters", MIN_PASSWORD_LENGTH));
+            return Err(anyhow!("password must be at least {MIN_PASSWORD_LENGTH} characters"));
         }
 
         let created_at_ms = now_ms()?;
@@ -210,10 +212,10 @@ impl PlatformStore {
     pub fn login(&self, username: &str, password: &str) -> Result<PublicUser> {
         let username = username.trim().to_ascii_lowercase();
         if username.len() > MAX_USERNAME_LENGTH {
-            return Err(anyhow!("username must be at most {} bytes", MAX_USERNAME_LENGTH));
+            return Err(anyhow!("username must be at most {MAX_USERNAME_LENGTH} bytes"));
         }
         if password.len() > MAX_PASSWORD_LENGTH {
-            return Err(anyhow!("password must be at most {} bytes", MAX_PASSWORD_LENGTH));
+            return Err(anyhow!("password must be at most {MAX_PASSWORD_LENGTH} bytes"));
         }
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare("SELECT user_id, username, password_hash, created_at_ms FROM users WHERE username = ?1")
@@ -744,11 +746,11 @@ fn now_ms() -> Result<u64> {
 fn hash_password(password: &str) -> Result<String> {
     let salt_bytes = random_bytes_16();
     let salt = SaltString::encode_b64(&salt_bytes)
-        .map_err(|e| anyhow!("failed to encode password salt: {}", e))?;
+        .map_err(|e| anyhow!("failed to encode password salt: {e}"))?;
     Argon2::default()
         .hash_password(password.as_bytes(), &salt)
         .map(|h| h.to_string())
-        .map_err(|e| anyhow!("failed to hash password: {}", e))
+        .map_err(|e| anyhow!("failed to hash password: {e}"))
 }
 
 fn verify_password(password_hash: &str, password: &str) -> bool {
@@ -792,7 +794,7 @@ fn sha256_hex(value: &str) -> String {
     let digest = hasher.finalize();
     let mut out = String::with_capacity(digest.len() * 2);
     for byte in digest {
-        out.push_str(&format!("{:02x}", byte));
+        let _ = write!(out, "{byte:02x}");
     }
     out
 }
@@ -1313,8 +1315,8 @@ mod tests {
     fn usage_stats_zero_for_new_user() {
         let (store, _tmp) = make_store();
         let user = create_test_user(&store, "heidi", "password123");
-        let _other = create_test_user(&store, "other", "password123");
-        store.record_usage(&_other.user_id, "ingest").unwrap();
+        let other = create_test_user(&store, "other", "password123");
+        store.record_usage(&other.user_id, "ingest").unwrap();
         let stats = store.usage_stats(&user.user_id).unwrap();
         assert_eq!(stats.request_count, 0);
         assert_eq!(stats.ingest_count, 0);
@@ -1325,8 +1327,8 @@ mod tests {
     fn record_usage_n_zero_does_nothing() {
         let (store, _tmp) = make_store();
         let user = create_test_user(&store, "ivan", "password123");
-        let _other = create_test_user(&store, "other", "password123");
-        store.record_usage(&_other.user_id, "ingest").unwrap();
+        let other = create_test_user(&store, "other", "password123");
+        store.record_usage(&other.user_id, "ingest").unwrap();
         store.record_usage_n(&user.user_id, "query", 0).unwrap();
         let stats = store.usage_stats(&user.user_id).unwrap();
         assert_eq!(stats.request_count, 0);
@@ -1416,8 +1418,8 @@ mod tests {
     fn update_profile_from_text_no_candidates_does_nothing() {
         let (store, _tmp) = make_store();
         let user = create_test_user(&store, "mallory", "password123");
-        let _other = create_test_user(&store, "other", "password123");
-        store.update_profile_from_text(&_other.user_id, "I am a tester.", 100, "chat").unwrap();
+        let other = create_test_user(&store, "other", "password123");
+        store.update_profile_from_text(&other.user_id, "I am a tester.", 100, "chat").unwrap();
         store.update_profile_from_text(&user.user_id, "The sky is blue.", 1000, "chat").unwrap();
         let profile = store.user_profile(&user.user_id).unwrap();
         assert!(profile.stable_facts.is_empty());
@@ -1428,8 +1430,8 @@ mod tests {
     fn user_profile_returns_empty_for_new_user() {
         let (store, _tmp) = make_store();
         let user = create_test_user(&store, "nancy", "password123");
-        let _other = create_test_user(&store, "other", "password123");
-        store.update_profile_from_text(&_other.user_id, "I am a tester.", 100, "chat").unwrap();
+        let other = create_test_user(&store, "other", "password123");
+        store.update_profile_from_text(&other.user_id, "I am a tester.", 100, "chat").unwrap();
         let profile = store.user_profile(&user.user_id).unwrap();
         assert!(profile.stable_facts.is_empty());
         assert!(profile.recent_activity.is_empty());
@@ -1454,7 +1456,7 @@ mod tests {
 
     #[test]
     fn insert_unique_front_truncates_at_max_len() {
-        let mut items: Vec<String> = (0..5).map(|i| format!("item-{}", i)).collect();
+        let mut items: Vec<String> = (0..5).map(|i| format!("item-{i}")).collect();
         insert_unique_front(&mut items, "new".to_string(), 3);
         assert_eq!(items.len(), 3);
         assert_eq!(items[0], "new");
@@ -1497,7 +1499,7 @@ mod tests {
     fn insert_activity_unique_front_truncates_at_max_len() {
         let mut items: Vec<ProfileActivityRecord> = (0..5)
             .map(|i| ProfileActivityRecord {
-                fact: format!("fact-{}", i),
+                fact: format!("fact-{i}"),
                 source: "test".to_string(),
                 timestamp_ms: i as u64,
             })

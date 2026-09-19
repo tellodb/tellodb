@@ -108,8 +108,14 @@ mod tests {
 
     #[test]
     fn apply_decay_with_policy_decay_exempt_keeps_score() {
-        assert_eq!(apply_decay_with_policy(0.75, 0, MemoryKind::Decision, u64::MAX), 0.75);
-        assert_eq!(apply_decay_with_policy(0.75, 0, MemoryKind::Preference, u64::MAX), 0.75);
+        assert!(
+            (apply_decay_with_policy(0.75, 0, MemoryKind::Decision, u64::MAX) - 0.75).abs()
+                < f32::EPSILON
+        );
+        assert!(
+            (apply_decay_with_policy(0.75, 0, MemoryKind::Preference, u64::MAX) - 0.75).abs()
+                < f32::EPSILON
+        );
     }
 
     #[test]

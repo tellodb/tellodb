@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    auto_rerank_enabled, elapsed_ms_and_us, retrieval_profile, HashMap, HashSet, Instant, Lane,
+    QueryIntent, QueryPipelineState, RerankDecision, RerankPolicy,
+};
 
 const NEURAL_BATCH: usize = 32;
 
@@ -75,7 +78,7 @@ pub(crate) fn should_apply_neural_rerank(
 
     let top = 1.0 - hnsw_raw[0].1;
     let second = 1.0 - hnsw_raw[1].1;
-    let fifth = hnsw_raw.get(4).map(|(_, dist)| 1.0 - dist).unwrap_or(second);
+    let fifth = hnsw_raw.get(4).map_or(second, |(_, dist)| 1.0 - dist);
     (top - second).abs() < 0.05 || (top - fifth).abs() < 0.10
 }
 

@@ -13,7 +13,7 @@ pub fn normalize_alpha_tokens(text: &str) -> Vec<String> {
     text.to_ascii_lowercase()
         .split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|token| !token.is_empty())
-        .map(|token| token.to_string())
+        .map(std::string::ToString::to_string)
         .collect()
 }
 
@@ -28,7 +28,7 @@ pub fn singularize_token(token: &str) -> String {
     } else if token.len() > 2 && token.ends_with('s') && !token.ends_with("ss") {
         token[..token.len() - 1].to_string()
     } else {
-        token.to_string()
+        token.clone()
     }
 }
 
@@ -163,7 +163,7 @@ pub fn extract_named_phrases(lines: &[String]) -> Vec<String> {
                 continue;
             }
 
-            let starts_upper = word.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false);
+            let starts_upper = word.chars().next().is_some_and(|c| c.is_ascii_uppercase());
             let has_lower = word.chars().any(|c| c.is_ascii_lowercase());
             if starts_upper && has_lower {
                 current.push(word.to_string());
@@ -297,8 +297,7 @@ mod tests {
 
     #[test]
     fn dedupe_preserve_order_filters_empty() {
-        let input =
-            vec!["".to_string(), "hello".to_string(), "  ".to_string(), "hello".to_string()];
+        let input = vec![String::new(), "hello".to_string(), "  ".to_string(), "hello".to_string()];
         let result = dedupe_preserve_order(input);
         assert_eq!(result, vec!["hello".to_string()]);
     }

@@ -110,11 +110,11 @@ fn text_result(value: &Value, is_error: bool) -> Value {
     })
 }
 
-fn rpc_result(id: Value, result: Value) -> Value {
+fn rpc_result(id: &Value, result: &Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "result": result })
 }
 
-fn rpc_error(id: Value, code: i64, message: impl Into<String>) -> Value {
+fn rpc_error(id: &Value, code: i64, message: impl Into<String>) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message.into() } })
 }
 
@@ -127,8 +127,7 @@ impl McpServer {
         args["entity_id"]
             .as_str()
             .filter(|e| !e.trim().is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| self.default_entity.clone())
+            .map_or_else(|| self.default_entity.clone(), str::to_string)
     }
 
     async fn call_tool(&self, name: &str, args: &Value) -> Result<Value, String> {
@@ -194,25 +193,20 @@ impl McpServer {
                     return Err("`fact_key` is required".into());
                 };
                 let entity = self.entity(args);
-                match args["as_of_ms"].as_u64() {
-                    Some(as_of) => {
-                        let version = self
-                            .engine
-                            .fact_as_of(&entity, key, as_of)
-                            .map_err(|e| e.to_string())?;
-                        Ok(json!({
-                            "entity_id": entity,
-                            "fact_key": key,
-                            "as_of_ms": as_of,
-                            "value": version.as_ref().map(|v| v.object.clone()),
-                            "version": version,
-                        }))
-                    }
-                    None => {
-                        let history =
-                            self.engine.fact_history(&entity, key).map_err(|e| e.to_string())?;
-                        Ok(json!({ "entity_id": entity, "fact_key": key, "history": history }))
-                    }
+                if let Some(as_of) = args["as_of_ms"].as_u64() {
+                    let version =
+                        self.engine.fact_as_of(&entity, key, as_of).map_err(|e| e.to_string())?;
+                    Ok(json!({
+                        "entity_id": entity,
+                        "fact_key": key,
+                        "as_of_ms": as_of,
+                        "value": version.as_ref().map(|v| v.object.clone()),
+                        "version": version,
+                    }))
+                } else {
+                    let history =
+                        self.engine.fact_history(&entity, key).map_err(|e| e.to_string())?;
+                    Ok(json!({ "entity_id": entity, "fact_key": key, "history": history }))
                 }
             }
             other => Err(format!("unknown tool `{other}`")),
@@ -233,25 +227,27 @@ impl McpServer {
                 let version =
                     negotiate_protocol_version(params["protocolVersion"].as_str().unwrap_or(""));
                 rpc_result(
-                    id,
-                    json!({
+                    &id,
+                    &json!({
                         "protocolVersion": version,
                         "capabilities": { "tools": {} },
                         "serverInfo": { "name": "tellodb", "version": env!("CARGO_PKG_VERSION") }
                     }),
                 )
             }
-            "ping" => rpc_result(id, json!({})),
-            "tools/list" => rpc_result(id, json!({ "tools": tool_definitions() })),
+            "ping" => rpc_result(&id, &json!({})),
+            "tools/list" => rpc_result(&id, &json!({ "tools": tool_definitions() })),
             "tools/call" => {
                 let name = params["name"].as_str().unwrap_or_default();
                 let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
                 match self.call_tool(name, &args).await {
-                    Ok(value) => rpc_result(id, text_result(&value, false)),
-                    Err(message) => rpc_result(id, text_result(&json!({ "error": message }), true)),
+                    Ok(value) => rpc_result(&id, &text_result(&value, false)),
+                    Err(message) => {
+                        rpc_result(&id, &text_result(&json!({ "error": message }), true))
+                    }
                 }
             }
-            other => rpc_error(id, -32601, format!("method not found: {other}")),
+            other => rpc_error(&id, -32601, format!("method not found: {other}")),
         })
     }
 
@@ -265,7 +261,7 @@ impl McpServer {
             }
             let reply = match serde_json::from_str::<Value>(&line) {
                 Ok(message) => self.handle(message).await,
-                Err(err) => Some(rpc_error(Value::Null, -32700, format!("parse error: {err}"))),
+                Err(err) => Some(rpc_error(&Value::Null, -32700, format!("parse error: {err}"))),
             };
             if let Some(reply) = reply {
                 stdout.write_all(serde_json::to_string(&reply)?.as_bytes()).await?;
@@ -314,10 +310,10 @@ mod tests {
 
     #[test]
     fn rpc_shapes_follow_json_rpc() {
-        let ok = rpc_result(json!(7), json!({ "x": 1 }));
+        let ok = rpc_result(&json!(7), &json!({ "x": 1 }));
         assert_eq!((&ok["jsonrpc"], &ok["id"]), (&json!("2.0"), &json!(7)));
         assert!(ok.get("error").is_none());
-        let err = rpc_error(json!("a"), -32601, "method not found: bogus");
+        let err = rpc_error(&json!("a"), -32601, "method not found: bogus");
         assert_eq!(err["error"]["code"], -32601);
         assert!(err["error"]["message"].as_str().unwrap().contains("bogus"));
         assert!(err.get("result").is_none());

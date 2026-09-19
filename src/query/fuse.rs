@@ -1,6 +1,12 @@
-use super::*;
+use super::{
+    adaptive_rrf_k, collect_edge_cluster_scores_for_seeds, cosine_similarity, elapsed_ms_and_us,
+    extract_named_phrases, weighted_reciprocal_rank_fusion, Feature, HashMap, Instant, Lane,
+    QueryIntent, QueryPipelineState, RankedItem, SystemTime, UNIX_EPOCH,
+};
 use crate::graph::Direction;
+use rayon::prelude::*;
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn fusion_phase(s: &mut QueryPipelineState) {
     let stage_start = Instant::now();
     let mut ranked_sources = s.candidates.semantic_ranked_lists.clone();
@@ -113,7 +119,6 @@ pub(crate) fn fusion_phase(s: &mut QueryPipelineState) {
         .map(|(mid, _)| mid)
         .collect();
 
-    use rayon::prelude::*;
     let intent_for_graph = s.plan.intent;
     let graph_lane = s.state.config.lanes.enabled(Lane::Graph);
     let links_on = graph_lane

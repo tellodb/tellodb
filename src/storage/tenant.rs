@@ -7,12 +7,16 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::info;
 
-use super::types::*;
+use super::types::{
+    build_session_router_text, AgentObservation, GraphEdgeEntry, LedgerTurn, MemoryCard,
+    SessionRouterRecord,
+};
+use std::fmt::Write as _;
 
 pub(crate) type GraphEdgeBatch<'a> = [GraphEdgeEntry<'a>];
 
-const PRAGMA_CACHE_SIZE: i64 = -262144;
-const PRAGMA_MMAP_SIZE: i64 = 1073741824;
+const PRAGMA_CACHE_SIZE: i64 = -262_144;
+const PRAGMA_MMAP_SIZE: i64 = 1_073_741_824;
 const PRAGMA_BUSY_TIMEOUT: i64 = 10000;
 const PRAGMA_PAGE_SIZE: i64 = 8192;
 const STATEMENT_CACHE_CAPACITY: usize = 512;
@@ -82,7 +86,7 @@ pub(crate) fn fts_entity_tok(entity_id: &str) -> String {
     let mut out = String::with_capacity(1 + entity_id.len() * 2);
     out.push('e');
     for byte in entity_id.as_bytes() {
-        out.push_str(&format!("{byte:02x}"));
+        let _ = write!(out, "{byte:02x}");
     }
     out
 }
@@ -100,10 +104,10 @@ pub(crate) fn fts_quote(term: impl AsRef<str>) -> String {
 /// deriving it from the key makes re-ingest replace instead of duplicate and
 /// makes deletes an O(log n) rowid lookup.
 pub(crate) fn fts_rowid(key: &str) -> i64 {
-    let mut hash = 0xcbf29ce484222325u64;
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for byte in key.as_bytes() {
         hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
     // Positive and non-zero.
     ((hash >> 1) | 1) as i64
@@ -124,11 +128,10 @@ impl TenantStore {
                      PRAGMA synchronous = NORMAL;
                      PRAGMA foreign_keys = ON;
                      PRAGMA temp_store = MEMORY;
-                     PRAGMA cache_size = {};
-                     PRAGMA mmap_size = {};
-                     PRAGMA busy_timeout = {};
-                     PRAGMA page_size = {};",
-                PRAGMA_CACHE_SIZE, PRAGMA_MMAP_SIZE, PRAGMA_BUSY_TIMEOUT, PRAGMA_PAGE_SIZE,
+                     PRAGMA cache_size = {PRAGMA_CACHE_SIZE};
+                     PRAGMA mmap_size = {PRAGMA_MMAP_SIZE};
+                     PRAGMA busy_timeout = {PRAGMA_BUSY_TIMEOUT};
+                     PRAGMA page_size = {PRAGMA_PAGE_SIZE};",
             ))
         });
         let max_size = (num_cpus::get().saturating_mul(2)).max(16) as u32;
@@ -234,7 +237,9 @@ impl TenantStore {
                     tx.last_insert_rowid()
                 };
 
-                if !obs.embedding.is_empty() {
+                if obs.embedding.is_empty() {
+                    del_vec_stmt.execute(params![rid])?;
+                } else {
                     vec_stmt.execute(params![
                         rid,
                         mem_id,
@@ -242,8 +247,6 @@ impl TenantStore {
                         ts,
                         vec_f32_to_bytes(&obs.embedding)
                     ])?;
-                } else {
-                    del_vec_stmt.execute(params![rid])?;
                 }
                 rowids.push(Some(rid as u64));
             }
@@ -481,6 +484,7 @@ pub(crate) fn merge_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::types::{FactVersionStatus, MemoryKind};
     use tempfile::tempdir;
 
     fn turn_obs(
@@ -695,7 +699,9 @@ mod tests {
         let names = ["hub", "a", "b", "c", "d", "e", ""];
         let mut state = 7u64;
         let mut next = |m: u64| {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
             (state >> 33) % m
         };
         let mut owned = Vec::new();
@@ -1043,7 +1049,7 @@ mod tests {
         );
 
         // As of t=80 only the t=75 version is valid (it used to overlap with t=50).
-        let ids: Vec<String> = ["m50", "m75", "m100"].iter().map(|s| s.to_string()).collect();
+        let ids: Vec<String> = ["m50", "m75", "m100"].iter().map(|s| (*s).to_string()).collect();
         let invalid = store.invalidated_set_at_time(80, &ids).unwrap();
         assert!(invalid.contains("m50") && invalid.contains("m100") && !invalid.contains("m75"));
 
@@ -1106,7 +1112,7 @@ mod tests {
             ])
             .unwrap();
         let scores = store.get_link_cluster_scores("a", 1).unwrap();
-        assert!((scores["b"] - 0.6).abs() < 1e-6, "got {:?}", scores);
+        assert!((scores["b"] - 0.6).abs() < 1e-6, "got {scores:?}");
     }
 
     fn fts_store(dir: &tempfile::TempDir) -> TenantStore {

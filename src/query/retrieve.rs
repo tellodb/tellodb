@@ -1,4 +1,8 @@
-use super::*;
+use super::{
+    cosine_similarity_from_distance, elapsed_ms_and_us, query_allows_stale_cards,
+    query_variant_weight, Feature, HashMap, HashSet, Instant, Lane, MemoryCardSearchInput,
+    QueryModality, QueryPipelineState, RankedItem,
+};
 
 const NEURAL_TOP: usize = 25;
 const MIN_HIT_SIMILARITY: f32 = 0.30;
@@ -13,6 +17,8 @@ pub(crate) struct ScopedAnnState {
     pub prev_hit_count: Option<usize>,
     pub prev_top_similarity: Option<f32>,
 }
+
+type AnnWorkerResult = (usize, Vec<String>, Vec<RankedItem>, Vec<(u64, f32)>, u64, u64);
 
 fn scoped_semantic_start(config: &crate::config::RetrievalConfig, max_top: usize) -> usize {
     config.scoped_semantic_start.min(max_top)
@@ -34,7 +40,7 @@ fn should_stop_scoped_ann(config: &crate::config::RetrievalConfig, state: &Scope
         return false;
     }
     let strong_enough =
-        state.top_similarity.map(|sim| sim >= config.scoped_stop_min_similarity).unwrap_or(false);
+        state.top_similarity.is_some_and(|sim| sim >= config.scoped_stop_min_similarity);
     if !strong_enough {
         return false;
     }
@@ -57,6 +63,7 @@ pub(crate) fn retrieval_phase(s: &mut QueryPipelineState) {
     retrieval_cards(s);
 }
 
+#[allow(clippy::too_many_lines)]
 fn retrieval_ann(s: &mut QueryPipelineState) {
     if !s.state.config.lanes.enabled(Lane::Vector) {
         return;
@@ -86,19 +93,18 @@ fn retrieval_ann(s: &mut QueryPipelineState) {
     }
     let mut embeddings = vec![primary_qembed_clone];
     if semantic_queries.len() > 1 {
-        let query_refs: Vec<&str> = semantic_queries.iter().skip(1).map(|q| q.as_str()).collect();
+        let query_refs: Vec<&str> =
+            semantic_queries.iter().skip(1).map(std::string::String::as_str).collect();
         match s.state.semantic.embed_queries(&query_refs) {
             Ok(batch_results) => embeddings.extend(batch_results),
             Err(err) => {
-                tracing::warn!(error = ?err, "query variant embedding failed; using primary only")
+                tracing::warn!(error = ?err, "query variant embedding failed; using primary only");
             }
         }
     }
 
     let scoped_entity_id = s.payload.entity_id.clone();
     let stage_start = Instant::now();
-    /// (variant index, rerank seeds, hits, raw neighbours, search attempts, final top-k)
-    type AnnWorkerResult = (usize, Vec<String>, Vec<RankedItem>, Vec<(u64, f32)>, u64, u64);
     let ann_results: Vec<AnnWorkerResult> = {
         let tenant_clone = s.tenant.clone();
         let eid = scoped_entity_id.clone();
@@ -166,7 +172,7 @@ fn retrieval_ann(s: &mut QueryPipelineState) {
                                 }
                             }
 
-                            for (vid, dist) in current_raw.iter() {
+                            for (vid, dist) in &current_raw {
                                 if !seen_vector_ids.insert(*vid) {
                                     continue;
                                 }
@@ -248,12 +254,10 @@ fn retrieval_ann(s: &mut QueryPipelineState) {
                                     if raw_similarity < MIN_HIT_SIMILARITY {
                                         continue;
                                     }
-                                    let routed_match = identity
-                                        .get(&mem_id)
-                                        .map(|(session, _)| {
+                                    let routed_match =
+                                        identity.get(&mem_id).is_some_and(|(session, _)| {
                                             profile.route_sessions.contains(session)
-                                        })
-                                        .unwrap_or(false);
+                                        });
                                     if profile.route_strength > 0.0
                                         && !routed_match
                                         && hnsw_hits.len() < (query_limit.saturating_div(2).max(1))

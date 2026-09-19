@@ -1,10 +1,10 @@
 use crate::error::EngineResult;
 
 pub fn extract_aliases_from_text(text: &str, known_entities: &[String]) -> Vec<(String, String)> {
-    let mut aliases = Vec::new();
-    let lower = text.to_ascii_lowercase();
     const MAX_ALIASES_PER_ENTITY: usize = 10;
     const MAX_PREFIX_COLLISIONS: usize = 3;
+    let mut aliases = Vec::new();
+    let lower = text.to_ascii_lowercase();
 
     let mut seen = std::collections::HashSet::new();
     let mut alias_counts: std::collections::HashMap<String, usize> =
@@ -14,7 +14,7 @@ pub fn extract_aliases_from_text(text: &str, known_entities: &[String]) -> Vec<(
         if alias == canonical.to_ascii_lowercase() {
             return;
         }
-        let key = format!("{}|{}", alias, canonical);
+        let key = format!("{alias}|{canonical}");
         if !seen.insert(key) {
             return;
         }

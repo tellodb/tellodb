@@ -82,7 +82,7 @@ impl TenantStore {
     pub fn detailed_db_stats(&self) -> Result<crate::api::types::StorageStatsResponse> {
         let conn = self.get_conn()?;
         let count = |table: &str| -> i64 {
-            conn.query_row(&format!("SELECT COUNT(*) FROM {}", table), [], |row| row.get(0))
+            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
                 .unwrap_or(0)
         };
         let page_count: i64 =

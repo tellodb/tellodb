@@ -217,6 +217,7 @@ impl TenantStore {
         Ok(assigned)
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn register_fact_versions_batch(
         &self,
         entity_id: &str,
@@ -340,6 +341,7 @@ impl TenantStore {
         Ok(statuses)
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn register_fact_versions_tx(
         tx: &rusqlite::Transaction<'_>,
         entity_id: &str,
@@ -476,8 +478,7 @@ impl TenantStore {
             stmt.query_row(params![fact_key, entity_id], |row| row.get::<_, Option<String>>(0));
         match res {
             Ok(Some(value)) => Ok(Some(value)),
-            Ok(None) => Ok(None),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Ok(None) | Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
     }
@@ -524,9 +525,7 @@ impl TenantStore {
                 params.push(rusqlite::types::Value::Integer(pit as i64));
             }
             params.extend(
-                values
-                    .into_iter()
-                    .map(|memory_id| rusqlite::types::Value::Text(memory_id.to_string())),
+                values.into_iter().map(|memory_id| rusqlite::types::Value::Text(memory_id.clone())),
             );
             let rows =
                 stmt.query_map(rusqlite::params_from_iter(params), |row| row.get::<_, String>(0))?;

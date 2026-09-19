@@ -109,6 +109,7 @@ pub struct MetricExtractor {
 }
 
 impl MetricExtractor {
+    #[allow(clippy::too_many_lines)]
     pub fn new() -> Self {
         let dimensions = vec![
             Dimension {
@@ -521,7 +522,7 @@ mod tests {
             .aggregate_bucketed("default", "u", "money", 0, u64::MAX, TemporalBucket::Day)
             .unwrap();
         assert_eq!(buckets.len(), 2);
-        assert_eq!(buckets[0].result.sum, 30.0);
+        assert!((buckets[0].result.sum - 30.0).abs() < f64::EPSILON);
         assert_eq!(buckets[1].bucket_start_ms, 3 * day);
     }
 }

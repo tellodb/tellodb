@@ -1,5 +1,11 @@
-use super::*;
+use super::{
+    compute_evidence_confidence, describe_stale_fact, elapsed_ms_and_us,
+    select_candidates_with_session_head, EngineError, EngineResult, EvidenceCard, Feature, Instant,
+    MemoryId, MemoryKind, ProofCheck, ProofPacket, ProofTurn, QueryPipelineState, QueryPlan,
+    QueryResult, ResultOrigin, Tag, TenantStore,
+};
 
+#[allow(clippy::too_many_lines)]
 fn build_proof_packet(
     tenant: &TenantStore,
     query_text: &str,
@@ -161,6 +167,7 @@ fn build_proof_packet(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn score_build_response(
     s: &mut QueryPipelineState,
     mut evidence_cards: Vec<EvidenceCard>,
@@ -173,7 +180,7 @@ pub(crate) fn score_build_response(
     // deterministic lookup against the fact_versions table and inject the
     // answer as a high-priority synthetic EvidenceCard so the reader LLM
     // receives the fact verbatim at the top of its context.
-    if let (Some(ref fact_key), Some(ref entity_id)) =
+    if let (Some(fact_key), Some(entity_id)) =
         (s.plan.fact_key.as_ref(), s.payload.entity_id.as_ref())
     {
         let fact_value = if s.state.config.features.enabled(Feature::Facts) {
@@ -214,12 +221,12 @@ pub(crate) fn score_build_response(
                 inference_notes: None,
                 internal_kind: MemoryKind::Fact,
                 created_at_ms: now_ms,
-                entity_id: entity_id.to_string(),
+                entity_id: entity_id.clone(),
                 source_turn_index: 0,
             });
             tracing::debug!(
-                entity_id = %entity_id,
-                fact_key = %fact_key,
+                entity_id = %&entity_id,
+                fact_key = %&fact_key,
                 "pre-synthesized fact lookup injected"
             );
         }
@@ -350,7 +357,7 @@ pub(crate) fn score_build_response(
             // matched through them (see `fact_versions_for_memories`).
             if let Some(version) = fact_versions.get(&card.source_memory_id) {
                 fact_key = Some(version.fact_key.clone());
-                superseded_by = version.superseded_by.clone();
+                superseded_by.clone_from(&version.superseded_by);
                 why_stale = describe_stale_fact(version);
             }
 

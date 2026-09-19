@@ -6,7 +6,11 @@ use axum::{
 use std::time::Instant;
 
 use crate::api::auth::{principal_user_id, record_usage_for_principal, RequestPrincipal};
-use crate::api::types::*;
+use crate::api::types::{
+    AdminInjectApiKeyPayload, EngineStatus, HardwareStatsResponse, HealthResponse,
+    MemoryAuditObservation, MemoryDeletePayload, MemoryDeleteResponse, MemoryInspectPayload,
+    MemoryInspectResponse, ProbeResponse, ProofTurn, ResetPayload, VersionResponse, WarmupResponse,
+};
 use crate::api::EngineState;
 use crate::metrics;
 
@@ -311,7 +315,7 @@ pub async fn memory_delete_handler(
             tenant.delete_observation(ts, &payload.memory_id, &reason).map_err(internal_error)?;
         let fts_removed = observation
             .as_ref()
-            .and_then(|_obs| tenant.fts_remove_document(&payload.memory_id).ok().map(|_| 1))
+            .and_then(|_obs| tenant.fts_remove_document(&payload.memory_id).ok().map(|()| 1))
             .unwrap_or(0);
         let graph_edges_removed = tenant.graph_remove_memory(&payload.memory_id).unwrap_or(0);
         let vectors = tenant.vectors().map_err(internal_error)?;
@@ -349,7 +353,7 @@ fn get_system_metrics() -> (f32, u64, u64) {
         sys.refresh_all();
         Mutex::new(sys)
     });
-    let mut sys = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let mut sys = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     sys.refresh_cpu_usage();
     sys.refresh_memory();
 
@@ -398,7 +402,7 @@ fn get_gpu_metrics() -> Option<(f32, u64, u64)> {
 
     let stdout = String::from_utf8(output.stdout).ok()?;
     let first_line = stdout.lines().next()?;
-    let parts: Vec<&str> = first_line.split(',').map(|s| s.trim()).collect();
+    let parts: Vec<&str> = first_line.split(',').map(str::trim).collect();
     if parts.len() >= 3 {
         let gpu_usage = parts[0].parse::<f32>().ok()?;
         let mem_used = parts[1].parse::<u64>().ok()?;
@@ -448,18 +452,18 @@ pub async fn cluster_stats_handler(
         StatusCode::NOT_FOUND
     })?;
 
-    let mut stats = tenant.db_stats().map_err(|err| {
+    let mut cluster_stats = tenant.db_stats().map_err(|err| {
         tracing::warn!("Failed to query db stats for cluster {}: {:?}", cluster_id, err);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
     if let Ok(usage) = state.platform.total_usage_stats() {
-        stats.request_count = usage.request_count as usize;
-        stats.ingest_count = usage.ingest_count as usize;
-        stats.query_count = usage.query_count as usize;
+        cluster_stats.request_count = usage.request_count as usize;
+        cluster_stats.ingest_count = usage.ingest_count as usize;
+        cluster_stats.query_count = usage.query_count as usize;
     }
 
-    Ok((StatusCode::OK, Json(stats)))
+    Ok((StatusCode::OK, Json(cluster_stats)))
 }
 
 pub async fn storage_stats_handler(
@@ -472,11 +476,11 @@ pub async fn storage_stats_handler(
         tracing::warn!(cluster_id = %cluster_id, error = ?err, "unknown or invalid cluster id");
         StatusCode::NOT_FOUND
     })?;
-    let stats = tenant.detailed_db_stats().map_err(|err| {
+    let storage_stats = tenant.detailed_db_stats().map_err(|err| {
         tracing::warn!("Failed to query storage stats for cluster {}: {:?}", cluster_id, err);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    Ok((StatusCode::OK, Json(stats)))
+    Ok((StatusCode::OK, Json(storage_stats)))
 }
 
 pub async fn cluster_graph_handler(

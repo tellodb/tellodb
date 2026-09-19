@@ -45,11 +45,10 @@ impl RuntimePaths {
     }
 
     fn with_root(root: PathBuf, explicit_root: bool) -> Self {
-        let hf_home =
-            env::var("HF_HOME").map(PathBuf::from).unwrap_or_else(|_| root.join("hf-home"));
+        let hf_home = env::var("HF_HOME").map_or_else(|_| root.join("hf-home"), PathBuf::from);
         let hf_hub_cache = hf_home.join("hub");
         let xdg_cache_home =
-            env::var("XDG_CACHE_HOME").map(PathBuf::from).unwrap_or_else(|_| root.join("cache"));
+            env::var("XDG_CACHE_HOME").map_or_else(|_| root.join("cache"), PathBuf::from);
 
         Self {
             platform_db: root.join(PLATFORM_DB_FILE),
@@ -169,7 +168,7 @@ mod tests {
     }
 
     fn lock_env() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn set_tellodb_dir(path: &str) -> RuntimePaths {
@@ -374,7 +373,7 @@ mod tests {
             let _lock = lock_env();
             set_tellodb_dir("/tmp/debug_test")
         };
-        let debug = format!("{:?}", paths);
+        let debug = format!("{paths:?}");
         assert!(debug.contains("/tmp/debug_test"));
         assert!(debug.contains("platform.db"));
         assert!(debug.contains("vector.hnsw"));

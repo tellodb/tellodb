@@ -62,17 +62,20 @@ impl Memory {
         Self { entity_id: entity_id.into(), text: text.into(), ..Default::default() }
     }
 
+    #[must_use]
     pub fn session(mut self, session_id: impl Into<String>, turn_index: u32) -> Self {
         self.session_id = Some(session_id.into());
         self.turn_index = Some(turn_index);
         self
     }
 
+    #[must_use]
     pub fn role(mut self, role: impl Into<String>) -> Self {
         self.role = Some(role.into());
         self
     }
 
+    #[must_use]
     pub fn at(mut self, timestamp_ms: u64) -> Self {
         self.timestamp_ms = Some(timestamp_ms);
         self
@@ -137,16 +140,19 @@ impl Query {
         }
     }
 
+    #[must_use]
     pub fn entity(mut self, entity_id: impl Into<String>) -> Self {
         self.entity_id = Some(entity_id.into());
         self
     }
 
+    #[must_use]
     pub fn limit(mut self, limit: usize) -> Self {
         self.limit = limit;
         self
     }
 
+    #[must_use]
     pub fn as_of(mut self, as_of_ms: u64) -> Self {
         self.as_of_ms = Some(as_of_ms);
         self

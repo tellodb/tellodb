@@ -222,6 +222,7 @@ pub fn build_query_expansion_terms(
     )
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn build_query_expansion_terms_with_profile(
     query: &str,
     slot_key: Option<&str>,
@@ -275,7 +276,7 @@ pub fn build_query_expansion_terms_with_profile(
                 let alpha = entity
                     .to_ascii_lowercase()
                     .chars()
-                    .filter(|ch| ch.is_ascii_alphabetic())
+                    .filter(char::is_ascii_alphabetic)
                     .collect::<String>();
                 if alpha.len() >= 4 {
                     push_expansion_term(&mut terms, &alpha[..2], 2);
@@ -309,7 +310,7 @@ pub fn build_query_expansion_terms_with_profile(
             let alpha = entity
                 .to_ascii_lowercase()
                 .chars()
-                .filter(|ch| ch.is_ascii_alphabetic())
+                .filter(char::is_ascii_alphabetic)
                 .collect::<String>();
             if alpha.len() >= 4 {
                 push_expansion_term(&mut terms, &alpha[..2], 2);
@@ -694,8 +695,8 @@ pub fn is_purchase_query(query: &str) -> bool {
                 || lower.contains("what did")))
 }
 
-pub fn make_coverage_facet(text: String, entities: Vec<String>) -> Option<CoverageFacet> {
-    let normalized = normalize_fact_text(&text);
+pub fn make_coverage_facet(text: &str, entities: Vec<String>) -> Option<CoverageFacet> {
+    let normalized = normalize_fact_text(text);
     if normalized.is_empty() {
         return None;
     }
@@ -714,11 +715,11 @@ pub fn make_coverage_facet(text: String, entities: Vec<String>) -> Option<Covera
 }
 
 pub fn make_query_requirement(
-    text: String,
+    text: &str,
     entities: Vec<String>,
     require_all_entities: bool,
 ) -> Option<QueryRequirement> {
-    let normalized = normalize_fact_text(&text);
+    let normalized = normalize_fact_text(text);
     if normalized.is_empty() {
         return None;
     }
@@ -758,14 +759,12 @@ pub fn build_coverage_facets(
             facets.push(facet);
         }
     };
-    if let Some(facet) = make_coverage_facet(query.to_string(), subject_entities.to_vec()) {
+    if let Some(facet) = make_coverage_facet(query, subject_entities.to_vec()) {
         push_facet(facet);
     }
     if let Some(keyword_query) = keyword_query {
         if !keyword_query.eq_ignore_ascii_case(query) {
-            if let Some(facet) =
-                make_coverage_facet(keyword_query.to_string(), subject_entities.to_vec())
-            {
+            if let Some(facet) = make_coverage_facet(keyword_query, subject_entities.to_vec()) {
                 push_facet(facet);
             }
         }
@@ -773,13 +772,13 @@ pub fn build_coverage_facets(
     if let Some(slot_key) = slot_key {
         let slot = humanize_slot_key(slot_key);
         if let Some(facet) =
-            make_coverage_facet(format!("canonical fact {slot}"), subject_entities.to_vec())
+            make_coverage_facet(&format!("canonical fact {slot}"), subject_entities.to_vec())
         {
             push_facet(facet);
         }
     }
     if let Some(expansion_query) = build_expansion_query(subject_entities, expansion_terms) {
-        if let Some(facet) = make_coverage_facet(expansion_query, subject_entities.to_vec()) {
+        if let Some(facet) = make_coverage_facet(&expansion_query, subject_entities.to_vec()) {
             push_facet(facet);
         }
     }
@@ -787,7 +786,7 @@ pub fn build_coverage_facets(
         let base = keyword_query.unwrap_or(query);
         for entity in subject_entities.iter().take(3) {
             if let Some(facet) =
-                make_coverage_facet(format!("{entity} {base}"), vec![entity.clone()])
+                make_coverage_facet(&format!("{entity} {base}"), vec![entity.clone()])
             {
                 push_facet(facet);
             }
@@ -796,7 +795,7 @@ pub fn build_coverage_facets(
     if ordinal_rank.is_some() {
         let stripped = crate::api::plan::intent::strip_ordinal_tokens(query);
         if !stripped.is_empty() && !stripped.eq_ignore_ascii_case(query) {
-            if let Some(facet) = make_coverage_facet(stripped, subject_entities.to_vec()) {
+            if let Some(facet) = make_coverage_facet(&stripped, subject_entities.to_vec()) {
                 push_facet(facet);
             }
         }
@@ -832,14 +831,14 @@ pub fn build_query_requirements(
     let require_joint_entities = cross_entity && !subject_entities.is_empty();
 
     if let Some(requirement) =
-        make_query_requirement(query.to_string(), subject_entities.to_vec(), require_joint_entities)
+        make_query_requirement(query, subject_entities.to_vec(), require_joint_entities)
     {
         push_requirement(requirement);
     }
     if let Some(keyword_query) = keyword_query {
         if !keyword_query.eq_ignore_ascii_case(query) {
             if let Some(requirement) = make_query_requirement(
-                keyword_query.to_string(),
+                keyword_query,
                 subject_entities.to_vec(),
                 require_joint_entities,
             ) {
@@ -850,7 +849,7 @@ pub fn build_query_requirements(
     if let Some(slot_key) = slot_key {
         let slot = humanize_slot_key(slot_key);
         if let Some(requirement) = make_query_requirement(
-            format!("canonical fact {slot}"),
+            &format!("canonical fact {slot}"),
             subject_entities.to_vec(),
             false,
         ) {
@@ -859,15 +858,13 @@ pub fn build_query_requirements(
     }
     if let Some(expansion_query) = build_expansion_query(subject_entities, expansion_terms) {
         if let Some(requirement) =
-            make_query_requirement(expansion_query, subject_entities.to_vec(), false)
+            make_query_requirement(&expansion_query, subject_entities.to_vec(), false)
         {
             push_requirement(requirement);
         }
     }
     if cross_entity && !subject_entities.is_empty() {
-        if let Some(requirement) =
-            make_query_requirement(query.to_string(), subject_entities.to_vec(), true)
-        {
+        if let Some(requirement) = make_query_requirement(query, subject_entities.to_vec(), true) {
             push_requirement(requirement);
         }
         for entity in subject_entities.iter().take(3) {
@@ -883,7 +880,7 @@ pub fn build_query_requirements(
                 format!("{entity} {}", focus.join(" "))
             };
             if let Some(requirement) =
-                make_query_requirement(entity_requirement_text, vec![entity.clone()], false)
+                make_query_requirement(&entity_requirement_text, vec![entity.clone()], false)
             {
                 push_requirement(requirement);
             }
@@ -893,7 +890,7 @@ pub fn build_query_requirements(
         let stripped = crate::api::plan::intent::strip_ordinal_tokens(query);
         if !stripped.is_empty() && !stripped.eq_ignore_ascii_case(query) {
             if let Some(requirement) =
-                make_query_requirement(stripped, subject_entities.to_vec(), false)
+                make_query_requirement(&stripped, subject_entities.to_vec(), false)
             {
                 push_requirement(requirement);
             }

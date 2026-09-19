@@ -41,7 +41,8 @@ fn current_core_profile(
             Some(pit) => tenant.invalidated_set_at_time(pit, &ids)?,
             None => tenant.invalidated_set(&ids)?,
         };
-        let timestamp = |f: &serde_json::Value| f.get("timestamp_ms").and_then(|t| t.as_u64());
+        let timestamp =
+            |f: &serde_json::Value| f.get("timestamp_ms").and_then(serde_json::Value::as_u64);
         facts.retain(|f| {
             let stale =
                 f.get("memory_id").and_then(|m| m.as_str()).is_some_and(|m| invalid.contains(m));
@@ -76,6 +77,7 @@ fn build_entity_observation_block(
     Ok(build_observation_block(profile.as_deref(), &scenes, &top_chunk_texts))
 }
 
+#[allow(clippy::too_many_lines)]
 pub async fn query_handler(
     State(state): State<EngineState>,
     Extension(principal): Extension<RequestPrincipal>,
@@ -294,8 +296,7 @@ pub async fn query_handler(
 fn scoped_graph_node_id(requested: Option<String>) -> EngineResult<String> {
     let node_id = match requested {
         Some(id) if !id.trim().is_empty() => id.trim().to_string(),
-        None => return Err(EngineError::bad_request("graph node is required")),
-        _ => return Err(EngineError::bad_request("graph node is required")),
+        None | Some(_) => return Err(EngineError::bad_request("graph node is required")),
     };
     Ok(node_id)
 }
@@ -306,10 +307,10 @@ pub async fn graph_query_handler(
     Json(payload): Json<GraphQueryPayload>,
 ) -> Result<impl IntoResponse, EngineError> {
     // If subject is provided, use it. If not, use the requested user_id.
-    let subject = if !payload.subject.trim().is_empty() {
-        payload.subject.trim().to_string()
-    } else {
+    let subject = if payload.subject.trim().is_empty() {
         scoped_graph_node_id(payload.user_id)?
+    } else {
+        payload.subject.trim().to_string()
     };
 
     let tenant_id = crate::api::auth::principal_user_id(&principal).unwrap_or("default");
@@ -334,10 +335,10 @@ pub async fn graph_walk_handler(
     Extension(principal): Extension<RequestPrincipal>,
     Json(payload): Json<GraphWalkPayload>,
 ) -> Result<impl IntoResponse, EngineError> {
-    let node = if !payload.node.trim().is_empty() {
-        payload.node.trim().to_string()
-    } else {
+    let node = if payload.node.trim().is_empty() {
         scoped_graph_node_id(payload.user_id)?
+    } else {
+        payload.node.trim().to_string()
     };
 
     let tenant_id = crate::api::auth::principal_user_id(&principal).unwrap_or("default");
@@ -345,7 +346,8 @@ pub async fn graph_walk_handler(
     let tenant_clone = tenant.clone();
     let results = tokio::task::spawn_blocking(move || {
         // TODO: actually implement depth/breadth walk. For now, pass first edge_type.
-        let edge_type = payload.edge_types.as_ref().and_then(|et| et.first().map(|s| s.as_str()));
+        let edge_type =
+            payload.edge_types.as_ref().and_then(|et| et.first().map(std::string::String::as_str));
         tenant_clone.graph_query_edges(
             &node,
             edge_type,
@@ -364,10 +366,10 @@ pub async fn graph_export_handler(
     Extension(principal): Extension<RequestPrincipal>,
     Json(payload): Json<GraphExportPayload>,
 ) -> Result<impl IntoResponse, EngineError> {
-    let seed = if !payload.seed.trim().is_empty() {
-        payload.seed.trim().to_string()
-    } else {
+    let seed = if payload.seed.trim().is_empty() {
         scoped_graph_node_id(payload.user_id)?
+    } else {
+        payload.seed.trim().to_string()
     };
 
     let tenant_id = crate::api::auth::principal_user_id(&principal).unwrap_or("default");
@@ -375,7 +377,8 @@ pub async fn graph_export_handler(
     let tenant_clone = tenant.clone();
     let results = tokio::task::spawn_blocking(move || {
         // TODO: implement export walk using breadth/depth. For now fallback to query edges.
-        let edge_type = payload.edge_types.as_ref().and_then(|et| et.first().map(|s| s.as_str()));
+        let edge_type =
+            payload.edge_types.as_ref().and_then(|et| et.first().map(std::string::String::as_str));
         tenant_clone.graph_query_edges(
             &seed,
             edge_type,
@@ -490,6 +493,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn retrieval_budget_table_matches_existing_values() {
         const EXPECTED: [[RetrievalBudget; 4]; 3] = [
             [

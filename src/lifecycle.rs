@@ -137,6 +137,7 @@ pub enum LifecycleState {
     Tombstoned,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LifecycleMetadata {
     pub policy_version: String,
@@ -306,7 +307,7 @@ fn specificity_score(text: &str, lower: &str, reasons: &mut Vec<String>) -> f32 
     }
     let has_named_entity = text
         .split_whitespace()
-        .any(|w| w.chars().next().is_some_and(|c| c.is_uppercase()) && w.len() > 2);
+        .any(|w| w.chars().next().is_some_and(char::is_uppercase) && w.len() > 2);
     if has_named_entity {
         score += SPECIFICITY_NAMED_ENTITY_BOOST;
         reasons.push("named_entity_signal".to_string());

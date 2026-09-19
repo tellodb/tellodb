@@ -1,4 +1,21 @@
-use super::*;
+use super::{
+    apply_decay_with_policy, attractor_negative_penalty, cosine_similarity, elapsed_ms_and_us,
+    entity_coverage_bonus, entity_hit_count, facet_match_mask, fuse_four_signals, kind_query_bonus,
+    lexical_hit_count, lexical_overlap_bonus, lifecycle_rank_adjustment, numeric_signal_bonus,
+    ordinal_signal_bonus, temporal_consistency_adjustment, temporal_hit_count, Duration,
+    EngineError, EngineResult, EvidenceCard, FourSignalWeights, HashSet, Instant, MemoryId,
+    MemoryKind, QueryPipelineState, ScorableObservation, Tag,
+};
+
+fn timed<T>(f: impl FnOnce() -> anyhow::Result<T>) -> (anyhow::Result<T>, Duration) {
+    let start = Instant::now();
+    let out = f();
+    (out, start.elapsed())
+}
+
+fn join<T>(name: &'static str, result: std::thread::Result<T>) -> EngineResult<T> {
+    result.map_err(|_panic| EngineError::internal(format!("hydrate stage panicked: {name}")))
+}
 
 pub(crate) fn score_hydrate(s: &mut QueryPipelineState) -> EngineResult<()> {
     let observation_keys: Vec<(u64, String)> =
@@ -7,12 +24,6 @@ pub(crate) fn score_hydrate(s: &mut QueryPipelineState) -> EngineResult<()> {
         observation_keys.iter().map(|(_, mid)| mid.clone()).collect();
     let pit = s.payload.point_in_time_ms;
     let tenant = s.tenant.as_ref();
-
-    fn timed<T>(f: impl FnOnce() -> anyhow::Result<T>) -> (anyhow::Result<T>, Duration) {
-        let start = Instant::now();
-        let out = f();
-        (out, start.elapsed())
-    }
 
     let (obs, cards, invalid) = std::thread::scope(|scope| {
         let obs = scope.spawn(|| timed(|| tenant.get_observations_batch(&observation_keys)));
@@ -24,9 +35,6 @@ pub(crate) fn score_hydrate(s: &mut QueryPipelineState) -> EngineResult<()> {
                 None => tenant.invalidated_set(&observation_memory_ids),
             })
         });
-        fn join<T>(name: &'static str, r: std::thread::Result<T>) -> EngineResult<T> {
-            r.map_err(|_panic| EngineError::internal(format!("hydrate stage panicked: {name}")))
-        }
         Ok::<_, EngineError>((
             join("observations", obs.join())?,
             join("cards", cards.join())?,
@@ -71,6 +79,7 @@ pub(crate) fn score_hydrate(s: &mut QueryPipelineState) -> EngineResult<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn score_loop(s: &mut QueryPipelineState) -> Vec<EvidenceCard> {
     let loop_start = Instant::now();
     let mut scored = Vec::new();
@@ -210,10 +219,10 @@ pub(crate) fn score_loop(s: &mut QueryPipelineState) -> Vec<EvidenceCard> {
             }
         }
         let (source_memory_id, source_session_id) = if let Some(card) = memory_cards.get(mid) {
-            if card.source_memory_id != *mid {
-                (card.source_memory_id.clone(), card.source_session_id.clone())
-            } else {
+            if card.source_memory_id == *mid {
                 (mid.clone(), obs.session_id.clone())
+            } else {
+                (card.source_memory_id.clone(), card.source_session_id.clone())
             }
         } else {
             (mid.clone(), obs.session_id.clone())

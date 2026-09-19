@@ -78,11 +78,11 @@ pub struct EmbeddingCache {
 
 impl EmbeddingCache {
     pub fn new(path: Option<PathBuf>, enabled: bool) -> Self {
-        let conn = if enabled { path.and_then(Self::open) } else { None };
+        let conn = if enabled { path.and_then(|path| Self::open(&path)) } else { None };
         Self { conn: conn.map(Mutex::new), hits: AtomicU64::new(0), misses: AtomicU64::new(0) }
     }
 
-    fn open(path: PathBuf) -> Option<rusqlite::Connection> {
+    fn open(path: &Path) -> Option<rusqlite::Connection> {
         if let Some(parent) = path.parent() {
             if let Err(err) = std::fs::create_dir_all(parent) {
                 tracing::warn!(path = %parent.display(), error = %err, "embedding cache dir");
@@ -90,7 +90,7 @@ impl EmbeddingCache {
             }
         }
         let open = || -> rusqlite::Result<rusqlite::Connection> {
-            let conn = rusqlite::Connection::open(&path)?;
+            let conn = rusqlite::Connection::open(path)?;
             conn.execute_batch(
                 "PRAGMA journal_mode = WAL;
                  PRAGMA synchronous = NORMAL;
@@ -223,8 +223,7 @@ pub fn parse_embedding_model(id: &str) -> Result<EmbeddingModel> {
         s if s.contains("minilm-l12") => Ok(EmbeddingModel::AllMiniLML12V2),
         s if s.contains("bge-m3") => Ok(EmbeddingModel::BGEM3),
         _ => anyhow::bail!(
-            "Unsupported embedding model '{}'. Please specify a valid FastEmbed model identifier.",
-            id
+            "Unsupported embedding model '{id}'. Please specify a valid FastEmbed model identifier."
         ),
     }
 }
@@ -403,6 +402,7 @@ impl SemanticInference {
         Self::with_config(cache_path, &config.embedding, &config.rerank).await
     }
 
+    #[allow(clippy::too_many_lines, clippy::unused_async)]
     pub async fn with_config(
         cache_path: Option<PathBuf>,
         embedding: &EmbeddingConfig,
@@ -413,10 +413,10 @@ impl SemanticInference {
             return Ok(Self::test_stub(cache_path, embedding));
         }
         let model_name = parse_embedding_model(&embedding_model_id)?;
-        let embedding_dim =
-            TextEmbedding::get_model_info(&model_name).map(|info| info.dim).unwrap_or_else(|_| {
-                embedding_dimensions_for_model(&embedding_model_id, embedding.dimension)
-            });
+        let embedding_dim = TextEmbedding::get_model_info(&model_name).map_or_else(
+            |_| embedding_dimensions_for_model(&embedding_model_id, embedding.dimension),
+            |info| info.dim,
+        );
 
         let threads = embedding.threads.max(1);
         // Sizes the rayon pool used by ingest NLP. ONNX Runtime threads are set
@@ -465,43 +465,37 @@ impl SemanticInference {
         let local_files = local_model_files(embedding.model_dir.as_deref())?;
         let mut executors = Vec::with_capacity(n_embed);
         for i in 0..n_embed {
-            let model = match &local_files {
-                Some((source, files)) => {
-                    if i == 0 {
-                        tracing::info!(source = %source, "loading embedding model without download");
-                    }
-                    let pooling = TextEmbedding::get_default_pooling_method(&model_name);
-                    let mut user_model =
-                        UserDefinedEmbeddingModel::new(files.onnx.clone(), files.tokenizer());
-                    if let Some(pooling) = pooling {
-                        user_model = user_model.with_pooling(pooling);
-                    }
-                    let options = InitOptionsUserDefined::new()
-                        .with_max_length(max_tokens)
-                        .with_execution_providers(execution_providers());
-                    TextEmbedding::try_new_from_user_defined(user_model, options)
+            let model = if let Some((source, files)) = &local_files {
+                if i == 0 {
+                    tracing::info!(source = %source, "loading embedding model without download");
                 }
-                None => {
-                    let mut options = TextInitOptions::default();
-                    options.model_name = model_name.clone();
-                    options.max_length = max_tokens;
-                    options.show_download_progress = i == 0;
-                    options.execution_providers.splice(0..0, execution_providers());
-                    TextEmbedding::try_new(options)
+                let pooling = TextEmbedding::get_default_pooling_method(&model_name);
+                let mut user_model =
+                    UserDefinedEmbeddingModel::new(files.onnx.clone(), files.tokenizer());
+                if let Some(pooling) = pooling {
+                    user_model = user_model.with_pooling(pooling);
                 }
+                let options = InitOptionsUserDefined::new()
+                    .with_max_length(max_tokens)
+                    .with_execution_providers(execution_providers());
+                TextEmbedding::try_new_from_user_defined(user_model, options)
+            } else {
+                let mut options = TextInitOptions::default();
+                options.model_name = model_name.clone();
+                options.max_length = max_tokens;
+                options.show_download_progress = i == 0;
+                options.execution_providers.splice(0..0, execution_providers());
+                TextEmbedding::try_new(options)
             }
             .with_context(|| format!("failed to load embedding model {embedding_model_id}"))?;
             executors.push(Mutex::new(model));
         }
 
         let probe = executors[0].lock().embed(["probe"], None)?;
-        let actual_dim = probe.first().map(Vec::len).unwrap_or(0);
+        let actual_dim = probe.first().map_or(0, Vec::len);
         if actual_dim != embedding_dim {
             anyhow::bail!(
-                "Embedding model dimension mismatch for '{}': expected {}, got {}",
-                embedding_model_id,
-                embedding_dim,
-                actual_dim
+                "Embedding model dimension mismatch for '{embedding_model_id}': expected {embedding_dim}, got {actual_dim}"
             );
         }
 
@@ -804,7 +798,7 @@ impl SemanticInference {
     ) -> Result<Vec<f32>> {
         let rr = &self.rerankers[executor_idx % self.rerankers.len()];
         let mut reranker = rr.lock();
-        let doc_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+        let doc_refs: Vec<&str> = texts.iter().map(std::string::String::as_str).collect();
         let results = reranker.rerank(q, doc_refs, false, None)?;
         let mut scores = vec![0.0f32; texts.len()];
         for res in results {
@@ -837,8 +831,8 @@ fn rerank_cache_key(q: &str, texts: &[String]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = DefaultHasher::new();
     q.hash(&mut hasher);
-    let mut sorted: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
-    sorted.sort();
+    let mut sorted: Vec<&str> = texts.iter().map(std::string::String::as_str).collect();
+    sorted.sort_unstable();
     for t in &sorted {
         t.hash(&mut hasher);
     }
@@ -866,7 +860,7 @@ fn test_embedding(text: &str, dimension: usize) -> Vec<f32> {
     use sha2::{Digest, Sha256};
 
     let mut vector = vec![0.0; dimension.max(1)];
-    for token in text.split_whitespace().map(|token| token.to_ascii_lowercase()) {
+    for token in text.split_whitespace().map(str::to_ascii_lowercase) {
         let digest = Sha256::digest(token.as_bytes());
         let mut seed = [0; 8];
         seed.copy_from_slice(&digest[..8]);

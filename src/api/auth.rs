@@ -4,6 +4,7 @@ use axum::http::{
 };
 use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Instant;
 use tower_http::cors::CorsLayer;
@@ -43,7 +44,10 @@ impl AuthConfig {
     /// For in-process use (embedded API, CLI, stdio MCP), where no request
     /// ever carries a key: a random key nobody knows.
     pub fn embedded() -> Self {
-        let key: String = (0..4).map(|_| format!("{:016x}", rand::random::<u64>())).collect();
+        let mut key = String::with_capacity(64);
+        for _ in 0..4 {
+            let _ = write!(key, "{:016x}", rand::random::<u64>());
+        }
         Self { api_key: Some(Arc::<str>::from(key)) }
     }
 
@@ -305,7 +309,7 @@ pub fn client_address(
             }
         }
     }
-    peer.map(|addr| addr.ip().to_string()).unwrap_or_else(|| "unknown".to_string())
+    peer.map_or_else(|| "unknown".to_string(), |addr| addr.ip().to_string())
 }
 
 pub fn check_rate_limit(

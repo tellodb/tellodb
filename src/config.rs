@@ -382,8 +382,7 @@ impl EmbeddingConfig {
             text: EmbedTextConfig {
                 mode,
                 window: usize_value("TELLODB_CONTEXT_WINDOW", None)
-                    .map(|value| (value as u32).min(4))
-                    .unwrap_or(defaults.text.window),
+                    .map_or(defaults.text.window, |value| (value as u32).min(4)),
             },
         }
     }
@@ -474,8 +473,7 @@ impl ServerConfig {
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(defaults.port),
             request_timeout_secs: usize_value("TELLODB_REQUEST_TIMEOUT_SECS", None)
-                .map(|value| value as u64)
-                .unwrap_or(defaults.request_timeout_secs),
+                .map_or(defaults.request_timeout_secs, |value| value as u64),
             trust_proxy: bool_value("TELLODB_TRUST_PROXY", None).unwrap_or(defaults.trust_proxy),
             cors_origins,
             api_key,
@@ -575,7 +573,7 @@ fn select_value(
                     legacy = legacy_name,
                     removal_date = LEGACY_ENV_REMOVAL_DATE,
                     "using deprecated configuration variable; migrate to the canonical variable"
-                )
+                );
             })
         }),
     }

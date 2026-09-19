@@ -1,6 +1,7 @@
 use super::types::QueryPlan;
 use crate::core::text::{normalize_alpha_tokens, singularize_token};
 
+#[allow(clippy::too_many_lines)]
 pub fn rewrite_query_for_retrieval(query: &str) -> String {
     let q = query.trim();
     let ql = q.to_lowercase();
@@ -262,11 +263,8 @@ fn extract_subject_from_what_query(q: &str) -> String {
     }
     if let Some(rest) = lower.strip_prefix("what is ") {
         let words: Vec<&str> = rest.split_whitespace().collect();
-        let end = words
-            .iter()
-            .position(|&w| w.ends_with("'s") || w.ends_with("s'"))
-            .map(|i| i + 1)
-            .unwrap_or(2);
+        let end =
+            words.iter().position(|&w| w.ends_with("'s") || w.ends_with("s'")).map_or(2, |i| i + 1);
         return words[..end.min(words.len())].join(" ");
     }
     String::new()

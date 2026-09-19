@@ -1,7 +1,18 @@
-use super::expansions::*;
-use super::intent::*;
-use super::scoring::*;
-use super::types::*;
+use super::expansions::{
+    build_coverage_facets, build_cross_entity_subqueries, build_expansion_query,
+    build_fact_slot_queries, build_hypothetical_semantic_queries, build_inference_semantic_hints,
+    build_keyword_query, build_peripheral_fts_query, build_purchase_queries,
+    build_query_expansion_terms_with_profile, build_query_requirements,
+    infer_query_fact_key_with_profile, is_purchase_query,
+};
+use super::intent::{
+    classify_query_intent, extract_ordinal_rank, ordinal_word, strip_ordinal_tokens,
+};
+use super::scoring::{
+    extract_subject_entities, is_coverage_style_query, query_prefers_distilled,
+    query_prefers_episodic,
+};
+use super::types::{QueryIntent, QueryPlan};
 use crate::core::calendar::extract_temporal_terms;
 use crate::core::text::{dedupe_preserve_order, is_low_signal_keyword, singularize_token};
 use crate::fts::tokenize_for_similarity;
@@ -12,6 +23,7 @@ pub fn build_query_plan(query: &str, classifier: Option<&QueryIntentClassifier>)
     build_query_plan_with_profile(query, classifier, Profile::Generic)
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn build_query_plan_with_profile(
     query: &str,
     classifier: Option<&QueryIntentClassifier>,
@@ -166,7 +178,6 @@ pub fn build_query_plan_with_profile(
 /// Explicit past references ("used to", "before", "as of", "back in", "last
 /// year") win, so "where did I live before?" is not treated as current.
 pub fn query_prefers_latest(query: &str) -> bool {
-    let lower = format!(" {} ", query.to_ascii_lowercase().replace(['?', '.', ',', '!'], " "));
     const PAST: [&str; 9] = [
         " used to ",
         " before ",
@@ -178,9 +189,6 @@ pub fn query_prefers_latest(query: &str) -> bool {
         " at first ",
         " formerly ",
     ];
-    if PAST.iter().any(|cue| lower.contains(cue)) {
-        return false;
-    }
     const CURRENT: [&str; 12] = [
         " currently ",
         " current ",
@@ -195,6 +203,10 @@ pub fn query_prefers_latest(query: &str) -> bool {
         " still ",
         " anymore ",
     ];
+    let lower = format!(" {} ", query.to_ascii_lowercase().replace(['?', '.', ',', '!'], " "));
+    if PAST.iter().any(|cue| lower.contains(cue)) {
+        return false;
+    }
     CURRENT.iter().any(|cue| lower.contains(cue))
 }
 

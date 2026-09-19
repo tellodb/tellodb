@@ -111,12 +111,13 @@ async fn request_timeout_middleware(
         return Ok(next.run(req).await);
     }
     let timeout_secs = state.config.server.request_timeout_secs;
-    match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), next.run(req)).await {
-        Ok(resp) => Ok(resp),
-        Err(_) => {
-            tracing::warn!(path = %path, "request exceeded timeout");
-            Err(StatusCode::REQUEST_TIMEOUT)
-        }
+    if let Ok(resp) =
+        tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), next.run(req)).await
+    {
+        Ok(resp)
+    } else {
+        tracing::warn!(path = %path, "request exceeded timeout");
+        Err(StatusCode::REQUEST_TIMEOUT)
     }
 }
 

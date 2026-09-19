@@ -13,7 +13,7 @@ impl TenantStore {
         let mut terms: Vec<String> = cleaned
             .split_whitespace()
             .filter(|t| t.len() > FTS_MIN_TERM_LEN)
-            .map(|t| t.to_lowercase())
+            .map(str::to_lowercase)
             .filter(|t| !crate::core::text::is_low_signal_keyword(t))
             .map(fts_quote)
             .collect();

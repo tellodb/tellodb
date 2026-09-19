@@ -19,7 +19,7 @@ pub fn report(state: &EngineState, paths: &RuntimePaths) -> Result<Value> {
     let mut tenant_ids: Vec<String> = std::fs::read_dir(paths.root().join("tenants"))
         .map(|entries| {
             entries
-                .filter_map(|e| e.ok())
+                .filter_map(std::result::Result::ok)
                 .filter(|e| e.path().is_dir())
                 .filter_map(|e| e.file_name().into_string().ok())
                 .collect()
@@ -36,7 +36,7 @@ pub fn report(state: &EngineState, paths: &RuntimePaths) -> Result<Value> {
                 continue;
             }
         };
-        let stats = tenant.detailed_db_stats()?;
+        let tenant_stats = tenant.detailed_db_stats()?;
         let (vectors, without_embedding) = tenant.stored_vector_counts()?;
         let db_path = paths.tenant_db(tenant_id);
         let mut wal_path = db_path.clone().into_os_string();
@@ -54,14 +54,14 @@ pub fn report(state: &EngineState, paths: &RuntimePaths) -> Result<Value> {
         }
         tenants.push(json!({
             "tenant": tenant_id,
-            "memories": stats.memory_count,
+            "memories": tenant_stats.memory_count,
             "vectors": vectors,
             "vectors_without_embedding": without_embedding,
-            "fact_versions": stats.fact_version_count,
-            "memory_cards": stats.memory_card_count,
-            "edges": stats.edge_count,
+            "fact_versions": tenant_stats.fact_version_count,
+            "memory_cards": tenant_stats.memory_card_count,
+            "edges": tenant_stats.edge_count,
             "db_bytes": file_len(&db_path),
-            "db_used_bytes": stats.used_bytes,
+            "db_used_bytes": tenant_stats.used_bytes,
             "wal_bytes": wal_bytes,
         }));
     }

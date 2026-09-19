@@ -45,7 +45,6 @@ pub fn month_index(value: &str) -> Option<u32> {
 pub fn days_in_month(year: i32, month: u32) -> u32 {
     match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
         2 => {
             if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 {
                 29
@@ -58,11 +57,11 @@ pub fn days_in_month(year: i32, month: u32) -> u32 {
 }
 
 pub fn days_since_epoch(year: i32, month: u32, day: u32) -> i64 {
-    let a = (14 - month as i64) / 12;
-    let y = year as i64 + 4800 - a;
-    let m = month as i64 + 12 * a - 3;
-    let jdn = day as i64 + (153 * m + 2) / 5 + 365 * y + y / 4 - y / 100 + y / 400 - 32045;
     const UNIX_EPOCH_JDN: i64 = 2_440_588;
+    let a = (14 - i64::from(month)) / 12;
+    let y = i64::from(year) + 4800 - a;
+    let m = i64::from(month) + 12 * a - 3;
+    let jdn = i64::from(day) + (153 * m + 2) / 5 + 365 * y + y / 4 - y / 100 + y / 400 - 32045;
     jdn - UNIX_EPOCH_JDN
 }
 
@@ -113,6 +112,7 @@ pub fn extract_temporal_terms(query: &str) -> Vec<String> {
     terms.into_iter().filter(|term| seen.insert(term.clone())).collect()
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn parse_temporal_window(query: &str, reference_time_ms: Option<u64>) -> Option<(u64, u64)> {
     let lower = query.to_ascii_lowercase();
     let tokens: Vec<&str> = lower.split_whitespace().collect();
@@ -138,7 +138,7 @@ pub fn parse_temporal_window(query: &str, reference_time_ms: Option<u64>) -> Opt
     }
 
     let year: Option<i32> = tokens.iter().find_map(|token| {
-        let digits: String = token.chars().filter(|c| c.is_ascii_digit()).collect();
+        let digits: String = token.chars().filter(char::is_ascii_digit).collect();
         if digits.len() == 4 {
             digits.parse().ok().filter(|&y: &i32| (MIN_YEAR..=MAX_YEAR).contains(&y))
         } else {
@@ -176,7 +176,7 @@ pub fn parse_temporal_window(query: &str, reference_time_ms: Option<u64>) -> Opt
             let is_last_week = lower.contains("last week");
             let is_first_week = lower.contains("first week");
             let day: Option<u32> = tokens.iter().find_map(|token| {
-                let digits: String = token.chars().filter(|c| c.is_ascii_digit()).collect();
+                let digits: String = token.chars().filter(char::is_ascii_digit).collect();
                 if digits.len() <= 2 {
                     digits.parse::<u32>().ok().filter(|&d| (1..=MAX_DAY_OF_MONTH).contains(&d))
                 } else {

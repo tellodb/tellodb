@@ -282,7 +282,7 @@ mod tests {
     fn fused_has_explicit_output_storage() {
         let fused = Fused { items: vec![(String::from("m"), 3, 0.8)] };
         assert_eq!(fused.items[0].0, "m");
-        assert_eq!(fused.items[0].2, 0.8);
+        assert!((fused.items[0].2 - 0.8).abs() < f32::EPSILON);
     }
 
     #[test]

@@ -1,4 +1,9 @@
-use super::*;
+use super::{
+    build_hyde_query, build_query_adaptive_profile, build_query_plan_with_profile,
+    elapsed_ms_and_us, parse_temporal_window, rewrite_query_for_retrieval, Feature, HashMap,
+    Instant, MemoryKind, QueryDiagnostics, QueryIntent, QueryPipelineState, QueryPlan,
+    RetrievalProfile, ScorableObservation,
+};
 
 const SEMANTIC_TOP_DEFAULT: usize = 100;
 
@@ -19,7 +24,7 @@ fn deterministic_subqueries(query: &str) -> Vec<String> {
     out
 }
 
-fn promote_query_variant(queries: &mut Vec<String>, candidate: String) {
+fn promote_query_variant(queries: &mut Vec<String>, candidate: &str) {
     let candidate = candidate.trim().to_string();
     if candidate.is_empty() {
         return;
@@ -50,7 +55,7 @@ pub(crate) fn lifecycle_rank_adjustment(
     ) {
         return None;
     }
-    if lifecycle.expires_at_ms.map(|expires_at| expires_at <= now_ms).unwrap_or(false) {
+    if lifecycle.expires_at_ms.is_some_and(|expires_at| expires_at <= now_ms) {
         return None;
     }
 
@@ -359,6 +364,7 @@ pub(crate) fn retrieval_budget_for_plan(
     BUDGETS[profile as usize][query_shape(plan) as usize]
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn plan_phase(s: &mut QueryPipelineState) {
     s.raw_query_text = s.payload.textual_query.clone();
     s.query_text = rewrite_query_for_retrieval(&s.raw_query_text);
@@ -381,8 +387,8 @@ pub(crate) fn plan_phase(s: &mut QueryPipelineState) {
     );
 
     if let Some(hyde_query) = build_hyde_query(&s.query_text, &s.plan) {
-        promote_query_variant(&mut s.plan.semantic_queries, hyde_query.clone());
-        promote_query_variant(&mut s.plan.fts_queries, hyde_query);
+        promote_query_variant(&mut s.plan.semantic_queries, &hyde_query);
+        promote_query_variant(&mut s.plan.fts_queries, &hyde_query);
     }
 
     if s.plan.needs_decomposition {
@@ -578,14 +584,14 @@ mod tests {
     #[test]
     fn promote_variant_moves_existing_query_to_second_position() {
         let mut queries = vec!["first".to_string(), "second".to_string(), "third".to_string()];
-        promote_query_variant(&mut queries, "third".to_string());
+        promote_query_variant(&mut queries, "third");
         assert_eq!(queries, vec!["first", "third", "second"]);
     }
 
     #[test]
     fn promote_variant_adds_new_query_after_primary() {
         let mut queries = vec!["first".to_string()];
-        promote_query_variant(&mut queries, "second".to_string());
+        promote_query_variant(&mut queries, "second");
         assert_eq!(queries, vec!["first", "second"]);
     }
 

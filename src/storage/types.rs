@@ -38,7 +38,6 @@ impl MemoryKind {
     pub fn parse(s: &str) -> MemoryKind {
         let normalized = s.trim().to_ascii_lowercase();
         match normalized.as_str() {
-            "conversational" => MemoryKind::Conversational,
             "decision" => MemoryKind::Decision,
             "lesson" => MemoryKind::Lesson,
             "preference" => MemoryKind::Preference,

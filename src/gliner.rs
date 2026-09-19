@@ -174,6 +174,7 @@ impl GlinerModel {
 
     /// Spans of `text` filling any of `labels`, scored above `threshold`.
     /// Overlapping spans are resolved greedily by score (flat tagging).
+    #[allow(clippy::too_many_lines)]
     pub fn predict(
         &self,
         text: &str,
@@ -272,7 +273,7 @@ impl GlinerModel {
         // [batch, words, max_width, labels]
         let dims: Vec<usize> = shape.iter().map(|d| *d as usize).collect();
         let [_batch, out_words, out_widths, out_labels] = dims[..] else {
-            bail!("unexpected GLiNER logits rank {:?}", dims);
+            bail!("unexpected GLiNER logits rank {dims:?}");
         };
         if out_labels != labels.len() {
             bail!("GLiNER returned {out_labels} label scores for {} labels", labels.len());

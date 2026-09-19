@@ -23,9 +23,8 @@ impl ResolverTier {
     pub fn confidence(&self) -> f32 {
         match self {
             Self::Exact => 1.0,
-            Self::Fuzzy(s) => *s,
+            Self::Fuzzy(s) | Self::Embedding(s) => *s,
             Self::Phonetic => 0.85,
-            Self::Embedding(s) => *s,
         }
     }
 
@@ -121,7 +120,7 @@ fn soundex_code(c: char) -> char {
 /// adjacent identical codes and padding/truncating to 4 chars.
 pub fn soundex_key(name: &str) -> String {
     let lower: String =
-        name.chars().filter(|c| c.is_ascii_alphabetic()).map(|c| c.to_ascii_lowercase()).collect();
+        name.chars().filter(char::is_ascii_alphabetic).map(|c| c.to_ascii_lowercase()).collect();
 
     if lower.is_empty() {
         return String::new();
@@ -216,7 +215,7 @@ pub fn resolve_name(
     }
 
     // Tier 2: Fuzzy match via Jaro-Winkler.
-    let fuzzy_threshold = config.fuzzy_threshold as f64;
+    let fuzzy_threshold = f64::from(config.fuzzy_threshold);
     let mut fuzzy_matches: Vec<(&EntityCandidate, f64)> = candidates
         .iter()
         .filter_map(|c| {
@@ -298,7 +297,7 @@ mod tests {
     fn candidate_with_aliases(name: &str, aliases: &[&str]) -> EntityCandidate {
         EntityCandidate {
             name: name.to_string(),
-            aliases: aliases.iter().map(|s| s.to_string()).collect(),
+            aliases: aliases.iter().map(|s| (*s).to_string()).collect(),
             soundex_key: phonetic_key(name),
             embedding: None,
         }

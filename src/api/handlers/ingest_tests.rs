@@ -338,7 +338,7 @@ fn build_artifacts_records_preferences() {
     let batches =
         build_artifacts(vec![prepared_record(item, false)], &mut diag, Features::default());
     assert_eq!(batches.preference_batch["alice"].len(), 1);
-    assert_eq!(batches.preference_batch["alice"][0].1, 1.0);
+    assert!((batches.preference_batch["alice"][0].1 - 1.0).abs() < f32::EPSILON);
 }
 
 #[test]
@@ -453,7 +453,7 @@ fn memory_card_builder_preserves_fact_metadata() {
     assert_eq!(card.subject, "Alice");
     assert_eq!(card.predicate, "lives in");
     assert_eq!(card.object, "Paris");
-    assert_eq!(card.confidence, 1.0);
+    assert!((card.confidence - 1.0).abs() < f32::EPSILON);
     assert!(card.is_inference);
     assert_eq!(card.root_card_id.as_deref(), Some("source"));
 }

@@ -83,6 +83,7 @@ impl MemoryId {
         Self { entity, session, turn, tags: Vec::new(), rendered, structured: true }
     }
 
+    #[must_use]
     pub fn derived(&self, tag: Tag) -> Self {
         if !self.structured {
             let component = escape_component(&tag.component());
@@ -93,7 +94,7 @@ impl MemoryId {
         let mut tags = self.tags.clone();
         tags.push(tag);
         let rendered = render_structured(&self.entity, &self.session, self.turn, &tags);
-        Self { rendered, tags, ..self.clone() }
+        Self { tags, rendered, ..self.clone() }
     }
 
     pub fn derived_from(parent: &str, tag: &str) -> String {

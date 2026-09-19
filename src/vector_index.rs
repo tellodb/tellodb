@@ -23,6 +23,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
+fn swap_row<T: Copy>(data: &mut Vec<T>, row: usize, last: usize, width: usize) {
+    if row != last {
+        data.copy_within(last * width..(last + 1) * width, row * width);
+    }
+    data.truncate(last * width);
+}
+
 /// Where segment vectors come from. `record_*` hooks let a source that is not
 /// already durable (the in-memory source used in tests and benchmarks)
 /// observe writes; the SQLite source ignores them because ingest has already
@@ -291,23 +298,22 @@ impl FlatSegment {
         let v = normalized(vector);
         let words = self.words();
         let dims = self.dims;
-        let row = match self.positions.get(&id) {
-            Some(&row) => row,
-            None => {
-                let row = self.ids.len();
-                self.ids.push(id);
-                self.positions.insert(id, row);
-                match &mut self.codes {
-                    Codes::F32(data) => data.resize(data.len() + dims, 0.0),
-                    Codes::F16(data) => data.resize(data.len() + dims, f16::ZERO),
-                    Codes::I8 { codes, scales } => {
-                        codes.resize(codes.len() + dims, 0);
-                        scales.push(0.0);
-                    }
-                    Codes::Binary(data) => data.resize(data.len() + words, 0),
+        let row = if let Some(&row) = self.positions.get(&id) {
+            row
+        } else {
+            let row = self.ids.len();
+            self.ids.push(id);
+            self.positions.insert(id, row);
+            match &mut self.codes {
+                Codes::F32(data) => data.resize(data.len() + dims, 0.0),
+                Codes::F16(data) => data.resize(data.len() + dims, f16::ZERO),
+                Codes::I8 { codes, scales } => {
+                    codes.resize(codes.len() + dims, 0);
+                    scales.push(0.0);
                 }
-                row
+                Codes::Binary(data) => data.resize(data.len() + words, 0),
             }
+            row
         };
         match &mut self.codes {
             Codes::F32(data) => data[row * dims..(row + 1) * dims].copy_from_slice(&v),
@@ -322,7 +328,7 @@ impl FlatSegment {
                 scales[row] = scale;
             }
             Codes::Binary(data) => {
-                data[row * words..(row + 1) * words].copy_from_slice(&sign_bits(&v))
+                data[row * words..(row + 1) * words].copy_from_slice(&sign_bits(&v));
             }
         }
     }
@@ -333,12 +339,6 @@ impl FlatSegment {
         };
         let last = self.ids.len() - 1;
         let (dims, words) = (self.dims, self.words());
-        fn swap_row<T: Copy>(data: &mut Vec<T>, row: usize, last: usize, width: usize) {
-            if row != last {
-                data.copy_within(last * width..(last + 1) * width, row * width);
-            }
-            data.truncate(last * width);
-        }
         match &mut self.codes {
             Codes::F32(data) => swap_row(data, row, last, dims),
             Codes::F16(data) => swap_row(data, row, last, dims),
@@ -698,7 +698,10 @@ mod tests {
     struct Rng(u64);
     impl Rng {
         fn next(&mut self) -> f32 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
             ((self.0 >> 40) as f32 / (1u64 << 24) as f32) - 0.5
         }
         fn vector(&mut self, dims: usize) -> Vec<f32> {
@@ -780,7 +783,7 @@ mod tests {
 
     #[test]
     fn quantized_and_hnsw_search_keep_recall() {
-        assert_eq!(recall_at_10(Quantization::F32, usize::MAX), 1.0);
+        assert!((recall_at_10(Quantization::F32, usize::MAX) - 1.0).abs() < f32::EPSILON);
         for quantization in [Quantization::F16, Quantization::I8] {
             let recall = recall_at_10(quantization, usize::MAX);
             assert!(recall >= 0.98, "{} recall {recall}", quantization.name());

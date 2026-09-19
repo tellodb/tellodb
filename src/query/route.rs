@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    elapsed_ms_and_us, routed_session_from_memory_id, rrf_fuse, Feature, HashMap, HashSet, Lane,
+    QueryPipelineState, TenantStore,
+};
 use crate::graph::EdgeType;
 
 pub(crate) fn collect_edge_cluster_scores_for_seeds(
@@ -75,7 +78,7 @@ pub(crate) fn intent_weight_for_edge(
 ) -> f32 {
     use crate::api::plan::types::QueryIntent;
     match intent {
-        Some(QueryIntent::Inference) | Some(QueryIntent::Recommendation) => {
+        Some(QueryIntent::Inference | QueryIntent::Recommendation) => {
             if matches!(edge_type, EdgeType::CausedBy | EdgeType::LeadsTo | EdgeType::Prefers) {
                 1.5
             } else {
@@ -93,6 +96,7 @@ pub(crate) fn intent_weight_for_edge(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn route_phase(s: &mut QueryPipelineState) {
     if !s.state.config.features.enabled(Feature::SessionRouter)
         || !s.state.config.lanes.enabled(Lane::Route)
@@ -250,28 +254,41 @@ pub(crate) fn route_phase(s: &mut QueryPipelineState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::plan::types::QueryIntent;
 
     #[test]
     fn inference_edges_get_causal_weight() {
-        assert_eq!(intent_weight_for_edge(EdgeType::CausedBy, Some(QueryIntent::Inference)), 1.5);
-        assert_eq!(intent_weight_for_edge(EdgeType::Supports, Some(QueryIntent::Inference)), 1.0);
+        assert!(
+            (intent_weight_for_edge(EdgeType::CausedBy, Some(QueryIntent::Inference)) - 1.5).abs()
+                < f32::EPSILON
+        );
+        assert!(
+            (intent_weight_for_edge(EdgeType::Supports, Some(QueryIntent::Inference)) - 1.0).abs()
+                < f32::EPSILON
+        );
     }
 
     #[test]
     fn peripheral_edges_get_support_weight() {
-        assert_eq!(
-            intent_weight_for_edge(EdgeType::Supports, Some(QueryIntent::PeripheralMention)),
-            1.5
+        assert!(
+            (intent_weight_for_edge(EdgeType::Supports, Some(QueryIntent::PeripheralMention))
+                - 1.5)
+                .abs()
+                < f32::EPSILON
         );
-        assert_eq!(
-            intent_weight_for_edge(EdgeType::Prefers, Some(QueryIntent::PeripheralMention)),
-            1.0
+        assert!(
+            (intent_weight_for_edge(EdgeType::Prefers, Some(QueryIntent::PeripheralMention)) - 1.0)
+                .abs()
+                < f32::EPSILON
         );
     }
 
     #[test]
     fn general_edges_keep_neutral_weight() {
-        assert_eq!(intent_weight_for_edge(EdgeType::CausedBy, Some(QueryIntent::General)), 1.0);
-        assert_eq!(intent_weight_for_edge(EdgeType::CausedBy, None), 1.0);
+        assert!(
+            (intent_weight_for_edge(EdgeType::CausedBy, Some(QueryIntent::General)) - 1.0).abs()
+                < f32::EPSILON
+        );
+        assert!((intent_weight_for_edge(EdgeType::CausedBy, None) - 1.0).abs() < f32::EPSILON);
     }
 }

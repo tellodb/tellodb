@@ -1,5 +1,7 @@
 use super::prelude::*;
 
+type Incident = HashMap<String, Vec<(String, f32, String)>>;
+
 impl TenantStore {
     pub fn set_memory_links_batch(&self, links: &[(String, String, String)]) -> Result<()> {
         let mut conn = self.get_conn()?;
@@ -206,7 +208,6 @@ impl TenantStore {
             .filter(|n| degree.get(n).copied().unwrap_or(0) <= max_node_degree)
             .collect();
 
-        type Incident = HashMap<String, Vec<(String, f32, String)>>;
         let mut incident: [Incident; 2] = [HashMap::new(), HashMap::new()];
         for (slot, column) in ["source", "target"].into_iter().enumerate() {
             for nodes in traversable.chunks(IN_CHUNK) {
@@ -293,7 +294,7 @@ impl TenantStore {
                     entry.status,
                     entry.timestamp as i64,
                     entry.memory_id,
-                    weight as f64,
+                    f64::from(weight),
                 ])?;
             }
         }
@@ -388,7 +389,7 @@ impl TenantStore {
                 ),
                 vec![Box::new(entity.to_string()), Box::new(limit as i64)],
             ),
-            _ => (
+            crate::graph::Direction::Out => (
                 "SELECT edge_id, source, target, edge_type, label, weight, timestamp_ms, memory_id
                  FROM edges WHERE source = ?1 ORDER BY timestamp_ms DESC LIMIT ?2"
                     .to_string(),
@@ -397,7 +398,7 @@ impl TenantStore {
         };
         let mut stmt = conn.prepare_cached(&sql)?;
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params_vec.iter().map(|p| p.as_ref()).collect();
+            params_vec.iter().map(std::convert::AsRef::as_ref).collect();
         let rows = stmt.query_map(param_refs.as_slice(), |row| {
             Ok(GraphEdge {
                 edge_id: row.get(0)?,

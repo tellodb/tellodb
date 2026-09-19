@@ -20,7 +20,7 @@ pub fn chunk_markdown(text: &str) -> Vec<String> {
     sections
         .into_iter()
         .flat_map(|section| {
-            let lines = section.lines().map(|l| l.to_string()).collect::<Vec<_>>();
+            let lines = section.lines().map(std::string::ToString::to_string).collect::<Vec<_>>();
             split_by_char_limit(&lines, 1100)
         })
         .collect()
@@ -48,7 +48,7 @@ pub fn chunk_code(text: &str) -> Vec<String> {
     blocks
         .into_iter()
         .flat_map(|block| {
-            let lines = block.lines().map(|l| l.to_string()).collect::<Vec<_>>();
+            let lines = block.lines().map(std::string::ToString::to_string).collect::<Vec<_>>();
             split_by_char_limit(&lines, 1200)
         })
         .collect()
@@ -80,7 +80,7 @@ pub fn chunk_email(text: &str) -> Vec<String> {
 }
 
 pub fn chunk_table_like(text: &str) -> Vec<String> {
-    let lines = text.lines().map(|l| l.to_string()).collect::<Vec<_>>();
+    let lines = text.lines().map(std::string::ToString::to_string).collect::<Vec<_>>();
     if lines.len() <= 24 {
         return vec![text.to_string()];
     }
@@ -199,7 +199,7 @@ mod moved_tests {
         IngestPayload {
             entity_id: "user".to_string(),
             memory_id: "user::session1::0".to_string(),
-            timestamp: 1000000,
+            timestamp: 1_000_000,
             textual_content: text.to_string(),
             relations: vec![],
             kind: None,
@@ -248,7 +248,7 @@ mod moved_tests {
     #[test]
     fn test_chunk_markdown_respects_char_limit() {
         let long_line = "A".repeat(600);
-        let text = format!("# H1\n{content}\n# H2\n{content}", content = long_line);
+        let text = format!("# H1\n{long_line}\n# H2\n{long_line}");
         let chunks = chunk_markdown(&text);
         assert!(chunks.len() >= 2);
         assert!(chunks.iter().all(|c| c.len() <= 1100));

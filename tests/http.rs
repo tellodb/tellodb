@@ -272,9 +272,8 @@ async fn unknown_ranking_config_key_fails_startup() {
     std::fs::write(temp.path().join("ranking_config.json"), r#"{"graph_weight": 1.0}"#)
         .expect("ranking config");
     let paths = RuntimePaths::from_root(temp.path().to_path_buf());
-    let error = match build_state(&paths, AuthConfig::embedded(), Config::default()).await {
-        Ok(_) => panic!("unknown ranking key must fail startup"),
-        Err(error) => error,
+    let Err(error) = build_state(&paths, AuthConfig::embedded(), Config::default()).await else {
+        panic!("unknown ranking key must fail startup");
     };
     assert!(error.to_string().contains("ranking config"));
 }

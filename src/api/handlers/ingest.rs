@@ -4,12 +4,20 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
+use std::fmt::Write as _;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::api::auth::{principal_user_id, record_usage_for_principal, RequestPrincipal};
 use crate::api::http::{elapsed_ms_and_us, insert_stage_timing_headers};
 use crate::api::ingest::salient::{extract_named_phrases, extract_salient_terms};
-use crate::api::ingest::{alias::*, chunking::*, companion::*, datetime::*, dialogue::*, fact::*};
+use crate::api::ingest::{
+    alias::is_semantic_duplicate,
+    chunking::expand_payload_for_content_type,
+    companion::{build_companion_payloads_with_profile, build_context_header},
+    datetime::{extract_document_time_ms, extract_event_time_ms},
+    dialogue::{extract_bracketed_header_value, extract_dialogue_messages},
+    fact::{extract_retrospective_reference_query, preference_signal_strength},
+};
 use crate::api::types::{BatchIngestPayload, IngestPayload};
 use crate::api::{EngineState, PlatformWriteOp};
 use crate::core::calendar::extract_temporal_terms;
@@ -32,7 +40,11 @@ fn content_hash(text: &str, entity_id: &str, kind: &str) -> String {
     hasher.update(CONTENT_HASH_SEPARATOR);
     hasher.update(kind.as_bytes());
     let result = hasher.finalize();
-    result.iter().map(|b| format!("{:02x}", b)).collect::<String>()
+    let mut output = String::with_capacity(result.len() * 2);
+    for byte in result {
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
 }
 type RetrospectiveCandidate = (String, String, String, u64, String, String);
 const CONTENT_HASH_SEPARATOR: &[u8] = &[58, 58];
@@ -326,6 +338,7 @@ fn payload_session(payload: &IngestPayload) -> Option<String> {
 }
 
 // ── Phase 1: Payload preparation ──
+#[allow(clippy::too_many_lines)]
 fn expand_and_enrich_payloads(
     payloads: Vec<IngestPayload>,
     diag: &mut IngestDiagnostics,
@@ -351,12 +364,12 @@ fn expand_and_enrich_payloads(
         let mut prefix = String::new();
         if let Some(ref desc) = payload.visual_description {
             if !desc.is_empty() {
-                prefix.push_str(&format!("[Visual: {}] ", desc));
+                let _ = write!(prefix, "[Visual: {desc}] ");
             }
         }
         if let Some(ref q) = payload.visual_query {
             if !q.is_empty() && payload.visual_description.as_ref() != Some(q) {
-                prefix.push_str(&format!("[Context: {}] ", q));
+                let _ = write!(prefix, "[Context: {q}] ");
             }
         }
         if !prefix.is_empty() {
@@ -390,9 +403,9 @@ fn expand_and_enrich_payloads(
                     }
                     // Derived records belong to the same session and turn as
                     // their source.
-                    companion.session_id = payload.session_id.clone();
+                    companion.session_id.clone_from(&payload.session_id);
                     companion.turn_index = payload.turn_index;
-                    companion.role = payload.role.clone();
+                    companion.role.clone_from(&payload.role);
                     expanded_payloads.push(companion);
                 }
             }
@@ -440,7 +453,7 @@ fn expand_and_enrich_payloads(
                     };
                     let context_header = build_context_header(prev_text, next_text);
                     if !context_header.is_empty() {
-                        final_text = format!("{}{}", context_header, final_text);
+                        final_text = format!("{context_header}{final_text}");
                     }
                 }
             }
@@ -518,7 +531,7 @@ fn build_observations(
     let mut semantic_seen: Vec<(String, Vec<f32>)> = Vec::new();
     let mut semantic_embedding_iter = semantic_embeddings.into_iter();
 
-    for payload in expanded_payloads.into_iter() {
+    for payload in expanded_payloads {
         let mut payload = payload;
         let kind = payload.kind.as_deref().map(MemoryKind::parse).unwrap_or_default();
         if (kind == MemoryKind::Preference
@@ -589,8 +602,7 @@ fn build_observations(
 
         // Keep the legacy Debug representation in content hashes until the Phase 7 migration
         // recomputes existing hashes; changing it would break deduplication.
-        let hash =
-            content_hash(&payload.textual_content, &payload.entity_id, &format!("{:?}", kind));
+        let hash = content_hash(&payload.textual_content, &payload.entity_id, &format!("{kind:?}"));
         let obs = AgentObservation {
             entity_id: payload.entity_id.clone(),
             textual_content: payload.textual_content.clone(),
@@ -612,6 +624,7 @@ fn build_observations(
 }
 
 // ── Phase 4: Artifact building ──
+#[allow(clippy::too_many_lines)]
 fn build_artifacts(
     prepared: Vec<PreparedRecord>,
     diag: &mut IngestDiagnostics,
@@ -755,6 +768,7 @@ fn build_artifacts(
 }
 
 // ── Phase 5: Storage commit ──
+#[allow(clippy::too_many_lines)]
 async fn commit_batches(
     tenant: &std::sync::Arc<TenantStore>,
     state: &EngineState,
@@ -1001,7 +1015,7 @@ fn is_static_profile_card(predicate: &str, text: &str, kind: MemoryKind) -> bool
     if matches!(kind, MemoryKind::Preference | MemoryKind::Decision) {
         return true;
     }
-    let lower = format!("{} {}", predicate, text).to_ascii_lowercase();
+    let lower = format!("{predicate} {text}").to_ascii_lowercase();
     [
         "identity",
         "occupation",
@@ -1159,11 +1173,7 @@ fn build_retrospective_links(
         });
 
         if let Some((target_memory_id, score)) = ranked.into_iter().find(|(memory_id, _)| {
-            timestamp_by_memory
-                .get(memory_id)
-                .copied()
-                .map(|ts| ts < *current_timestamp)
-                .unwrap_or(false)
+            timestamp_by_memory.get(memory_id).copied().is_some_and(|ts| ts < *current_timestamp)
         }) {
             if score >= 0.55 {
                 let target_text = tenant
@@ -1219,8 +1229,8 @@ fn classify_retrospective_link(
 
     let current_temporal = extract_temporal_terms(current_text).len();
     let target_temporal = extract_temporal_terms(target_text).len();
-    let current_numbers = current_text.chars().filter(|c| c.is_ascii_digit()).count();
-    let target_numbers = target_text.chars().filter(|c| c.is_ascii_digit()).count();
+    let current_numbers = current_text.chars().filter(char::is_ascii_digit).count();
+    let target_numbers = target_text.chars().filter(char::is_ascii_digit).count();
     if current_temporal + current_numbers > target_temporal + target_numbers {
         return ("clarifies", "clarified_by");
     }
@@ -1287,7 +1297,9 @@ fn update_core_profile_heuristic(
             "terms": extract_salient_terms(&task.textual_content, 6)
         }));
         // Keep the newest facts by fact time, not by arrival order.
-        facts.sort_by_key(|f| std::cmp::Reverse(f.get("timestamp_ms").and_then(|t| t.as_u64())));
+        facts.sort_by_key(|f| {
+            std::cmp::Reverse(f.get("timestamp_ms").and_then(serde_json::Value::as_u64))
+        });
         facts.truncate(MAX_PROFILE_FACTS);
         let latest = facts.first().and_then(|f| f.get("timestamp_ms")).cloned();
         if let Some(latest) = latest {
@@ -1297,6 +1309,7 @@ fn update_core_profile_heuristic(
     })
 }
 
+#[allow(clippy::too_many_lines)]
 async fn execute_ingest_pipeline(
     state: &EngineState,
     tenant: &std::sync::Arc<TenantStore>,

@@ -20,10 +20,10 @@ impl BenchRng {
     }
 
     fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9e3779b97f4a7c15);
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
         let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         z ^ (z >> 31)
     }
 
@@ -133,7 +133,7 @@ fn bench_vector_index(c: &mut Criterion) {
     let batch: Vec<(u64, Vec<f32>)> = (0..100).map(|i| (i, rng.random_vector(dim))).collect();
     index.insert_batch("e", &batch).expect("insert");
     group.bench_function("insert_batch_100_loaded", |b| {
-        b.iter(|| index.insert_batch("e", black_box(&batch)).expect("insert"))
+        b.iter(|| index.insert_batch("e", black_box(&batch)).expect("insert"));
     });
     group.finish();
 }
@@ -217,7 +217,7 @@ fn bench_fts(c: &mut Criterion) {
 
     let mut rows = Vec::with_capacity(10_000);
     for i in 0..10_000 {
-        let mem_id = format!("mem_{:05}", i);
+        let mem_id = format!("mem_{i:05}");
         let entity_id = format!("entity_{:03}", i % 50);
         let content = format!(
             "Memory record {} discusses {} {} algorithms and {} optimizations for temporal retrieval.",
@@ -343,12 +343,11 @@ fn bench_models(c: &mut Criterion) {
     let sample_texts: Vec<String> = (0..32)
         .map(|i| {
             format!(
-                "This is test document number {} containing various semantic claims about agent memory.",
-                i
+                "This is test document number {i} containing various semantic claims about agent memory."
             )
         })
         .collect();
-    let text_refs: Vec<&str> = sample_texts.iter().map(|s| s.as_str()).collect();
+    let text_refs: Vec<&str> = sample_texts.iter().map(std::string::String::as_str).collect();
 
     for &batch_size in &[1, 8, 32] {
         let input_slice = &text_refs[..batch_size];

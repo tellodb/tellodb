@@ -18,7 +18,7 @@ pub fn extract_named_phrases(lines: &[String]) -> Vec<String> {
                 continue;
             }
 
-            let starts_upper = word.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false);
+            let starts_upper = word.chars().next().is_some_and(|c| c.is_ascii_uppercase());
             let has_lower = word.chars().any(|c| c.is_ascii_lowercase());
             if starts_upper && has_lower {
                 current.push(word.to_string());

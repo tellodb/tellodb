@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::hash::BuildHasher;
 
 use super::types::{
     FourSignalWeights, QueryAdaptiveProfile, QueryIntent, QueryModality, QueryPlan,
@@ -66,11 +67,11 @@ pub fn fuse_four_signals(
         + graph * weights.graph
 }
 
-pub fn compute_evidence_confidence(
+pub fn compute_evidence_confidence<S: BuildHasher>(
     results: &[QueryResult],
     query: &str,
     classifier: Option<&QueryIntentClassifier>,
-    scorables: &HashMap<String, ScorableObservation>,
+    scorables: &HashMap<String, ScorableObservation, S>,
 ) -> f32 {
     use super::builder::build_query_plan;
     let lexical = build_query_plan(query, classifier);
@@ -78,7 +79,7 @@ pub fn compute_evidence_confidence(
         return 0.0;
     }
     let top = results[0].similarity.max(0.0);
-    let second = results.get(1).map(|r| r.similarity.max(0.0)).unwrap_or(0.0);
+    let second = results.get(1).map_or(0.0, |r| r.similarity.max(0.0));
     let margin = (top - second).max(0.0);
     let support = results
         .iter()
@@ -99,7 +100,10 @@ pub fn compute_evidence_confidence(
 }
 
 pub fn routed_session_from_memory_id(memory_id: &str) -> Option<String> {
-    MemoryId::parse(memory_id).ok().filter(|id| id.is_structured()).map(|id| id.session().clone())
+    MemoryId::parse(memory_id)
+        .ok()
+        .filter(crate::core::memory_id::MemoryId::is_structured)
+        .map(|id| id.session().clone())
 }
 
 pub fn extract_numeric_tokens(text: &str) -> Vec<f32> {
@@ -358,8 +362,7 @@ pub fn query_variant_weight(index: usize, modality: QueryModality, intent: Query
         (QueryIntent::Inference, QueryModality::Lexical) => 1.04,
         (QueryIntent::PeripheralMention, QueryModality::Semantic) => 0.82,
         (QueryIntent::PeripheralMention, QueryModality::Lexical) => 1.35,
-        (QueryIntent::General, QueryModality::Semantic) => 1.0,
-        (QueryIntent::General, QueryModality::Lexical) => 1.0,
+        (QueryIntent::General, QueryModality::Semantic | QueryModality::Lexical) => 1.0,
     };
 
     base * multiplier
@@ -372,13 +375,13 @@ pub fn adaptive_rrf_k(plan: &QueryPlan) -> usize {
         match plan.intent {
             QueryIntent::PeripheralMention => 40,
             QueryIntent::Inference => 50,
-            QueryIntent::TemporalAggregation => 55,
-            QueryIntent::NumericAggregation => 55,
+            QueryIntent::TemporalAggregation | QueryIntent::NumericAggregation => 55,
             QueryIntent::Recommendation | QueryIntent::General => 60,
         }
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn session_coverage_bonus(items: &[EvidenceCard], plan: &QueryPlan) -> f32 {
     if items.is_empty() {
         return 0.0;
@@ -644,6 +647,7 @@ pub fn reorder_session_items_for_requirements(
     ordered
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn select_candidates_with_session_head(
     candidates: Vec<EvidenceCard>,
     limit: usize,
@@ -682,9 +686,9 @@ pub fn select_candidates_with_session_head(
                     .then_with(|| a.source_memory_id.cmp(&b.source_memory_id))
             });
 
-            let top1 = items.first().map(|item| item.final_score).unwrap_or(0.0);
-            let top2 = items.get(1).map(|item| item.final_score).unwrap_or(0.0);
-            let top3 = items.get(2).map(|item| item.final_score).unwrap_or(0.0);
+            let top1 = items.first().map_or(0.0, |item| item.final_score);
+            let top2 = items.get(1).map_or(0.0, |item| item.final_score);
+            let top3 = items.get(2).map_or(0.0, |item| item.final_score);
             let max_lexical_hits = items.iter().map(|item| item.lexical_hits).max().unwrap_or(0);
             let max_temporal_hits = items.iter().map(|item| item.temporal_hits).max().unwrap_or(0);
             let max_entity_hits = items.iter().map(|item| item.entity_hits).max().unwrap_or(0);
@@ -877,7 +881,7 @@ pub fn select_candidates_with_session_head(
 
     while selected.len() < limit {
         let mut progressed = false;
-        for session in sessions.iter() {
+        for session in &sessions {
             if let Some(candidate) = session.items.get(round) {
                 if seen_memory_ids.insert(candidate.source_memory_id.clone()) {
                     selected.push(candidate.clone());

@@ -13,10 +13,10 @@ use tellodb::vector_index::{Quantization, VectorConfig, VectorIndex};
 struct Rng(u64);
 impl Rng {
     fn next(&mut self) -> f32 {
-        self.0 = self.0.wrapping_add(0x9e3779b97f4a7c15);
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
         let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         ((z ^ (z >> 31)) >> 40) as f32 / (1u64 << 24) as f32 - 0.5
     }
     fn vector(&mut self, dims: usize) -> Vec<f32> {

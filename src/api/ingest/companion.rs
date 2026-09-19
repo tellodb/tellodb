@@ -73,8 +73,7 @@ pub fn build_relation_companion_payloads(payload: &IngestPayload) -> Vec<IngestP
                 memory_id: MemoryId::derived_from(&payload.memory_id, &format!("rel{idx}")),
                 timestamp: payload.timestamp,
                 textual_content: format!(
-                    "Canonical relation: {} {} {}",
-                    subject, human_predicate, object
+                    "Canonical relation: {subject} {human_predicate} {object}"
                 ),
                 relations: payload.relations.clone(),
                 kind: Some("fact".to_string()),
@@ -99,6 +98,7 @@ pub fn build_companion_payloads(payload: &IngestPayload) -> Vec<IngestPayload> {
     build_companion_payloads_with_profile(payload, Profile::Generic)
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn build_companion_payloads_with_profile(
     payload: &IngestPayload,
     profile: Profile,
@@ -115,10 +115,10 @@ pub fn build_companion_payloads_with_profile(
     let mut companions = Vec::new();
 
     if turn_index == 0 {
-        let session_companion_source = session_focus
-            .as_ref()
-            .map(|focus| format!("{focus}\n{}", payload.textual_content))
-            .unwrap_or_else(|| payload.textual_content.clone());
+        let session_companion_source = session_focus.as_ref().map_or_else(
+            || payload.textual_content.clone(),
+            |focus| format!("{focus}\n{}", payload.textual_content),
+        );
         let gist = session_focus.map(|focus| format!("Session gist: {focus}")).or(fallback_gist);
         let keyword_index = build_keyword_companion_text(&session_companion_source);
 
@@ -174,7 +174,7 @@ pub fn build_companion_payloads_with_profile(
         let fact_content = if let Some(slot_key) = fact_key.as_deref() {
             format!("Canonical fact about {}: {}", slot_key.replace('_', " "), fact_text)
         } else {
-            format!("Canonical fact: {}", fact_text)
+            format!("Canonical fact: {fact_text}")
         };
         companions.push(IngestPayload {
             entity_id: payload.entity_id.clone(),

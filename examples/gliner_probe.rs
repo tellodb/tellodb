@@ -9,7 +9,7 @@ fn main() -> anyhow::Result<()> {
     let model = GlinerModel::load(std::path::Path::new(&dir))?;
     let labels: Vec<String> = ["city of residence", "employer", "job title", "person", "pet"]
         .iter()
-        .map(|s| s.to_string())
+        .map(|s| (*s).to_string())
         .collect();
 
     for text in ["I live in Austin.", "My home city is Austin.", "I now live in Seattle."] {

@@ -26,9 +26,9 @@ impl TenantStore {
                     card.memory_text,
                     card.card_type,
                     card.confidence,
-                    card.is_latest as i32,
-                    card.is_static as i32,
-                    card.is_inference as i32,
+                    i32::from(card.is_latest),
+                    i32::from(card.is_static),
+                    i32::from(card.is_inference),
                     card.expires_at,
                     card.root_card_id,
                     card.parent_card_id,
@@ -73,13 +73,14 @@ impl TenantStore {
                 "UPDATE memory_cards SET is_latest = ?1, updated_at_ms = ?2 WHERE card_id = ?3",
             )?;
             for (card_id, is_latest, ts) in updates {
-                stmt.execute(params![*is_latest as i32, *ts as i64, card_id])?;
+                stmt.execute(params![i32::from(*is_latest), *ts as i64, card_id])?;
             }
         }
         tx.commit()?;
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn search_memory_cards(
         &self,
         query: &MemoryCardSearchInput<'_>,
@@ -131,13 +132,12 @@ impl TenantStore {
             if !query.include_stale && !is_latest {
                 continue;
             }
-            if expires_at.map(|exp| exp <= now_ms).unwrap_or(false) {
+            if expires_at.is_some_and(|exp| exp <= now_ms) {
                 continue;
             }
 
             let text = format!(
-                "{} {} {} {} {} {}",
-                subject, predicate, object, memory_text, card_type, source_session_id
+                "{subject} {predicate} {object} {memory_text} {card_type} {source_session_id}"
             );
             let lower = text.to_ascii_lowercase();
             let lexical_hits = contains_term_count(&lower, query.lexical_terms);

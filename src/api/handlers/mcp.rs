@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 
 const JSONRPC_INTERNAL_ERROR: i32 = -32000;
 
-fn rpc_error(id: Value, code: i32, message: impl Into<String>) -> Json<Value> {
+fn rpc_error(id: &Value, code: i32, message: impl Into<String>) -> Json<Value> {
     Json(json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -29,7 +29,7 @@ pub async fn mcp_handler(
 ) -> Json<Value> {
     let id = request.get("id").cloned().unwrap_or(Value::Null);
     if request["jsonrpc"] != "2.0" {
-        return rpc_error(id, -32600, "Invalid JSON-RPC version");
+        return rpc_error(&id, -32600, "Invalid JSON-RPC version");
     }
 
     let tenant_id = principal_user_id(&principal).unwrap_or("default");
@@ -37,7 +37,7 @@ pub async fn mcp_handler(
         Ok(tenant) => tenant,
         Err(err) => {
             tracing::error!(error = ?err, tenant_id, "MCP tenant lookup failed");
-            return rpc_error(id, JSONRPC_INTERNAL_ERROR, "Failed to open tenant store");
+            return rpc_error(&id, JSONRPC_INTERNAL_ERROR, "Failed to open tenant store");
         }
     };
     let default_entity = "user".to_string();
@@ -55,13 +55,13 @@ mod tests {
 
     #[test]
     fn errors_are_json_rpc_errors_with_the_request_id() {
-        let Json(unauthorized) = rpc_error(json!("req-1"), -32001, "Unauthorized");
+        let Json(unauthorized) = rpc_error(&json!("req-1"), -32001, "Unauthorized");
         assert_eq!(unauthorized["jsonrpc"], "2.0");
         assert_eq!(unauthorized["id"], json!("req-1"));
         assert_eq!(unauthorized["error"]["code"], -32001);
         assert!(unauthorized.get("result").is_none());
 
-        let Json(bad_version) = rpc_error(json!(1), -32600, "Invalid JSON-RPC version");
+        let Json(bad_version) = rpc_error(&json!(1), -32600, "Invalid JSON-RPC version");
         assert_eq!(bad_version["error"]["code"], -32600);
         assert_eq!(bad_version["error"]["message"], "Invalid JSON-RPC version");
     }

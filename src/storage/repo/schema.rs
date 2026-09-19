@@ -1,6 +1,7 @@
 use super::prelude::*;
 
 impl TenantStore {
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn init_schema(conn: &rusqlite::Connection) -> Result<()> {
         conn.execute_batch(
             "
@@ -315,7 +316,7 @@ impl TenantStore {
             // The old table was keyed by (timestamp, entity, label), so two
             // amounts in one memory overwrote each other. Ingest never wrote
             // to it, so there is nothing to carry over.
-            conn.execute_batch(&format!("DROP TABLE metrics; {}", METRICS_DDL))?;
+            conn.execute_batch(&format!("DROP TABLE metrics; {METRICS_DDL}"))?;
         }
         if !Self::has_column(conn, "fact_versions", "recorded_at_ms")? {
             conn.execute_batch("ALTER TABLE fact_versions ADD COLUMN recorded_at_ms INTEGER;")?;

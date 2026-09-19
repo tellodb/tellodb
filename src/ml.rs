@@ -79,7 +79,7 @@ impl QueryIntentClassifier {
 
         let mut prototypes = Vec::with_capacity(prototype_texts.len());
         for (intent, texts) in prototype_texts {
-            let texts: Vec<String> = texts.iter().map(|s| s.to_string()).collect();
+            let texts: Vec<String> = texts.iter().map(|s| (*s).to_string()).collect();
             let mut embeddings: Vec<Vec<f32>> = Vec::new();
             for t in &texts {
                 if let Ok(emb) = semantic.generate_query_embedding(t) {
@@ -97,7 +97,7 @@ impl QueryIntentClassifier {
                 }
             }
             let n = embeddings.len() as f32;
-            for val in centroid.iter_mut() {
+            for val in &mut centroid {
                 *val /= n;
             }
             prototypes.push((*intent, centroid));
@@ -108,6 +108,7 @@ impl QueryIntentClassifier {
 
     #[cfg(test)]
     #[allow(dead_code)]
+    #[must_use]
     pub fn with_threshold(mut self, threshold: f32) -> Self {
         self.threshold = threshold;
         self
@@ -167,15 +168,13 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
         if sqrt_a != 0.0 {
             debug_assert!(
                 (sqrt_a - 1.0).abs() < 1e-2,
-                "vector a is not L2 normalized: norm={}",
-                sqrt_a
+                "vector a is not L2 normalized: norm={sqrt_a}"
             );
         }
         if sqrt_b != 0.0 {
             debug_assert!(
                 (sqrt_b - 1.0).abs() < 1e-2,
-                "vector b is not L2 normalized: norm={}",
-                sqrt_b
+                "vector b is not L2 normalized: norm={sqrt_b}"
             );
         }
     }
@@ -209,7 +208,7 @@ mod tests {
     fn test_cosine_similarity_zero_vector() {
         let a = vec![0.0, 0.0, 0.0];
         let b = vec![1.0, 2.0, 3.0];
-        assert_eq!(cosine_similarity(&a, &b), 0.0);
+        assert!(cosine_similarity(&a, &b).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -225,14 +224,14 @@ mod tests {
         let b = vec![0.0, 0.0, 0.0];
         let result = cosine_similarity(&a, &b);
         assert!(!result.is_nan());
-        assert_eq!(result, 0.0);
+        assert!(result.abs() < f32::EPSILON);
     }
 
     #[test]
     fn test_cosine_similarity_zero_b() {
         let a = vec![1.0, 2.0, 3.0];
         let b = vec![0.0, 0.0, 0.0];
-        assert_eq!(cosine_similarity(&a, &b), 0.0);
+        assert!(cosine_similarity(&a, &b).abs() < f32::EPSILON);
     }
 
     #[test]

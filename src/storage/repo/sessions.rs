@@ -120,7 +120,7 @@ impl TenantStore {
             )
         } else {
             let fts_query =
-                terms.iter().map(|t| format!("\"{}\"", t)).collect::<Vec<_>>().join(" OR ");
+                terms.iter().map(|t| format!("\"{t}\"")).collect::<Vec<_>>().join(" OR ");
             let mut stmt = conn.prepare_cached(
                 "SELECT sr.record_json
                  FROM fts_session_router fsr
@@ -161,10 +161,7 @@ impl TenantStore {
     ) -> Vec<SessionRouterSearchHit> {
         let mut hits = Vec::new();
         for row in rows {
-            let json = match row {
-                Ok(j) => j,
-                Err(_) => continue,
-            };
+            let Ok(json) = row else { continue };
             let Ok(record) = serde_json::from_str::<SessionRouterRecord>(&json) else {
                 continue;
             };

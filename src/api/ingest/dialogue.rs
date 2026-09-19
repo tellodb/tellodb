@@ -565,9 +565,9 @@ mod moved_tests {
     #[test]
     fn test_extract_companion_texts_no_dialogue_no_gist() {
         let text = "Just some plain text.";
-        let (gist, _facts) = extract_companion_texts(text);
+        let (gist, facts) = extract_companion_texts(text);
         assert!(gist.is_none());
-        assert!(_facts.is_empty());
+        assert!(facts.is_empty());
     }
 
     #[test]
