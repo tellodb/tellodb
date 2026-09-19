@@ -517,56 +517,14 @@ impl TenantStore {
         )?;
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version < 2 {
-            // FTS rows used to get random rowids, so re-ingest duplicated them.
-            // Re-key every row by `fts_rowid`, keeping the newest copy. Each
-            // table is rewritten in one transaction.
-            for (table, key_col, cols) in
-                [("fts_memories", "memory_id", "memory_id, entity_id, content")]
-            {
-                let tmp = format!("{table}_migrate");
-                conn.execute_batch(&format!(
-                    "BEGIN IMMEDIATE;
-                     DROP TABLE IF EXISTS {tmp};
-                     CREATE TEMP TABLE {tmp} AS
-                        SELECT {cols} FROM {table} WHERE rowid IN
-                            (SELECT MAX(rowid) FROM {table} GROUP BY {key_col});
-                     DELETE FROM {table};"
-                ))?;
-                let rows: Vec<Vec<rusqlite::types::Value>> = {
-                    let mut stmt = conn.prepare(&format!("SELECT {cols} FROM {tmp}"))?;
-                    let width = stmt.column_count();
-                    let mapped = stmt.query_map([], |row| {
-                        (0..width).map(|i| row.get::<_, rusqlite::types::Value>(i)).collect()
-                    })?;
-                    mapped.collect::<rusqlite::Result<_>>()?
-                };
-                let placeholders = vec!["?"; cols.split(',').count() + 1].join(", ");
-                {
-                    let mut insert = conn.prepare(&format!(
-                        "INSERT OR REPLACE INTO {table} (rowid, {cols}) VALUES ({placeholders})"
-                    ))?;
-                    for row in rows {
-                        let key = match &row[0] {
-                            rusqlite::types::Value::Text(key) => key.clone(),
-                            _ => continue,
-                        };
-                        let mut values = vec![rusqlite::types::Value::Integer(fts_rowid(&key))];
-                        values.extend(row);
-                        insert.execute(rusqlite::params_from_iter(values))?;
-                    }
-                }
-                conn.execute_batch(&format!("COMMIT; DROP TABLE {tmp};"))?;
-            }
-        }
         if version < 3 {
-            // `entity_tok` (indexed) replaced the post-MATCH filter on the
-            // UNINDEXED `entity_id`. Nothing rebuilds the contents: there is
-            // no data worth preserving yet, and re-ingesting restores it.
+            // The v3 FTS rebuild supersedes the v2 rowid rewrite because it
+            // drops the table and re-ingest restores its contents.
             tracing::warn!("dropping FTS index for the entity-token schema; re-ingest to restore");
-            conn.execute_batch("DROP TABLE IF EXISTS fts_memories;")?;
-            conn.execute_batch(
-                "CREATE VIRTUAL TABLE fts_memories USING fts5(
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "DROP TABLE IF EXISTS fts_memories;
+                 CREATE VIRTUAL TABLE fts_memories USING fts5(
                      memory_id UNINDEXED,
                      entity_id UNINDEXED,
                      entity_tok,
@@ -574,6 +532,7 @@ impl TenantStore {
                      tokenize='porter unicode61'
                  );",
             )?;
+            tx.commit()?;
         }
         if version < SCHEMA_VERSION {
             conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
@@ -3510,6 +3469,19 @@ mod tests {
             .map(|(key, ts, memory_id, object)| (*key, *ts, *memory_id, entity, *key, *object))
             .collect();
         store.register_fact_versions_batch(entity, &registrations).unwrap()
+    }
+
+    #[test]
+    fn migrate_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tenant.db");
+
+        for _ in 0..2 {
+            let store = TenantStore::new(&path).unwrap();
+            let conn = store.get_conn().unwrap();
+            let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
+            assert_eq!(version, SCHEMA_VERSION);
+        }
     }
 
     #[test]
