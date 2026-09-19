@@ -409,6 +409,9 @@ impl SemanticInference {
         rerank: &RerankConfig,
     ) -> Result<Self> {
         let embedding_model_id = embedding.model_id.clone();
+        if cfg!(debug_assertions) && embedding_model_id.trim().eq_ignore_ascii_case("test") {
+            return Ok(Self::test_stub(cache_path, embedding));
+        }
         let model_name = parse_embedding_model(&embedding_model_id)?;
         let embedding_dim =
             TextEmbedding::get_model_info(&model_name).map(|info| info.dim).unwrap_or_else(|_| {
@@ -536,6 +539,28 @@ impl SemanticInference {
         })
     }
 
+    fn test_stub(cache_path: Option<PathBuf>, embedding: &EmbeddingConfig) -> Self {
+        let embedding_dim = embedding_dimensions_for_model("test", embedding.dimension);
+        Self {
+            embedding_model_id: "test".to_string(),
+            cache_model_key: format!("test@{}", embedding.max_tokens.max(1)),
+            embedding_dim,
+            embed_batch: embedding.batch.max(1),
+            max_tokens: embedding.max_tokens.max(1),
+            rerank_model_id: None,
+            query_instruction: String::new(),
+            executors: Vec::new(),
+            next_executor: AtomicUsize::new(0),
+            rerankers: Vec::new(),
+            rerank_cache: Mutex::new(LruCache::new(
+                NonZeroUsize::new(64).expect("literal is non-zero"),
+            )),
+            permits: ComputePermits::new(1),
+            cache: EmbeddingCache::new(cache_path, embedding.cache_enabled),
+            device_label: "CPU",
+        }
+    }
+
     pub fn is_rerank_enabled(&self) -> bool {
         !self.rerankers.is_empty()
     }
@@ -597,30 +622,37 @@ impl SemanticInference {
         }
         missing.sort_by_key(|&i| texts[i].len());
 
-        let batches: Vec<&[usize]> = missing.chunks(self.embed_batch).collect();
-        let computed: Vec<Vec<Vec<f32>>> = if self.executors.len() == 1 || batches.len() == 1 {
-            batches
-                .iter()
-                .map(|batch| self.embed_on_executor(texts, batch))
-                .collect::<Result<_>>()?
+        if self.executors.is_empty() {
+            for &idx in &missing {
+                results[idx] = Some(test_embedding(texts[idx], self.embedding_dim));
+            }
         } else {
-            std::thread::scope(|scope| {
-                let handles: Vec<_> = batches
+            let batches: Vec<&[usize]> = missing.chunks(self.embed_batch).collect();
+            let computed: Vec<Vec<Vec<f32>>> = if self.executors.len() == 1 || batches.len() == 1 {
+                batches
                     .iter()
-                    .map(|batch| scope.spawn(move || self.embed_on_executor(texts, batch)))
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|h| {
-                        h.join().map_err(|_panic| anyhow::anyhow!("embedding thread panicked"))?
-                    })
-                    .collect::<Result<_>>()
-            })?
-        };
+                    .map(|batch| self.embed_on_executor(texts, batch))
+                    .collect::<Result<_>>()?
+            } else {
+                std::thread::scope(|scope| {
+                    let handles: Vec<_> = batches
+                        .iter()
+                        .map(|batch| scope.spawn(move || self.embed_on_executor(texts, batch)))
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| {
+                            h.join()
+                                .map_err(|_panic| anyhow::anyhow!("embedding thread panicked"))?
+                        })
+                        .collect::<Result<_>>()
+                })?
+            };
 
-        for (batch, vectors) in batches.iter().zip(computed) {
-            for (&idx, vector) in batch.iter().zip(vectors) {
-                results[idx] = Some(vector);
+            for (batch, vectors) in batches.iter().zip(computed) {
+                for (&idx, vector) in batch.iter().zip(vectors) {
+                    results[idx] = Some(vector);
+                }
             }
         }
         let cache_items: Vec<([u8; 32], &[f32])> = missing
@@ -828,6 +860,28 @@ fn embedding_dimensions_for_model(id: &str, configured: Option<usize>) -> usize 
         s if s.contains("e5-large") => 1024,
         _ => 384,
     }
+}
+
+fn test_embedding(text: &str, dimension: usize) -> Vec<f32> {
+    use sha2::{Digest, Sha256};
+
+    let mut vector = vec![0.0; dimension.max(1)];
+    for token in text.split_whitespace().map(|token| token.to_ascii_lowercase()) {
+        let digest = Sha256::digest(token.as_bytes());
+        let mut seed = [0; 8];
+        seed.copy_from_slice(&digest[..8]);
+        let index = u64::from_le_bytes(seed) as usize % vector.len();
+        vector[index] += 1.0;
+    }
+    let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for value in &mut vector {
+            *value /= norm;
+        }
+    } else {
+        vector[0] = 1.0;
+    }
+    vector
 }
 
 #[cfg(test)]

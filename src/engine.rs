@@ -5,7 +5,7 @@ use crate::api::{self, EngineState};
 use crate::config::Config;
 use crate::runtime_paths::RuntimePaths;
 use crate::{analytics, ml, platform, semantic, storage};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -19,6 +19,15 @@ pub async fn build_state(
     paths.ensure_dirs()?;
     paths.apply_process_env_defaults();
     info!(root = %paths.root().display(), "Runtime data root");
+
+    let ranking_path = paths.root().join("ranking_config.json");
+    if ranking_path.exists() {
+        let config_data = std::fs::read_to_string(&ranking_path)
+            .with_context(|| format!("failed to read ranking config {}", ranking_path.display()))?;
+        config.ranking = serde_json::from_str(&config_data).with_context(|| {
+            format!("failed to parse ranking config {}", ranking_path.display())
+        })?;
+    }
 
     if !config.features.disabled_names().is_empty() {
         info!(disabled = ?config.features.disabled_names(), "Ingest structures disabled");
@@ -84,14 +93,8 @@ pub async fn build_state(
     let platform_write_tx = api::start_platform_writer(platform.clone());
     let analytics = Arc::new(analytics::MetricVault::new(tenant_manager.clone()));
 
-    if let Ok(config_data) = std::fs::read_to_string(paths.root().join("ranking_config.json")) {
-        match serde_json::from_str::<api::types::RankingConfig>(&config_data) {
-            Ok(parsed) => {
-                info!("Loaded ranking config from ranking_config.json");
-                config.ranking = parsed;
-            }
-            Err(err) => warn!(error = %err, "Failed to parse ranking_config.json; using defaults"),
-        }
+    if ranking_path.exists() {
+        info!("Loaded ranking config from ranking_config.json");
     }
 
     Ok(EngineState {
