@@ -6,3 +6,4 @@ pub mod types;
 pub use manager::TenantDatabaseManager;
 pub use tenant::TenantStore;
 pub use types::*;
+pub mod repo;
