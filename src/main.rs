@@ -218,6 +218,9 @@ async fn serve(paths: &RuntimePaths) -> anyhow::Result<()> {
                     error!(error = ?error, "Expired session purge failed");
                 }
                 for tenant in tenants {
+                    if let Err(error) = tenant.reindex_unindexed(500) {
+                        error!(error = ?error, "unindexed memory recovery failed");
+                    }
                     if let Err(error) = tenant.checkpoint() {
                         error!(error = ?error, "WAL checkpoint failed");
                     }

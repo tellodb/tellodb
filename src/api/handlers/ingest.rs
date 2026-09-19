@@ -12,7 +12,7 @@ use crate::api::ingest::{alias::*, chunking::*, companion::*, datetime::*, dialo
 use crate::api::types::{BatchIngestPayload, IngestPayload};
 use crate::api::utils::*;
 use crate::api::{EngineState, PlatformWriteOp};
-use crate::core::memory_id::{MemoryId, Tag};
+use crate::core::memory_id::MemoryId;
 use crate::error::{EngineError, EngineResult};
 use crate::graph::EdgeType;
 use crate::ml::cosine_similarity;
@@ -40,8 +40,8 @@ use crate::lifecycle::{evaluate_lifecycle, LifecycleMetadata};
 use crate::metrics;
 use crate::storage::repo::traits::{RetrospectiveRepo, VectorRepo};
 use crate::storage::{
-    build_session_router_text, AgentObservation, FactVersionStatus, GraphEdgeEntry, MemoryCard,
-    MemoryKind, SessionRouterRecord, TenantStore,
+    build_session_router_text, AgentObservation, MemoryCard, MemoryKind, SessionRouterRecord,
+    TenantStore,
 };
 
 #[derive(Default)]
@@ -215,20 +215,21 @@ struct FactRegistration {
 struct PreparedRecord {
     payload: IngestPayload,
     obs: AgentObservation,
-    embedding: Vec<f32>,
     lifecycle: LifecycleMetadata,
     enable_consolidation: bool,
 }
 
 #[derive(Default)]
 struct ArtifactBatches {
+    observations: Vec<(u64, String, AgentObservation)>,
     fts_batch: Vec<(String, String, String)>,
-    vector_batch: std::collections::HashMap<String, Vec<(u64, Vec<f32>)>>,
     memory_links_batch: Vec<(String, String, String)>,
     memory_card_batch: Vec<MemoryCard>,
     memory_card_latest_updates: Vec<(String, bool, u64)>,
     session_router_updates: Vec<SessionRouterRecord>,
     preference_batch: std::collections::HashMap<String, Vec<(String, f32)>>,
+    predicate_canon_batch: std::collections::HashMap<String, Vec<(String, Vec<f32>)>>,
+    predicate_canon_tau: f32,
     retrospective_candidates: Vec<RetrospectiveCandidate>,
     fact_batch: Vec<FactRegistration>,
     consolidation_tasks: Vec<ConsolidationTask>,
@@ -635,7 +636,7 @@ fn build_observations(
             parent_memory_id: payload.source_memory_id.clone(),
         };
 
-        prepared.push(PreparedRecord { payload, obs, embedding, lifecycle, enable_consolidation });
+        prepared.push(PreparedRecord { payload, obs, lifecycle, enable_consolidation });
     }
 
     diag.dedup_build_ms = dedup_build_start.elapsed().as_millis() as u64;
@@ -645,14 +646,18 @@ fn build_observations(
 // ── Phase 4: Artifact building ──
 fn build_artifacts(
     prepared: Vec<PreparedRecord>,
-    inserted_flags: Vec<Option<u64>>,
     diag: &mut IngestDiagnostics,
     features: Features,
 ) -> ArtifactBatches {
     let artifact_build_start = Instant::now();
     let mut batches = ArtifactBatches::default();
 
-    for (record, vector_id) in prepared.into_iter().zip(inserted_flags.into_iter()) {
+    for record in prepared {
+        batches.observations.push((
+            record.payload.timestamp,
+            record.payload.memory_id.clone(),
+            record.obs.clone(),
+        ));
         let is_synthetic_query = record.payload.kind.as_deref() == Some("synthetic_query");
         if !is_synthetic_query {
             batches.fts_batch.push((
@@ -681,16 +686,6 @@ fn build_artifacts(
                 }
             }
         }
-        if !record.embedding.is_empty() {
-            if let Some(vid) = vector_id {
-                batches
-                    .vector_batch
-                    .entry(record.payload.entity_id.clone())
-                    .or_default()
-                    .push((vid, record.embedding.clone()));
-            }
-        }
-
         if !is_synthetic_query && features.enabled(Feature::Preferences) {
             if let Some(strength) = preference_signal_strength(
                 &record.payload.textual_content,
@@ -798,127 +793,6 @@ async fn commit_batches(
     batches: &mut ArtifactBatches,
     diag: &mut IngestDiagnostics,
 ) -> EngineResult<()> {
-    // Memory cards
-    if !batches.memory_card_batch.is_empty() {
-        let stage_start = Instant::now();
-        let (tenant, cards) = (tenant.clone(), batches.memory_card_batch.clone());
-        tokio::task::spawn_blocking(move || tenant.ingest_cards(&cards))
-            .await
-            .map_err(anyhow::Error::from)
-            .and_then(|r| r)
-            .map_err(|err| {
-                tracing::error!(error = ?err, "memory card upsert failed");
-                EngineError::internal("ingest operation failed")
-            })?;
-        diag.memory_cards_ms = stage_start.elapsed().as_millis() as u64;
-    }
-
-    tracing::debug!("[CP] upserts_done_before_session_router");
-
-    // Session router merge
-    if !batches.session_router_updates.is_empty() {
-        let sr_start = Instant::now();
-        let router_records = {
-            let tenant = tenant.clone();
-            let updates = batches.session_router_updates.clone();
-            tokio::task::spawn_blocking(move || tenant.merge_session_router_records_batch(&updates))
-                .await
-                .map_err(|e| {
-                    tracing::error!("session_router spawn panic: {:?}", e);
-                    EngineError::internal("ingest operation failed")
-                })?
-                .map_err(|e| {
-                    tracing::error!("session_router merge failed: {:?}", e);
-                    EngineError::internal("ingest operation failed")
-                })?
-        };
-
-        for record in &router_records {
-            if !record.router_text.is_empty() {
-                let router_id = MemoryId::new(&record.entity_id, &record.session_id, 0)
-                    .derived(Tag::Named("router".to_string()))
-                    .as_str()
-                    .to_string();
-                batches.fts_batch.push((
-                    router_id,
-                    record.entity_id.clone(),
-                    record.router_text.clone(),
-                ));
-            }
-        }
-
-        diag.session_router_ms = sr_start.elapsed().as_millis() as u64;
-    }
-
-    // FTS + vector indexing (parallel). Failures fail the request: the rows
-    // are already committed, and a 200 here would hide memories that can
-    // never be retrieved.
-    let (res_fts, res_vix) = tokio::join!(
-        tokio::task::spawn_blocking({
-            let tenant = tenant.clone();
-            let batch = batches.fts_batch.clone();
-            move || -> anyhow::Result<Duration> {
-                let start = Instant::now();
-                if !batch.is_empty() {
-                    tenant.fts_index_batch(&batch)?;
-                }
-                Ok(start.elapsed())
-            }
-        }),
-        tokio::task::spawn_blocking({
-            let tenant = tenant.clone();
-            let batch = batches.vector_batch.clone();
-            move || -> anyhow::Result<Duration> {
-                let start = Instant::now();
-                if !batch.is_empty() {
-                    let vectors = tenant.vectors()?;
-                    for (entity_id, items) in batch {
-                        vectors.insert_batch(&entity_id, &items)?;
-                    }
-                }
-                Ok(start.elapsed())
-            }
-        })
-    );
-    let join_stage =
-        |stage: &'static str, res: Result<anyhow::Result<Duration>, tokio::task::JoinError>| {
-            res.map_err(anyhow::Error::from).and_then(|r| r).map_err(|err| {
-                tracing::error!(stage, error = ?err, "ingest indexing stage failed");
-                EngineError::internal("ingest operation failed")
-            })
-        };
-    let res_fts = join_stage("fts", res_fts)?;
-    let res_vix = join_stage("vector", res_vix)?;
-
-    diag.fts_ms = res_fts.as_millis() as u64;
-    diag.fts_us = res_fts.as_micros() as u64;
-    diag.vector_ms = res_vix.as_millis() as u64;
-    diag.vector_us = res_vix.as_micros() as u64;
-
-    // Preferences
-    if !batches.preference_batch.is_empty() {
-        let stage_start = Instant::now();
-        let tenant_pref = tenant.clone();
-        let pref_batch = batches.preference_batch.clone();
-        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            for (entity_id, items) in pref_batch {
-                tenant_pref.set_preference_memories_batch(&entity_id, &items)?;
-            }
-            Ok(())
-        })
-        .await
-        .map_err(|e| {
-            tracing::error!("preference spawn panic: {:?}", e);
-            EngineError::internal("ingest operation failed")
-        })?
-        .map_err(|e| {
-            tracing::error!("preference write failed: {:?}", e);
-            EngineError::internal("ingest operation failed")
-        })?;
-        diag.preferences_ms = stage_start.elapsed().as_millis() as u64;
-    }
-
-    // Retrospective links
     if !batches.retrospective_candidates.is_empty() {
         let stage_start = Instant::now();
         let retrospective_links = build_retrospective_links(
@@ -931,30 +805,13 @@ async fn commit_batches(
         diag.retrospective_ms = stage_start.elapsed().as_millis() as u64;
     }
 
-    // Memory links
-    if !batches.memory_links_batch.is_empty() {
-        let stage_start = Instant::now();
-        let tenant_links = tenant.clone();
-        let links = batches.memory_links_batch.clone();
-        tokio::task::spawn_blocking(move || tenant_links.set_memory_links_batch(&links))
-            .await
-            .map_err(|e| {
-                tracing::error!("memory_links spawn panic: {:?}", e);
-                EngineError::internal("ingest operation failed")
-            })?
-            .map_err(|e| {
-                tracing::error!("memory_links write failed: {:?}", e);
-                EngineError::internal("ingest operation failed")
-            })?;
-        diag.memory_links_ms = stage_start.elapsed().as_millis() as u64;
-    }
-
-    // Predicate grouping: rule-derived keys vary in wording ("job title" vs
-    // "job_title"), which would otherwise keep two chains for one fact.
     if state.config.features.enabled(Feature::PredicateCanon) && !batches.fact_batch.is_empty() {
         let stage_start = Instant::now();
-        let mut keys: Vec<(String, String)> =
-            batches.fact_batch.iter().map(|f| (f.entity_id.clone(), f.fact_key.clone())).collect();
+        let mut keys: Vec<(String, String)> = batches
+            .fact_batch
+            .iter()
+            .map(|fact| (fact.entity_id.clone(), fact.fact_key.clone()))
+            .collect();
         keys.sort();
         keys.dedup();
         let texts: Vec<String> = keys.iter().map(|(_, key)| key.replace('_', " ")).collect();
@@ -967,251 +824,99 @@ async fn commit_batches(
         for ((entity_id, key), embedding) in keys.into_iter().zip(embeddings) {
             by_entity.entry(entity_id).or_default().push((key, embedding));
         }
-        let tenant_canon = tenant.clone();
         let predicate_tau = state.config.ingest.predicate_canon_tau;
-        let canonical = tokio::task::spawn_blocking(move || {
-            let mut canonical = std::collections::HashMap::new();
-            for (entity_id, predicates) in by_entity {
-                let assigned =
-                    tenant_canon.canonicalize_predicates(&entity_id, &predicates, predicate_tau)?;
-                for (predicate, group) in assigned {
-                    canonical.insert((entity_id.clone(), predicate), group);
-                }
-            }
-            Ok::<_, anyhow::Error>(canonical)
-        })
-        .await
-        .map_err(anyhow::Error::from)
-        .and_then(|r| r)
-        .map_err(|err| {
-            tracing::error!(error = ?err, "predicate canonicalization failed");
-            EngineError::internal("ingest operation failed")
-        })?;
-        let mut regrouped = 0usize;
-        for fact in batches.fact_batch.iter_mut() {
-            if let Some(group) = canonical
-                .get(&(fact.entity_id.clone(), fact.fact_key.clone()))
-                .filter(|g| **g != fact.fact_key)
-            {
-                fact.predicate = fact.fact_key.replace('_', " ");
-                fact.fact_key = group.clone();
-                regrouped += 1;
-            }
-        }
-        diag.count(Feature::PredicateCanon.name(), regrouped);
+        batches.predicate_canon_batch = by_entity;
+        batches.predicate_canon_tau = predicate_tau;
         diag.predicate_canon_ms = stage_start.elapsed().as_millis() as u64;
     }
 
-    // Fact registration + supersession
-    // Clone fact data for typed graph edges before drain consumes it.
-    let facts_for_edges: Vec<FactRegistration> = batches.fact_batch.clone();
-    if !batches.fact_batch.is_empty() {
-        let stage_start = Instant::now();
-        let mut by_entity: std::collections::HashMap<String, Vec<FactRegistration>> =
-            std::collections::HashMap::new();
-        for item in batches.fact_batch.drain(..) {
-            by_entity.entry(item.entity_id.clone()).or_default().push(item);
-        }
-
-        #[derive(Default)]
-        struct FactSideEffects {
-            card_updates: Vec<(String, bool, u64)>,
-        }
-
-        let tenant_fact = tenant.clone();
-        let fact_side_effects: Vec<EngineResult<FactSideEffects>> =
-            tokio::task::spawn_blocking(move || {
-                by_entity
-                    .into_iter()
-                    .map(|(entity_id, registrations)| {
-                        let mut se = FactSideEffects::default();
-                        let items: Vec<(&str, u64, &str, &str, &str, &str)> = registrations
-                            .iter()
-                            .map(|r| {
-                                (
-                                    r.fact_key.as_str(),
-                                    r.timestamp,
-                                    r.memory_id.as_str(),
-                                    r.subject.as_str(),
-                                    r.predicate.as_str(),
-                                    r.object.as_str(),
-                                )
-                            })
-                            .collect();
-                        let statuses =
-                            tenant_fact.register_fact_versions_batch(&entity_id, &items).map_err(
-                                |_write_error| EngineError::internal("ingest operation failed"),
-                            )?;
-
-                        let mut graph_status_batch = Vec::new();
-
-                        for (status, reg) in statuses.iter().zip(registrations.iter()) {
-                            match status {
-                                FactVersionStatus::Current { superseded: Some((_, old_id)) } => {
-                                    se.card_updates.push((old_id.clone(), false, reg.timestamp));
-                                    se.card_updates.push((
-                                        reg.memory_id.clone(),
-                                        true,
-                                        reg.timestamp,
-                                    ));
-                                    graph_status_batch.push(GraphEdgeEntry {
-                                        memory_id: reg.memory_id.as_str(),
-                                        subject: reg.subject.as_str(),
-                                        predicate: reg.predicate.as_str(),
-                                        object: reg.object.as_str(),
-                                        status: "current",
-                                        ref_info: Some((
-                                            EdgeType::Supersedes.as_str(),
-                                            old_id.as_str(),
-                                        )),
-                                        timestamp: reg.timestamp,
-                                    });
-                                    graph_status_batch.push(GraphEdgeEntry {
-                                        memory_id: old_id.as_str(),
-                                        subject: reg.subject.as_str(),
-                                        predicate: reg.predicate.as_str(),
-                                        object: reg.object.as_str(),
-                                        status: "stale",
-                                        ref_info: Some((
-                                            EdgeType::SupersededBy.as_str(),
-                                            reg.memory_id.as_str(),
-                                        )),
-                                        timestamp: reg.timestamp,
-                                    });
-                                }
-                                FactVersionStatus::Stale { current: (_, cur_id) } => {
-                                    se.card_updates.push((
-                                        reg.memory_id.clone(),
-                                        false,
-                                        reg.timestamp,
-                                    ));
-                                    graph_status_batch.push(GraphEdgeEntry {
-                                        memory_id: reg.memory_id.as_str(),
-                                        subject: reg.subject.as_str(),
-                                        predicate: reg.predicate.as_str(),
-                                        object: reg.object.as_str(),
-                                        status: "stale",
-                                        ref_info: Some((
-                                            EdgeType::SupersededBy.as_str(),
-                                            cur_id.as_str(),
-                                        )),
-                                        timestamp: reg.timestamp,
-                                    });
-                                }
-                                // A restatement confirms the version it
-                                // matches; nothing about the chain changed.
-                                FactVersionStatus::Confirmed { .. } => {}
-                                FactVersionStatus::Current { superseded: None } => {
-                                    se.card_updates.push((
-                                        reg.memory_id.clone(),
-                                        true,
-                                        reg.timestamp,
-                                    ));
-                                    graph_status_batch.push(GraphEdgeEntry {
-                                        memory_id: reg.memory_id.as_str(),
-                                        subject: reg.subject.as_str(),
-                                        predicate: reg.predicate.as_str(),
-                                        object: reg.object.as_str(),
-                                        status: "current",
-                                        ref_info: None,
-                                        timestamp: reg.timestamp,
-                                    });
-                                }
-                            }
-                        }
-
-                        if !graph_status_batch.is_empty() {
-                            tenant_fact
-                                .graph_upsert_fact_status_batch(&entity_id, &graph_status_batch)
-                                .map_err(|_write_error| {
-                                    EngineError::internal("ingest operation failed")
-                                })?;
-                        }
-
-                        Ok(se)
-                    })
-                    .collect()
+    let storage_batches = crate::storage::repo::ingest::IngestBatches {
+        observations: std::mem::take(&mut batches.observations),
+        fts_batch: std::mem::take(&mut batches.fts_batch),
+        memory_card_batch: std::mem::take(&mut batches.memory_card_batch),
+        memory_card_latest_updates: std::mem::take(&mut batches.memory_card_latest_updates),
+        session_router_updates: std::mem::take(&mut batches.session_router_updates),
+        preference_batch: std::mem::take(&mut batches.preference_batch),
+        memory_links_batch: std::mem::take(&mut batches.memory_links_batch),
+        predicate_canon_batch: std::mem::take(&mut batches.predicate_canon_batch),
+        predicate_canon_tau: batches.predicate_canon_tau,
+        fact_batch: std::mem::take(&mut batches.fact_batch)
+            .into_iter()
+            .map(|fact| crate::storage::repo::ingest::IngestFactRegistration {
+                entity_id: fact.entity_id,
+                fact_key: fact.fact_key,
+                timestamp: fact.timestamp,
+                memory_id: fact.memory_id,
+                subject: fact.subject,
+                predicate: fact.predicate,
+                object: fact.object,
             })
+            .collect(),
+    };
+
+    let storage_start = Instant::now();
+    let tenant_for_commit = tenant.clone();
+    let outcome =
+        tokio::task::spawn_blocking(move || tenant_for_commit.commit_ingest(&storage_batches))
             .await
-            .map_err(|e| {
-                tracing::error!("fact supersession spawn panic: {:?}", e);
+            .map_err(anyhow::Error::from)
+            .and_then(|result| result)
+            .map_err(|err| {
+                tracing::error!(error = ?err, "atomic ingest commit failed");
                 EngineError::internal("ingest operation failed")
             })?;
+    (diag.storage_ms, diag.storage_us) = elapsed_ms_and_us(storage_start);
 
-        for result in fact_side_effects {
-            match result {
-                Ok(se) => {
-                    batches.memory_card_latest_updates.extend(se.card_updates);
+    let fts_batch = outcome.fts_batch;
+    let vector_batch = outcome.vector_batch;
+    let indexed_memory_ids = outcome.indexed_memory_ids;
+    let (res_fts, res_vix) = tokio::join!(
+        tokio::task::spawn_blocking({
+            let tenant = tenant.clone();
+            move || -> anyhow::Result<Duration> {
+                let start = Instant::now();
+                if !fts_batch.is_empty() {
+                    tenant.fts_index_batch(&fts_batch)?;
                 }
-                Err(e) => return Err(e),
+                Ok(start.elapsed())
             }
-        }
-
-        (diag.fact_ms, diag.fact_us) = elapsed_ms_and_us(stage_start);
-    }
-
-    // Typed graph edges from memory cards and fact registrations; they feed
-    // the entity-graph retrieval lane.
-    if state.config.features.enabled(Feature::GraphEdges) {
-        let stage_start = Instant::now();
-        let tenant = tenant.clone();
-        let cards = batches.memory_card_batch.clone();
-        let written = tokio::task::spawn_blocking(move || {
-            let edges: Vec<(&str, &str, &str, &str, u64)> = cards
-                .iter()
-                .map(|c| {
-                    (
-                        c.source_memory_id.as_str(),
-                        c.subject.as_str(),
-                        c.predicate.as_str(),
-                        c.object.as_str(),
-                        c.created_at_ms,
-                    )
-                })
-                .chain(facts_for_edges.iter().map(|f| {
-                    (
-                        f.memory_id.as_str(),
-                        f.subject.as_str(),
-                        f.predicate.as_str(),
-                        f.object.as_str(),
-                        f.timestamp,
-                    )
-                }))
-                .collect();
-            tenant.graph_insert_edges_batch(&edges)
+        }),
+        tokio::task::spawn_blocking({
+            let tenant = tenant.clone();
+            move || -> anyhow::Result<Duration> {
+                let start = Instant::now();
+                if !vector_batch.is_empty() {
+                    let vectors = tenant.vectors()?;
+                    for (entity_id, items) in vector_batch {
+                        vectors.insert_batch(&entity_id, &items)?;
+                    }
+                }
+                Ok(start.elapsed())
+            }
         })
-        .await
-        .map_err(anyhow::Error::from)
-        .and_then(|r| r)
-        .map_err(|err| {
-            tracing::error!(error = ?err, "typed graph edge insert failed");
-            EngineError::internal("ingest operation failed")
-        })?;
-        diag.count(Feature::GraphEdges.name(), written);
-        (diag.graph_ms, diag.graph_us) = elapsed_ms_and_us(stage_start);
-    }
-
-    // Card latest updates
-    if !batches.memory_card_latest_updates.is_empty() {
-        let stage_start = Instant::now();
-        let tenant_cl = tenant.clone();
-        let updates = batches.memory_card_latest_updates.clone();
-        tokio::task::spawn_blocking(move || tenant_cl.set_memory_card_latest_batch(&updates))
-            .await
-            .map_err(|e| {
-                tracing::error!("card_latest spawn panic: {:?}", e);
+    );
+    let join_stage =
+        |stage: &'static str, result: Result<anyhow::Result<Duration>, tokio::task::JoinError>| {
+            result.map_err(anyhow::Error::from).and_then(|value| value).map_err(|err| {
+                tracing::error!(stage, error = ?err, "ingest indexing stage failed");
                 EngineError::internal("ingest operation failed")
-            })?
-            .map_err(|e| {
-                tracing::error!("card_latest write failed: {:?}", e);
-                EngineError::internal("ingest operation failed")
-            })?;
-        diag.card_latest_ms = stage_start.elapsed().as_millis() as u64;
-    }
+            })
+        };
+    let res_fts = join_stage("fts", res_fts)?;
+    let res_vix = join_stage("vector", res_vix)?;
+    diag.fts_ms = res_fts.as_millis() as u64;
+    diag.fts_us = res_fts.as_micros() as u64;
+    diag.vector_ms = res_vix.as_millis() as u64;
+    diag.vector_us = res_vix.as_micros() as u64;
 
+    let mark_start = Instant::now();
+    tenant.mark_indexed(&indexed_memory_ids).map_err(|err| {
+        tracing::error!(error = ?err, "marking indexed memories failed");
+        EngineError::internal("ingest operation failed")
+    })?;
+    diag.storage_ms += mark_start.elapsed().as_millis() as u64;
     Ok(())
 }
-
 fn build_memory_card_from_payload(
     payload: &IngestPayload,
     kind: MemoryKind,
@@ -1729,24 +1434,10 @@ async fn execute_ingest_pipeline(
         state.config.heuristics,
     )?;
 
-    let batch_items: Vec<(u64, String, AgentObservation)> = prepared
-        .iter()
-        .map(|record| {
-            (record.payload.timestamp, record.payload.memory_id.clone(), record.obs.clone())
-        })
-        .collect();
-
     tracing::debug!("[CP] dedup_done: μs={}", total_start.elapsed().as_micros());
 
-    let stage_start = Instant::now();
-    let inserted_flags = tenant.insert_observations_batch(&batch_items).map_err(|e| {
-        tracing::warn!("Batch Storage Error: {:?}", e);
-        EngineError::internal("ingest operation failed")
-    })?;
-    (diag.storage_ms, diag.storage_us) = elapsed_ms_and_us(stage_start);
-
     // Phase 4: Artifact building
-    let mut batches = build_artifacts(prepared, inserted_flags, &mut diag, features);
+    let mut batches = build_artifacts(prepared, &mut diag, features);
 
     // Phase 5: Storage commit
     commit_batches(tenant, state, &mut batches, &mut diag).await?;

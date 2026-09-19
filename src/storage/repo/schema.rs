@@ -16,7 +16,8 @@ impl TenantStore {
                 session_id TEXT NOT NULL DEFAULT '',
                 turn_index INTEGER NOT NULL DEFAULT 0,
                 role TEXT NOT NULL DEFAULT '',
-                parent_memory_id TEXT
+                parent_memory_id TEXT,
+                indexed INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_memories_entity ON memories(entity_id);
             CREATE INDEX IF NOT EXISTS idx_memories_memory_id ON memories(memory_id);
@@ -287,10 +288,15 @@ impl TenantStore {
             ("turn_index", "ALTER TABLE memories ADD COLUMN turn_index INTEGER NOT NULL DEFAULT 0"),
             ("role", "ALTER TABLE memories ADD COLUMN role TEXT NOT NULL DEFAULT ''"),
             ("parent_memory_id", "ALTER TABLE memories ADD COLUMN parent_memory_id TEXT"),
+            ("indexed", "ALTER TABLE memories ADD COLUMN indexed INTEGER NOT NULL DEFAULT 0"),
         ] {
             if !Self::has_column(conn, "memories", column)? {
                 conn.execute_batch(ddl)?;
             }
+        }
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version < 4 {
+            conn.execute("UPDATE memories SET indexed = 1", [])?;
         }
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_memories_session_turn
@@ -334,7 +340,6 @@ impl TenantStore {
              DROP TABLE IF EXISTS artifact_versions;",
         )?;
 
-        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version < 3 {
             // The v3 FTS rebuild supersedes the v2 rowid rewrite because it
             // drops the table and re-ingest restores its contents.

@@ -110,7 +110,7 @@ pub(crate) fn fts_rowid(key: &str) -> i64 {
 }
 
 /// Schema version recorded in `PRAGMA user_version`.
-pub(crate) const SCHEMA_VERSION: i64 = 3;
+pub(crate) const SCHEMA_VERSION: i64 = 4;
 
 impl TenantStore {
     pub fn new(path: &Path) -> Result<Self> {
@@ -188,12 +188,12 @@ impl TenantStore {
                 tx.prepare_cached("SELECT rowid FROM memories WHERE memory_id = ?1")?;
             let mut update_stmt = tx.prepare_cached(
                 "UPDATE memories SET content = ?1, kind = ?2, created_at_ms = ?3, entity_id = ?4, content_hash = ?5,
-                 session_id = ?7, turn_index = ?8, role = ?9, parent_memory_id = ?10 WHERE rowid = ?6",
+                 session_id = ?7, turn_index = ?8, role = ?9, parent_memory_id = ?10, indexed = 0 WHERE rowid = ?6",
             )?;
             let mut insert_stmt = tx.prepare_cached(
                 "INSERT INTO memories (memory_id, entity_id, content, kind, content_hash, created_at_ms,
-                                       session_id, turn_index, role, parent_memory_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                                       session_id, turn_index, role, parent_memory_id, indexed)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0)",
             )?;
             let mut vec_stmt = tx.prepare_cached(
                 "INSERT OR REPLACE INTO vector_lookup (vector_id, memory_id, entity_id, timestamp_ms, embedding)

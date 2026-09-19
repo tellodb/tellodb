@@ -156,60 +156,66 @@ impl TenantStore {
         predicates: &[(String, Vec<f32>)],
         tau: f32,
     ) -> Result<HashMap<String, String>> {
-        let mut assigned = HashMap::with_capacity(predicates.len());
         if predicates.is_empty() {
-            return Ok(assigned);
+            return Ok(HashMap::new());
         }
         let mut conn = self.get_conn()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        {
-            let mut known = tx.prepare_cached(
-                "SELECT canonical FROM predicate_canon WHERE entity_id = ?1 AND predicate = ?2",
-            )?;
-            let mut groups = tx.prepare_cached(
-                "SELECT canonical, embedding FROM predicate_canon
-                 WHERE entity_id = ?1 AND predicate = canonical AND embedding IS NOT NULL",
-            )?;
-            let mut insert = tx.prepare_cached(
-                "INSERT OR REPLACE INTO predicate_canon (entity_id, predicate, canonical, embedding)
-                 VALUES (?1, ?2, ?3, ?4)",
-            )?;
-            for (predicate, embedding) in predicates {
-                match known.query_row(params![entity_id, predicate], |row| row.get::<_, String>(0))
-                {
-                    Ok(canonical) => {
-                        assigned.insert(predicate.clone(), canonical);
-                        continue;
-                    }
-                    Err(rusqlite::Error::QueryReturnedNoRows) => {}
-                    Err(err) => return Err(err.into()),
-                }
-                let mut best: Option<(String, f32)> = None;
-                let candidates = groups.query_map(params![entity_id], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-                })?;
-                for candidate in candidates {
-                    let (canonical, bytes) = candidate?;
-                    let other = bytes_to_vec_f32(&bytes);
-                    if other.len() != embedding.len() {
-                        continue;
-                    }
-                    let similarity = crate::ml::cosine_similarity(embedding, &other);
-                    if similarity >= tau && best.as_ref().map_or(true, |(_, s)| similarity > *s) {
-                        best = Some((canonical, similarity));
-                    }
-                }
-                let canonical = match best {
-                    Some((canonical, _)) => canonical,
-                    None => predicate.clone(),
-                };
-                let stored_embedding =
-                    (canonical == *predicate).then(|| vec_f32_to_bytes(embedding));
-                insert.execute(params![entity_id, predicate, canonical, stored_embedding])?;
-                assigned.insert(predicate.clone(), canonical);
-            }
-        }
+        let assigned = Self::canonicalize_predicates_tx(&tx, entity_id, predicates, tau)?;
         tx.commit()?;
+        Ok(assigned)
+    }
+
+    pub(crate) fn canonicalize_predicates_tx(
+        tx: &rusqlite::Transaction<'_>,
+        entity_id: &str,
+        predicates: &[(String, Vec<f32>)],
+        tau: f32,
+    ) -> Result<HashMap<String, String>> {
+        let mut assigned = HashMap::with_capacity(predicates.len());
+        let mut known = tx.prepare_cached(
+            "SELECT canonical FROM predicate_canon WHERE entity_id = ?1 AND predicate = ?2",
+        )?;
+        let mut groups = tx.prepare_cached(
+            "SELECT canonical, embedding FROM predicate_canon
+             WHERE entity_id = ?1 AND predicate = canonical AND embedding IS NOT NULL",
+        )?;
+        let mut insert = tx.prepare_cached(
+            "INSERT OR REPLACE INTO predicate_canon (entity_id, predicate, canonical, embedding)
+             VALUES (?1, ?2, ?3, ?4)",
+        )?;
+        for (predicate, embedding) in predicates {
+            match known.query_row(params![entity_id, predicate], |row| row.get::<_, String>(0)) {
+                Ok(canonical) => {
+                    assigned.insert(predicate.clone(), canonical);
+                    continue;
+                }
+                Err(rusqlite::Error::QueryReturnedNoRows) => {}
+                Err(err) => return Err(err.into()),
+            }
+            let mut best: Option<(String, f32)> = None;
+            let candidates = groups.query_map(params![entity_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?;
+            for candidate in candidates {
+                let (canonical, bytes) = candidate?;
+                let other = bytes_to_vec_f32(&bytes);
+                if other.len() != embedding.len() {
+                    continue;
+                }
+                let similarity = crate::ml::cosine_similarity(embedding, &other);
+                if similarity >= tau && best.as_ref().map_or(true, |(_, s)| similarity > *s) {
+                    best = Some((canonical, similarity));
+                }
+            }
+            let canonical = match best {
+                Some((canonical, _)) => canonical,
+                None => predicate.clone(),
+            };
+            let stored_embedding = (canonical == *predicate).then(|| vec_f32_to_bytes(embedding));
+            insert.execute(params![entity_id, predicate, canonical, stored_embedding])?;
+            assigned.insert(predicate.clone(), canonical);
+        }
         Ok(assigned)
     }
 
@@ -333,6 +339,127 @@ impl TenantStore {
             }
         }
         tx.commit()?;
+        Ok(statuses)
+    }
+
+    pub(crate) fn register_fact_versions_tx(
+        tx: &rusqlite::Transaction<'_>,
+        entity_id: &str,
+        registrations: &[(&str, u64, &str, &str, &str, &str)],
+        recorded_at: u64,
+    ) -> Result<Vec<FactVersionStatus>> {
+        let mut statuses = Vec::with_capacity(registrations.len());
+        {
+            let mut insert = tx.prepare_cached(
+                "INSERT INTO fact_versions (fact_key, memory_id, entity_id, subject, predicate, object, status, timestamp_ms, valid_from_ms, recorded_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'current', ?7, ?7, ?8)
+                 ON CONFLICT(fact_key, memory_id) DO NOTHING",
+            )?;
+            let mut latest_stmt = tx.prepare_cached(
+                "SELECT memory_id, timestamp_ms FROM fact_versions
+                 WHERE fact_key = ?1 AND entity_id = ?2 AND status = 'current'",
+            )?;
+            let mut chain_stmt = tx.prepare_cached(
+                "SELECT memory_id, timestamp_ms, COALESCE(object, '') FROM fact_versions
+                 WHERE fact_key = ?1 AND entity_id = ?2
+                 ORDER BY timestamp_ms ASC, rowid DESC",
+            )?;
+            let mut evidence = tx.prepare_cached(
+                "INSERT OR IGNORE INTO fact_evidence
+                     (fact_key, entity_id, version_memory_id, memory_id, timestamp_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            let mut update = tx.prepare_cached(
+                "UPDATE fact_versions
+                 SET status = ?1, valid_from_ms = ?2, valid_to_ms = ?3, superseded_by = ?4, supersedes = ?5
+                 WHERE fact_key = ?6 AND memory_id = ?7",
+            )?;
+
+            for (fact_key, ts, memory_id, subject, predicate, object) in registrations {
+                // A memory that restates the value already covering its
+                // timestamp confirms that version instead of starting a new
+                // one, so repeating "I live in Seattle" does not look like a
+                // change of residence.
+                let existing: Vec<(String, u64, String)> = chain_stmt
+                    .query_map(params![fact_key, entity_id], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)? as u64,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<_>>()?;
+                let covering = existing
+                    .iter()
+                    .rev()
+                    .find(|(_, version_ts, _)| version_ts <= ts)
+                    .or_else(|| existing.first());
+                if let Some((version_id, version_ts, version_object)) = covering {
+                    if version_id != memory_id && same_fact_object(version_object, object) {
+                        evidence.execute(params![
+                            fact_key, entity_id, version_id, memory_id, *ts as i64
+                        ])?;
+                        statuses.push(FactVersionStatus::Confirmed {
+                            version: (*version_ts, version_id.clone()),
+                        });
+                        continue;
+                    }
+                }
+
+                let previous_latest: Option<(String, u64)> = match latest_stmt
+                    .query_row(params![fact_key, entity_id], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+                    }) {
+                    Ok(latest) => Some(latest),
+                    Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                    Err(err) => return Err(err.into()),
+                };
+
+                insert.execute(params![
+                    fact_key,
+                    memory_id,
+                    entity_id,
+                    subject,
+                    predicate,
+                    object,
+                    *ts as i64,
+                    recorded_at
+                ])?;
+
+                evidence.execute(params![fact_key, entity_id, memory_id, memory_id, *ts as i64])?;
+
+                let chain: Vec<(String, u64)> = chain_stmt
+                    .query_map(params![fact_key, entity_id], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+                    })?
+                    .collect::<rusqlite::Result<_>>()?;
+                for (idx, (version_id, version_ts)) in chain.iter().enumerate() {
+                    let next = chain.get(idx + 1);
+                    let prev = idx.checked_sub(1).map(|p| &chain[p]);
+                    update.execute(params![
+                        if next.is_none() { "current" } else { "stale" },
+                        *version_ts as i64,
+                        next.map(|(_, next_ts)| *next_ts as i64),
+                        next.map(|(next_id, _)| next_id.as_str()),
+                        prev.map(|(prev_id, _)| prev_id.as_str()),
+                        fact_key,
+                        version_id,
+                    ])?;
+                }
+
+                let (latest_id, latest_ts) = chain.last().expect("chain contains the new version");
+                statuses.push(if latest_id == memory_id {
+                    FactVersionStatus::Current {
+                        superseded: previous_latest
+                            .filter(|(id, _)| id != *memory_id)
+                            .map(|(id, t)| (t, id)),
+                    }
+                } else {
+                    FactVersionStatus::Stale { current: (*latest_ts, latest_id.clone()) }
+                });
+            }
+        }
+
         Ok(statuses)
     }
 

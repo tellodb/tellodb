@@ -4,6 +4,7 @@ pub mod entities;
 pub mod facts;
 pub mod fts;
 pub mod graph;
+pub mod ingest;
 pub mod memories;
 pub mod prefs;
 pub mod schema;
