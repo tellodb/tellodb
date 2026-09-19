@@ -39,6 +39,9 @@ benchmarks/ranking_tuner/*
 __pycache__/
 *.pyc
 
-# Benchmark run outputs (regenerate with benchmarks/run_baseline.sh / run_matrix.sh)
-/benchmarks/runs/
+# Benchmark run outputs. Smoke runs are cheap and regenerate locally; dev- and
+# paper-tier records are the evidence behind published numbers and cost GPU
+# hours on a rented box, so they are tracked. Engine logs are server noise.
+/benchmarks/runs/*_smoke*/
+/benchmarks/runs/**/engine.log
 /benchmarks/snapshots/
