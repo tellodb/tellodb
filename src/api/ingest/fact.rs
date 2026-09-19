@@ -3,6 +3,7 @@ use crate::api::utils::{
     extract_named_phrases, extract_temporal_terms, has_token, normalize_alpha_tokens,
     normalize_fact_text, singularize_token,
 };
+use crate::core::memory_id::MemoryId;
 use crate::heuristics::{benchmark_tuned_rules, Profile};
 
 use super::dialogue::strip_leading_bracketed_prefixes;
@@ -388,10 +389,7 @@ fn build_cards_from_facts(
             };
             IngestPayload {
                 entity_id: payload.entity_id.clone(),
-                memory_id: crate::api::utils::derived_memory_id(
-                    &payload.memory_id,
-                    &format!("card{card_idx}"),
-                ),
+                memory_id: MemoryId::derived_from(&payload.memory_id, &format!("card{card_idx}")),
                 timestamp: payload.timestamp,
                 textual_content: text,
                 relations: payload.relations.clone(),

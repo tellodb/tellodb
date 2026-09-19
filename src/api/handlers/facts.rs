@@ -1,10 +1,7 @@
 //! `GET /facts/current` and `GET /facts/history`: what a fact's value is now,
 //! what it was at a point in time, and how it changed.
 
-use crate::api::auth::{
-    principal_namespace_prefix, principal_user_id, record_usage_for_principal, scope_entity_id,
-    RequestPrincipal,
-};
+use crate::api::auth::{principal_user_id, record_usage_for_principal, RequestPrincipal};
 use crate::api::EngineState;
 use axum::extract::{Extension, Query, State};
 use axum::http::StatusCode;
@@ -29,7 +26,6 @@ fn scope(
     principal: &RequestPrincipal,
     requested: Option<&str>,
 ) -> Result<(std::sync::Arc<crate::storage::TenantStore>, String), StatusCode> {
-    let ns_prefix = principal_namespace_prefix(principal);
     let tenant_id = principal_user_id(principal).unwrap_or("default");
     let tenant = state.tenant_store(tenant_id).map_err(|err| {
         tracing::error!(error = ?err, tenant_id, "fact lookup tenant open failed");
@@ -37,8 +33,7 @@ fn scope(
     })?;
     let entity_id = requested
         .filter(|e| !e.trim().is_empty())
-        .map(|e| scope_entity_id(e, ns_prefix.as_deref()))
-        .or_else(|| ns_prefix.as_deref().map(|p| p.trim_end_matches(':').to_string()))
+        .map(str::to_string)
         .ok_or(StatusCode::BAD_REQUEST)?;
     Ok((tenant, entity_id))
 }

@@ -1,13 +1,10 @@
-use crate::api::auth::{
-    principal_namespace_prefix, principal_user_id, record_usage_for_principal, scope_entity_id,
-    RequestPrincipal,
-};
+use crate::api::auth::{principal_user_id, record_usage_for_principal, RequestPrincipal};
 use crate::api::plan::*;
 use crate::api::types::RankedItem;
 use crate::api::types::{
     AnalyticsQueryPayload, AnalyticsQueryResult, BucketedResult, EvidenceCard, GraphExportPayload,
     GraphQueryPayload, GraphWalkPayload, ProofCheck, ProofPacket, ProofTurn, QueryPayload,
-    QueryResult,
+    QueryResult, ResultOrigin,
 };
 use crate::api::utils::{
     apply_decay_with_policy, clip_profile_to_budget, cosine_similarity_from_distance,
@@ -17,6 +14,7 @@ use crate::api::utils::{
 };
 use crate::api::{EngineState, PlatformWriteOp};
 use crate::config::{RerankPolicy, RetrievalProfile};
+use crate::core::memory_id::{MemoryId, Tag};
 use crate::features::Feature;
 use crate::metrics;
 use crate::ml::cosine_similarity;
@@ -178,7 +176,6 @@ pub async fn query_handler(
     Extension(principal): Extension<RequestPrincipal>,
     Json(payload): Json<QueryPayload>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let ns_prefix = principal_namespace_prefix(&principal);
     let tenant_id = principal_user_id(&principal).unwrap_or("default");
     let tenant = state.tenant_store(tenant_id).map_err(|e| {
         tracing::warn!("Failed to get tenant store: {:?}", e);
@@ -186,13 +183,6 @@ pub async fn query_handler(
     })?;
     let profile_query_text = payload.textual_query.clone();
 
-    let mut payload = payload;
-    if let Some(ref p) = ns_prefix {
-        payload.entity_id = Some(match payload.entity_id {
-            Some(eid) => scope_entity_id(&eid, Some(p.as_str())),
-            None => p.trim_end_matches(':').to_string(),
-        });
-    }
     let limit = payload.limit.max(1);
     let enable_neural_rerank = payload.enable_neural_rerank.unwrap_or(false);
 
@@ -250,6 +240,7 @@ pub async fn query_handler(
                 superseded_by: None,
                 why_stale: None,
                 stability_score: None,
+                origin: ResultOrigin::Stored,
             },
         );
     }
@@ -396,10 +387,6 @@ pub async fn query_handler(
         metrics::observe_query_duration(diagnostics.total_ms as f64 / 1000.0);
     }
     Ok((StatusCode::OK, h, Json(results)))
-}
-
-fn is_synthetic_query_memory(memory_id: &str) -> bool {
-    memory_id.split("::").nth(3) == Some("sq")
 }
 
 fn deterministic_subqueries(query: &str) -> Vec<String> {
@@ -1024,17 +1011,10 @@ fn parse_graph_direction_str(direction: Option<&str>) -> &'static str {
     }
 }
 
-fn scoped_graph_node_id(
-    principal: &crate::api::auth::RequestPrincipal,
-    requested: Option<String>,
-) -> Result<String, StatusCode> {
-    let ns_prefix = principal_namespace_prefix(principal);
+fn scoped_graph_node_id(requested: Option<String>) -> Result<String, StatusCode> {
     let node_id = match requested {
-        Some(id) if !id.trim().is_empty() => scope_entity_id(id.trim(), ns_prefix.as_deref()),
-        None => ns_prefix
-            .as_deref()
-            .map(|prefix| prefix.trim_end_matches(':').to_string())
-            .ok_or(StatusCode::BAD_REQUEST)?,
+        Some(id) if !id.trim().is_empty() => id.trim().to_string(),
+        None => return Err(StatusCode::BAD_REQUEST),
         _ => return Err(StatusCode::BAD_REQUEST),
     };
     Ok(node_id)
@@ -1045,12 +1025,11 @@ pub async fn graph_query_handler(
     Extension(principal): Extension<RequestPrincipal>,
     Json(payload): Json<GraphQueryPayload>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    // If subject is provided, scope it. If not, fallback to scoping the requested user_id.
+    // If subject is provided, use it. If not, use the requested user_id.
     let subject = if !payload.subject.trim().is_empty() {
-        let ns_prefix = principal_namespace_prefix(&principal);
-        scope_entity_id(payload.subject.trim(), ns_prefix.as_deref())
+        payload.subject.trim().to_string()
     } else {
-        scoped_graph_node_id(&principal, payload.user_id)?
+        scoped_graph_node_id(payload.user_id)?
     };
 
     let tenant_id = crate::api::auth::principal_user_id(&principal).unwrap_or("default");
@@ -1077,10 +1056,9 @@ pub async fn graph_walk_handler(
     Json(payload): Json<GraphWalkPayload>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let node = if !payload.node.trim().is_empty() {
-        let ns_prefix = principal_namespace_prefix(&principal);
-        scope_entity_id(payload.node.trim(), ns_prefix.as_deref())
+        payload.node.trim().to_string()
     } else {
-        scoped_graph_node_id(&principal, payload.user_id)?
+        scoped_graph_node_id(payload.user_id)?
     };
 
     let tenant_id = crate::api::auth::principal_user_id(&principal).unwrap_or("default");
@@ -1109,10 +1087,9 @@ pub async fn graph_export_handler(
     Json(payload): Json<GraphExportPayload>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let seed = if !payload.seed.trim().is_empty() {
-        let ns_prefix = principal_namespace_prefix(&principal);
-        scope_entity_id(payload.seed.trim(), ns_prefix.as_deref())
+        payload.seed.trim().to_string()
     } else {
-        scoped_graph_node_id(&principal, payload.user_id)?
+        scoped_graph_node_id(payload.user_id)?
     };
 
     let tenant_id = crate::api::auth::principal_user_id(&principal).unwrap_or("default");
@@ -1140,10 +1117,7 @@ pub async fn analytics_query_handler(
     Extension(principal): Extension<RequestPrincipal>,
     Json(payload): Json<AnalyticsQueryPayload>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let ns_prefix = principal_namespace_prefix(&principal);
     let user_id = crate::api::auth::principal_user_id(&principal).unwrap_or("default");
-    let mut payload = payload;
-    payload.entity_id = scope_entity_id(&payload.entity_id, ns_prefix.as_deref());
     let s = payload.start_timestamp_ms.unwrap_or(0);
     let e = payload.end_timestamp_ms.unwrap_or(u64::MAX);
 
@@ -2490,7 +2464,7 @@ fn score_loop(s: &mut QueryPipelineState) -> Vec<EvidenceCard> {
     let session_route_scores = &s.session_route_scores;
 
     for (mid, ts, rrf_score) in &s.fused {
-        if is_synthetic_query_memory(mid) {
+        if MemoryId::parse(mid).ok().is_some_and(|id| id.tags().contains(&Tag::SyntheticQuery)) {
             continue;
         }
         let Some(obs) = observations.get(mid) else {
@@ -2727,7 +2701,11 @@ fn score_build_response(
         if let Ok(Some(fact_value)) = fact_value {
             let synthetic_score = 1.0e9_f32;
             let now_ms = s.now_ms;
-            let synthetic_id = format!("__pre_synth_fact::{}::{}", entity_id, fact_key);
+            let synthetic_id = MemoryId::new(entity_id.as_str(), "synthetic", 0)
+                .derived(Tag::SyntheticQuery)
+                .derived(Tag::Named("fact".to_string()))
+                .as_str()
+                .to_string();
             evidence_cards.push(EvidenceCard {
                 claim_text: format!("{}: {}", fact_key.replace('_', " "), fact_value),
                 source_memory_id: synthetic_id.clone(),
@@ -2781,7 +2759,9 @@ fn score_build_response(
         let second_score = evidence_cards[1].final_score;
         let delta = (top_score - second_score).abs();
         if delta < s.weights.ambiguity_delta_threshold
-            && !evidence_cards[0].source_memory_id.starts_with("__pre_synth_")
+            && !MemoryId::parse(&evidence_cards[0].source_memory_id)
+                .ok()
+                .is_some_and(|id| id.tags().contains(&Tag::SyntheticQuery))
         {
             let note = format!(
                 "AmbiguityPacket: top-2 candidates are within {:.3} of each other ({} vs {}); consider asking the user to disambiguate.",
@@ -2801,8 +2781,14 @@ fn score_build_response(
 
     // Pre-synthesized fact cards are extra context, not retrieved memories,
     // so they must not take slots from the requested `limit`.
-    let synthetic_cards =
-        evidence_cards.iter().filter(|c| c.source_memory_id.starts_with("__pre_synth_")).count();
+    let synthetic_cards = evidence_cards
+        .iter()
+        .filter(|c| {
+            MemoryId::parse(&c.source_memory_id)
+                .ok()
+                .is_some_and(|id| id.tags().contains(&Tag::SyntheticQuery))
+        })
+        .count();
     let selected = select_candidates_with_session_head(
         evidence_cards,
         s.limit + synthetic_cards,
@@ -2897,6 +2883,10 @@ fn score_build_response(
                 }
             }
 
+            let origin = MemoryId::parse(&card.source_memory_id)
+                .ok()
+                .filter(|id| id.tags().contains(&Tag::SyntheticQuery))
+                .map_or(ResultOrigin::Stored, |_| ResultOrigin::SynthesizedFact);
             QueryResult {
                 memory_id: card.source_memory_id.clone(),
                 entity_id: card.entity_id,
@@ -2912,6 +2902,7 @@ fn score_build_response(
                 superseded_by,
                 why_stale,
                 stability_score,
+                origin,
             }
         })
         .collect();
@@ -2930,13 +2921,17 @@ fn score_build_response(
     // card, surface its claim_text as a synthetic answer row at position 0
     // so the reader LLM receives the distilled claim verbatim.
     if let Some(top) = queries.first() {
-        if !top.memory_id.starts_with("__pre_synth_") {
+        if top.origin.is_stored() {
             if let Ok(Some(card)) = s.tenant.get_memory_card_by_source(&top.memory_id) {
                 if card.is_latest && card.confidence >= 0.70 {
                     // Dated like the memory it restates, so recency ordering holds.
                     let source_created_at_ms = top.created_at_ms;
                     let synthetic = QueryResult {
-                        memory_id: format!("__pre_synth_card::{}", card.card_id),
+                        memory_id: MemoryId::new(&card.entity_id, "synthetic", 0)
+                            .derived(Tag::SyntheticQuery)
+                            .derived(Tag::Named("card".to_string()))
+                            .as_str()
+                            .to_string(),
                         entity_id: card.entity_id.clone(),
                         session_id: card.source_session_id.clone(),
                         turn_index: top.turn_index,
@@ -2953,6 +2948,7 @@ fn score_build_response(
                         superseded_by: None,
                         why_stale: None,
                         stability_score: None,
+                        origin: ResultOrigin::SynthesizedCard,
                     };
                     queries.insert(0, synthetic);
                 }

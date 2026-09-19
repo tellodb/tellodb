@@ -132,23 +132,6 @@ pub fn principal_user_id(principal: &RequestPrincipal) -> Option<&str> {
     }
 }
 
-/// Prefix applied to entity and memory ids for this principal.
-///
-/// Always `None`: every user key already maps to its own tenant database
-/// (`principal_user_id`), so ids need no namespacing. The former
-/// `"{user_id}::"` prefix also broke the `entity::session::turn` id layout,
-/// making every platform user's session ids resolve to the entity name.
-pub fn principal_namespace_prefix(_principal: &RequestPrincipal) -> Option<String> {
-    None
-}
-
-pub fn scope_entity_id(entity_id: &str, prefix: Option<&str>) -> String {
-    match prefix {
-        Some(p) if !entity_id.starts_with(p) => format!("{}{}", p, entity_id),
-        _ => entity_id.to_string(),
-    }
-}
-
 pub fn authorize_global_api_key(headers: &HeaderMap, auth: &AuthConfig) -> Result<(), StatusCode> {
     let Some(expected) = auth.api_key.as_deref() else {
         return Ok(());
@@ -563,26 +546,6 @@ mod tests {
     fn request_bearer_token_missing_header() {
         let headers = HeaderMap::new();
         assert_eq!(request_bearer_token(&headers), None);
-    }
-
-    #[test]
-    fn scope_entity_id_with_prefix() {
-        assert_eq!(scope_entity_id("abc", Some("ns::")), "ns::abc");
-    }
-
-    #[test]
-    fn scope_entity_id_without_prefix() {
-        assert_eq!(scope_entity_id("abc", None), "abc");
-    }
-
-    #[test]
-    fn scope_entity_id_already_prefixed() {
-        assert_eq!(scope_entity_id("ns::abc", Some("ns::")), "ns::abc");
-    }
-
-    #[test]
-    fn scope_entity_id_empty_entity_id() {
-        assert_eq!(scope_entity_id("", Some("ns::")), "ns::");
     }
 
     #[test]

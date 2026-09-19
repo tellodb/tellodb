@@ -162,7 +162,7 @@ pub fn infer_content_type(payload: &IngestPayload) -> String {
 pub fn build_chunk_memory_id(payload: &IngestPayload, idx: usize) -> String {
     // Chunks used to be numbered `turn*100 + idx`, which reused real turn ids
     // (chunk 1 of turn 0 overwrote turn 1).
-    crate::api::utils::derived_memory_id(&payload.memory_id, &format!("c{idx}"))
+    crate::core::memory_id::MemoryId::derived_from(&payload.memory_id, &format!("c{idx}"))
 }
 
 pub fn expand_payload_for_content_type(payload: &IngestPayload) -> Vec<IngestPayload> {
@@ -501,8 +501,8 @@ mod moved_tests {
         let id = build_chunk_memory_id(&p, 0);
         assert_eq!(id, format!("{}::c0", p.memory_id));
         assert_eq!(
-            crate::api::utils::turn_index_from_memory_id(&id),
-            crate::api::utils::turn_index_from_memory_id(&p.memory_id)
+            crate::core::memory_id::MemoryId::parse(&id).unwrap().turn(),
+            crate::core::memory_id::MemoryId::parse(&p.memory_id).unwrap().turn()
         );
     }
 

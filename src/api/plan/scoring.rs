@@ -7,8 +7,9 @@ use super::types::{
 use crate::api::types::{EvidenceCard, QueryResult, RankedItem};
 use crate::api::utils::{
     dedupe_preserve_order, extract_named_phrases, extract_temporal_terms, has_token,
-    normalize_alpha_tokens, session_id_from_memory_id, singularize_token,
+    normalize_alpha_tokens, singularize_token,
 };
+use crate::core::memory_id::MemoryId;
 use crate::fts::tokenize_for_similarity;
 use crate::ml::QueryIntentClassifier;
 use crate::storage::MemoryKind;
@@ -90,7 +91,7 @@ pub fn compute_evidence_confidence(
 }
 
 pub fn routed_session_from_memory_id(memory_id: &str) -> Option<String> {
-    session_id_from_memory_id(memory_id)
+    MemoryId::parse(memory_id).ok().filter(|id| id.is_structured()).map(|id| id.session().clone())
 }
 
 pub fn extract_numeric_tokens(text: &str) -> Vec<f32> {
@@ -652,7 +653,7 @@ pub fn select_candidates_with_session_head(
         std::collections::BTreeMap::new();
     for candidate in candidates {
         let session_key = if candidate.source_session_id.is_empty() {
-            session_id_from_memory_id(&candidate.source_memory_id)
+            routed_session_from_memory_id(&candidate.source_memory_id)
                 .unwrap_or_else(|| candidate.source_memory_id.clone())
         } else {
             candidate.source_session_id.clone()

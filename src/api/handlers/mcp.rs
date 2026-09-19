@@ -2,9 +2,7 @@
 //! reached over HTTP with API-key auth and tenant scoping. The protocol and
 //! the tools live in [`crate::mcp_stdio`]; this module handles the request.
 
-use crate::api::auth::{
-    principal_namespace_prefix, principal_user_id, record_usage_for_principal, RequestPrincipal,
-};
+use crate::api::auth::{principal_user_id, record_usage_for_principal, RequestPrincipal};
 use crate::api::EngineState;
 use crate::db::Engine;
 use crate::mcp_stdio::McpServer;
@@ -42,10 +40,7 @@ pub async fn mcp_handler(
             return rpc_error(id, JSONRPC_INTERNAL_ERROR, "Failed to open tenant store");
         }
     };
-    // Memories of callers scoped to a namespace live under that prefix.
-    let default_entity = principal_namespace_prefix(&principal)
-        .map(|prefix| prefix.trim_end_matches(':').to_string())
-        .unwrap_or_else(|| "user".to_string());
+    let default_entity = "user".to_string();
 
     let server = McpServer::new(Engine::from_parts(state.clone(), tenant), default_entity);
     let response = server.handle(request).await;

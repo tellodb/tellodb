@@ -180,54 +180,6 @@ pub fn apply_decay_with_policy(
     apply_time_decay(base_score, age_days, half_life_days, floor)
 }
 
-pub fn session_id_from_memory_id(memory_id: &str) -> Option<String> {
-    let mut parts = memory_id.split("::");
-    let _entity = parts.next()?;
-    let session = parts.next()?;
-    Some(session.to_string())
-}
-
-/// Turn index of `entity::session::turn[::tag...]` (0 if absent). Derived
-/// records carry their source turn followed by a tag segment.
-pub fn turn_index_from_memory_id(memory_id: &str) -> usize {
-    memory_id.split("::").nth(2).and_then(|part| part.parse::<usize>().ok()).unwrap_or(0)
-}
-
-/// Id of a record derived from `parent` (chunk, companion, card, ...). The
-/// tag lives in its own `::` segment, so derived ids can never collide with
-/// source turns or with records derived from other turns, and every record
-/// derived from a memory shares the `"{parent}::"` prefix (used for cascading
-/// deletes).
-pub fn derived_memory_id(parent: &str, tag: &str) -> String {
-    format!("{parent}::{tag}")
-}
-
-/// Fills `session_id`/`turn_index` from a structured `entity::session::turn`
-/// memory id when the client did not send them explicitly.
-pub fn normalize_payload_identity(payload: &mut crate::api::types::IngestPayload) {
-    // Fall back to parsing `entity::session::turn` only for ids that follow
-    // that convention; opaque ids (UUIDs) carry identity in explicit fields.
-    let mut parts = payload.memory_id.split("::");
-    let follows_convention = parts.next() == Some(payload.entity_id.as_str());
-    let parsed_session = parts.next().filter(|s| follows_convention && !s.is_empty());
-    let parsed_turn =
-        parts.next().filter(|_| follows_convention).and_then(|t| t.parse::<u32>().ok());
-    if payload.session_id.as_deref().map_or(true, str::is_empty) {
-        payload.session_id = parsed_session.map(str::to_string);
-    }
-    if payload.turn_index.is_none() {
-        payload.turn_index = parsed_turn;
-    }
-}
-
-pub fn split_memory_id(memory_id: &str) -> Option<(&str, &str, usize)> {
-    let mut parts = memory_id.split("::");
-    let entity_id = parts.next()?;
-    let session_id = parts.next()?;
-    let turn_index = parts.next()?.parse::<usize>().ok()?;
-    Some((entity_id, session_id, turn_index))
-}
-
 pub fn normalize_fact_text(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -745,39 +697,6 @@ pub fn extract_named_phrases(lines: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    fn identity_payload(entity: &str, memory_id: &str) -> crate::api::types::IngestPayload {
-        crate::api::types::IngestPayload {
-            entity_id: entity.into(),
-            memory_id: memory_id.into(),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn identity_parsed_only_from_conventional_ids() {
-        let mut p = identity_payload("alice", "alice::s1::3");
-        normalize_payload_identity(&mut p);
-        assert_eq!((p.session_id.as_deref(), p.turn_index), (Some("s1"), Some(3)));
-
-        let mut p = identity_payload("alice", "0b7c5e0e-3f1a-4d2b-9c61-2a7d8f0e4b11");
-        normalize_payload_identity(&mut p);
-        assert_eq!((p.session_id, p.turn_index), (None, None));
-
-        // An id that merely contains `::` must not be mistaken for a session.
-        let mut p = identity_payload("alice", "doc::chapter1::2");
-        normalize_payload_identity(&mut p);
-        assert_eq!((p.session_id, p.turn_index), (None, None));
-    }
-
-    #[test]
-    fn explicit_identity_wins_over_parsed() {
-        let mut p = identity_payload("alice", "alice::s1::3");
-        p.session_id = Some("chat-42".into());
-        p.turn_index = Some(9);
-        normalize_payload_identity(&mut p);
-        assert_eq!((p.session_id.as_deref(), p.turn_index), (Some("chat-42"), Some(9)));
-    }
-
     use super::*;
     use crate::config::RetrievalConfig;
     use std::time::Instant;
@@ -894,69 +813,6 @@ mod tests {
         assert!(recent > 0.35 && recent < 1.0);
         let ancient = apply_decay_with_policy(1.0, 0, MemoryKind::Conversational, 3_000 * day);
         assert!((ancient - DECAY_FLOOR).abs() < 1e-6);
-    }
-
-    #[test]
-    fn session_id_from_memory_id_valid() {
-        assert_eq!(
-            session_id_from_memory_id("entity::session123::42"),
-            Some("session123".to_string())
-        );
-    }
-
-    #[test]
-    fn session_id_from_memory_id_no_turn() {
-        assert_eq!(session_id_from_memory_id("entity::session456"), Some("session456".to_string()));
-    }
-
-    #[test]
-    fn session_id_from_memory_id_invalid_returns_none() {
-        assert_eq!(session_id_from_memory_id("only_one_part"), None);
-    }
-
-    #[test]
-    fn session_id_from_memory_id_empty_returns_none() {
-        assert_eq!(session_id_from_memory_id(""), None);
-    }
-
-    #[test]
-    fn turn_index_from_memory_id_valid() {
-        assert_eq!(turn_index_from_memory_id("entity::session::42"), 42);
-    }
-
-    #[test]
-    fn turn_index_from_memory_id_missing_returns_zero() {
-        assert_eq!(turn_index_from_memory_id("entity::session"), 0);
-    }
-
-    #[test]
-    fn turn_index_from_memory_id_non_numeric_returns_zero() {
-        assert_eq!(turn_index_from_memory_id("entity::session::abc"), 0);
-    }
-
-    #[test]
-    fn turn_index_from_memory_id_empty_returns_zero() {
-        assert_eq!(turn_index_from_memory_id(""), 0);
-    }
-
-    #[test]
-    fn split_memory_id_valid() {
-        assert_eq!(split_memory_id("entity1::session1::7"), Some(("entity1", "session1", 7)));
-    }
-
-    #[test]
-    fn split_memory_id_missing_turn_returns_none() {
-        assert_eq!(split_memory_id("entity1::session1"), None);
-    }
-
-    #[test]
-    fn split_memory_id_single_part_returns_none() {
-        assert_eq!(split_memory_id("entity1"), None);
-    }
-
-    #[test]
-    fn split_memory_id_empty_returns_none() {
-        assert_eq!(split_memory_id(""), None);
     }
 
     #[test]

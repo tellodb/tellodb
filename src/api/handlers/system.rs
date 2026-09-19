@@ -5,10 +5,7 @@ use axum::{
 };
 use std::time::Instant;
 
-use crate::api::auth::{
-    principal_namespace_prefix, principal_user_id, record_usage_for_principal, scope_entity_id,
-    RequestPrincipal,
-};
+use crate::api::auth::{principal_user_id, record_usage_for_principal, RequestPrincipal};
 use crate::api::types::*;
 use crate::api::utils::RESET_CONFIRM_PHRASE;
 use crate::api::EngineState;
@@ -188,11 +185,8 @@ pub async fn memory_inspect_handler(
     Extension(principal): Extension<RequestPrincipal>,
     Json(payload): Json<MemoryInspectPayload>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let ns_prefix = principal_namespace_prefix(&principal);
     let tenant_id = principal_user_id(&principal).unwrap_or("default");
     let tenant = state.tenant_store(tenant_id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let mut payload = payload;
-    payload.memory_id = scope_entity_id(&payload.memory_id, ns_prefix.as_deref());
     let response = tokio::task::spawn_blocking(move || {
         let tenant = tenant.clone();
         let timestamp = tenant
@@ -219,7 +213,7 @@ pub async fn memory_inspect_handler(
             .get_memory_card(&payload.memory_id)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         let ledger_turn = tenant
-            .get_ledger_turns_batch(&[payload.memory_id.clone()])
+            .get_ledger_turns_batch(std::slice::from_ref(&payload.memory_id))
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
             .remove(&payload.memory_id);
         let deletion_tombstones = tenant
@@ -276,11 +270,8 @@ pub async fn memory_delete_handler(
     Extension(principal): Extension<RequestPrincipal>,
     Json(payload): Json<MemoryDeletePayload>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let ns_prefix = principal_namespace_prefix(&principal);
     let tenant_id = principal_user_id(&principal).unwrap_or("default");
     let tenant = state.tenant_store(tenant_id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let mut payload = payload;
-    payload.memory_id = scope_entity_id(&payload.memory_id, ns_prefix.as_deref());
     let reason = payload
         .reason
         .clone()

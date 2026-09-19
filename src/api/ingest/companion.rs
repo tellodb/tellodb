@@ -6,9 +6,9 @@ use crate::api::ingest::salient::{
     truncate_for_companion,
 };
 use crate::api::types::IngestPayload;
-use crate::api::utils::derived_memory_id;
 use crate::api::utils::extract_temporal_terms;
 use crate::api::utils::normalize_fact_text;
+use crate::core::memory_id::MemoryId;
 use crate::heuristics::Profile;
 
 pub fn build_event_companion_text(payload: &IngestPayload) -> Option<String> {
@@ -70,7 +70,7 @@ pub fn build_relation_companion_payloads(payload: &IngestPayload) -> Vec<IngestP
             let human_predicate = predicate.replace('_', " ");
             IngestPayload {
                 entity_id: payload.entity_id.clone(),
-                memory_id: derived_memory_id(&payload.memory_id, &format!("rel{idx}")),
+                memory_id: MemoryId::derived_from(&payload.memory_id, &format!("rel{idx}")),
                 timestamp: payload.timestamp,
                 textual_content: format!(
                     "Canonical relation: {} {} {}",
@@ -125,7 +125,7 @@ pub fn build_companion_payloads_with_profile(
         if let Some(gist_text) = gist {
             companions.push(IngestPayload {
                 entity_id: payload.entity_id.clone(),
-                memory_id: derived_memory_id(&payload.memory_id, "gist"),
+                memory_id: MemoryId::derived_from(&payload.memory_id, "gist"),
                 timestamp: payload.timestamp,
                 textual_content: gist_text,
                 relations: payload.relations.clone(),
@@ -148,7 +148,7 @@ pub fn build_companion_payloads_with_profile(
         if let Some(keyword_text) = keyword_index {
             companions.push(IngestPayload {
                 entity_id: payload.entity_id.clone(),
-                memory_id: derived_memory_id(&payload.memory_id, "kw"),
+                memory_id: MemoryId::derived_from(&payload.memory_id, "kw"),
                 timestamp: payload.timestamp,
                 textual_content: keyword_text,
                 relations: payload.relations.clone(),
@@ -178,7 +178,7 @@ pub fn build_companion_payloads_with_profile(
         };
         companions.push(IngestPayload {
             entity_id: payload.entity_id.clone(),
-            memory_id: derived_memory_id(&payload.memory_id, &format!("fact{idx}")),
+            memory_id: MemoryId::derived_from(&payload.memory_id, &format!("fact{idx}")),
             timestamp: payload.timestamp,
             textual_content: fact_content,
             relations: payload.relations.clone(),
@@ -208,7 +208,7 @@ pub fn build_companion_payloads_with_profile(
     if let Some(event_text) = build_event_companion_text(payload) {
         companions.push(IngestPayload {
             entity_id: payload.entity_id.clone(),
-            memory_id: derived_memory_id(&payload.memory_id, "event"),
+            memory_id: MemoryId::derived_from(&payload.memory_id, "event"),
             timestamp: payload.timestamp,
             textual_content: event_text,
             relations: payload.relations.clone(),

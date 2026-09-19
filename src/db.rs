@@ -17,6 +17,7 @@ use crate::api::handlers::ingest::{process_ingest_batch, spawn_consolidation_tas
 use crate::api::handlers::query::execute_query_pipeline;
 use crate::api::types::{IngestPayload, QueryPayload};
 use crate::api::EngineState;
+use crate::core::memory_id::MemoryId;
 use crate::runtime_paths::RuntimePaths;
 use crate::storage::TenantStore;
 use anyhow::{Context, Result};
@@ -83,7 +84,9 @@ impl Memory {
             let session = session_id
                 .clone()
                 .unwrap_or_else(|| format!("mem-{timestamp}-{:032x}", rand::random::<u128>()));
-            format!("{}::{}::{}", self.entity_id, session, self.turn_index.unwrap_or(0))
+            MemoryId::new(&self.entity_id, session, self.turn_index.unwrap_or(0))
+                .as_str()
+                .to_string()
         });
         IngestPayload {
             entity_id: self.entity_id,
@@ -251,7 +254,7 @@ impl Engine {
         .map_err(|status| anyhow::anyhow!("query failed ({status})"))?;
         Ok(results
             .into_iter()
-            .filter(|r| !r.memory_id.starts_with("__pre_synth_"))
+            .filter(|r| r.origin.is_stored())
             .map(|r| Hit {
                 memory_id: r.memory_id,
                 entity_id: r.entity_id,

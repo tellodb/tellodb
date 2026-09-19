@@ -248,6 +248,20 @@ pub struct WhyStale {
     pub evidence: Vec<String>,
 }
 
+#[derive(Serialize, Clone, Debug, PartialEq, Eq, Default)]
+pub enum ResultOrigin {
+    #[default]
+    Stored,
+    SynthesizedFact,
+    SynthesizedCard,
+}
+
+impl ResultOrigin {
+    pub fn is_stored(&self) -> bool {
+        matches!(self, Self::Stored)
+    }
+}
+
 #[derive(Serialize, Clone, Debug)]
 pub struct QueryResult {
     pub memory_id: String,
@@ -272,6 +286,8 @@ pub struct QueryResult {
     pub why_stale: Option<WhyStale>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stability_score: Option<f32>,
+    #[serde(skip)]
+    pub origin: ResultOrigin,
 }
 
 /// Proof packet for evidence-verified query responses.

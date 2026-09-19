@@ -6,15 +6,13 @@ use axum::{
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::api::auth::{
-    principal_namespace_prefix, principal_user_id, record_usage_for_principal, scope_entity_id,
-    RequestPrincipal,
-};
+use crate::api::auth::{principal_user_id, record_usage_for_principal, RequestPrincipal};
 use crate::api::ingest::salient::{extract_named_phrases, extract_salient_terms};
 use crate::api::ingest::{alias::*, chunking::*, companion::*, datetime::*, dialogue::*, fact::*};
 use crate::api::types::{BatchIngestPayload, IngestPayload};
 use crate::api::utils::*;
 use crate::api::{EngineState, PlatformWriteOp};
+use crate::core::memory_id::{MemoryId, Tag};
 use crate::graph::EdgeType;
 use crate::ml::cosine_similarity;
 use std::sync::Arc;
@@ -26,14 +24,15 @@ fn content_hash(text: &str, entity_id: &str, kind: &str) -> String {
     use sha2::Digest;
     let mut hasher = sha2::Sha256::new();
     hasher.update(text.as_bytes());
-    hasher.update(b"::");
+    hasher.update(CONTENT_HASH_SEPARATOR);
     hasher.update(entity_id.as_bytes());
-    hasher.update(b"::");
+    hasher.update(CONTENT_HASH_SEPARATOR);
     hasher.update(kind.as_bytes());
     let result = hasher.finalize();
     result.iter().map(|b| format!("{:02x}", b)).collect::<String>()
 }
 type RetrospectiveCandidate = (String, String, String, u64, String, String);
+const CONTENT_HASH_SEPARATOR: &[u8] = &[58, 58];
 use crate::features::{Feature, Features};
 use crate::heuristics::Profile;
 use crate::lifecycle::{evaluate_lifecycle, LifecycleMetadata};
@@ -238,7 +237,6 @@ pub async fn ingest_handler(
     Extension(principal): Extension<RequestPrincipal>,
     Json(payload): Json<IngestPayload>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let ns_prefix = principal_namespace_prefix(&principal);
     let profile_text = payload.textual_content.clone();
     let profile_ts = payload.timestamp;
 
@@ -247,14 +245,6 @@ pub async fn ingest_handler(
         tracing::warn!("Failed to get tenant store: {:?}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-
-    let mut payload = payload;
-    payload.entity_id = scope_entity_id(&payload.entity_id, ns_prefix.as_deref());
-    if !payload.memory_id.starts_with(ns_prefix.as_deref().unwrap_or("")) {
-        if let Some(ref p) = ns_prefix {
-            payload.memory_id = format!("{}{}", p, payload.memory_id);
-        }
-    }
 
     let (tasks, diag) = process_ingest_batch(&state, &tenant, vec![payload]).await?;
 
@@ -302,7 +292,6 @@ pub async fn batch_ingest_handler(
     Extension(principal): Extension<RequestPrincipal>,
     Json(payload): Json<BatchIngestPayload>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let ns_prefix = principal_namespace_prefix(&principal);
     let profile_items = payload
         .items
         .iter()
@@ -314,16 +303,6 @@ pub async fn batch_ingest_handler(
         tracing::warn!("Failed to get tenant store: {:?}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-
-    let mut payload = payload;
-    for item in payload.items.iter_mut() {
-        item.entity_id = scope_entity_id(&item.entity_id, ns_prefix.as_deref());
-        if !item.memory_id.starts_with(ns_prefix.as_deref().unwrap_or("")) {
-            if let Some(ref p) = ns_prefix {
-                item.memory_id = format!("{}{}", p, item.memory_id);
-            }
-        }
-    }
 
     let (tasks, diag) = process_ingest_batch(&state, &tenant, payload.items).await?;
 
@@ -394,7 +373,16 @@ fn expand_and_enrich_payloads(
 
     let mut expanded_payloads = Vec::new();
     for mut payload in payloads {
-        normalize_payload_identity(&mut payload);
+        if let Ok(identity) = MemoryId::parse(&payload.memory_id) {
+            if identity.is_structured() && identity.entity() == &payload.entity_id {
+                if payload.session_id.as_deref().map_or(true, str::is_empty) {
+                    payload.session_id = Some(identity.session().clone());
+                }
+                if payload.turn_index.is_none() {
+                    payload.turn_index = Some(identity.turn());
+                }
+            }
+        }
         let mut prefix = String::new();
         if let Some(ref desc) = payload.visual_description {
             if !desc.is_empty() {
@@ -851,8 +839,12 @@ async fn commit_batches(
 
         for record in &router_records {
             if !record.router_text.is_empty() {
+                let router_id = MemoryId::new(&record.entity_id, &record.session_id, 0)
+                    .derived(Tag::Named("router".to_string()))
+                    .as_str()
+                    .to_string();
                 batches.fts_batch.push((
-                    format!("{}::{}::0::router", record.entity_id, record.session_id),
+                    router_id,
                     record.entity_id.clone(),
                     record.router_text.clone(),
                 ));
@@ -1225,16 +1217,22 @@ fn build_memory_card_from_payload(
 ) -> Option<MemoryCard> {
     let source_memory_id =
         payload.source_memory_id.clone().unwrap_or_else(|| payload.memory_id.clone());
+    let parsed_source_id = MemoryId::parse(&source_memory_id).ok();
     let source_session_id = payload
         .session_id
         .clone()
         .filter(|s| !s.is_empty())
-        .or_else(|| session_id_from_memory_id(&source_memory_id))
+        .or_else(|| {
+            parsed_source_id.as_ref().filter(|id| id.is_structured()).map(|id| id.session().clone())
+        })
         .unwrap_or_default();
     let source_turn_index = payload
         .turn_index
         .map(|t| t as usize)
-        .unwrap_or_else(|| turn_index_from_memory_id(&source_memory_id));
+        .or_else(|| {
+            parsed_source_id.as_ref().filter(|id| id.is_structured()).map(|id| id.turn() as usize)
+        })
+        .unwrap_or(0);
     let document_time = extract_document_time_ms(&payload.textual_content, payload.timestamp);
     let event_time = extract_event_time_ms(&payload.textual_content, document_time);
     let memory_text = normalize_fact_text(&payload.textual_content);
