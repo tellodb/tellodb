@@ -56,7 +56,12 @@ DATASETS="${DATASETS:-longmemeval,locomo,synthetic}"
 TIMESTAMPS="${TIMESTAMPS:-session}"
 TELLODB_EMBED_TEXT="${TELLODB_EMBED_TEXT:-context}"
 TELLODB_CONTEXT_WINDOW="${TELLODB_CONTEXT_WINDOW:-1}"
-CLIENT_CONTEXT="${CLIENT_CONTEXT:-window}"
+# The engine assembles context itself from stored turns
+# (TELLODB_EMBED_TEXT=context), so a client-side window applies it twice: each
+# payload is already a 3-turn block, and the engine then windows those blocks
+# against their neighbours. `off` sends the turn as written and lets the
+# engine do it once.
+CLIENT_CONTEXT="${CLIENT_CONTEXT:-off}"
 
 export HF_HOME="${HF_HOME:-$HOME/.cache/tellodb/hf}"
 export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-$HF_HOME/hub}"

@@ -679,7 +679,11 @@ fn build_artifacts(
             batches.fts_batch.push((
                 record.payload.memory_id.clone(),
                 record.payload.entity_id.clone(),
-                record.payload.textual_content.clone(),
+                // Without stripping, `[Session Date: 2023/05/20]` is indexed
+                // with every memory and a lexical query can match a document
+                // by its metadata instead of its content.
+                crate::api::ingest::dialogue::content_for_index(&record.payload.textual_content)
+                    .to_string(),
             ));
             if features.enabled(Feature::MemoryCards) {
                 if let Some(card) = build_memory_card_from_payload(

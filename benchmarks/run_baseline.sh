@@ -137,7 +137,12 @@ TIMESTAMPS="${TIMESTAMPS:-session}"
 # prepends its own header/window to each turn (window|off).
 TELLODB_EMBED_TEXT="${TELLODB_EMBED_TEXT:-context}"
 TELLODB_CONTEXT_WINDOW="${TELLODB_CONTEXT_WINDOW:-1}"
-CLIENT_CONTEXT="${CLIENT_CONTEXT:-window}"
+# The engine assembles context itself from stored turns
+# (TELLODB_EMBED_TEXT=context), so a client-side window applies it twice: each
+# payload is already a 3-turn block, and the engine then windows those blocks
+# against their neighbours. `off` sends the turn as written and lets the
+# engine do it once.
+CLIENT_CONTEXT="${CLIENT_CONTEXT:-off}"
 
 ENGINE_BIN="${REPO_ROOT}/target/${PROFILE}/tellodb"
 EVALUATOR_BIN="${REPO_ROOT}/benchmarks/rust_evaluator/target/release/rust_evaluator"

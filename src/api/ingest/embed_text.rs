@@ -75,7 +75,10 @@ pub fn is_source_turn(payload: &IngestPayload) -> bool {
 }
 
 pub fn turn_line(role: &str, text: &str) -> String {
-    let text = text.trim();
+    // A caller may prefix `[Session ID: ...]` / `[Session Date: ...]`. Those
+    // are read for event time elsewhere and must not be embedded: this module
+    // guarantees dates and session ids are not part of embedded text.
+    let text = super::dialogue::content_for_index(text).trim();
     if role.is_empty() {
         text.to_string()
     } else {

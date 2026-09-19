@@ -55,6 +55,26 @@ pub fn strip_leading_bracketed_prefixes(text: &str) -> &str {
     rest
 }
 
+/// The part of a memory that should be embedded and indexed.
+///
+/// A caller may prefix `[Session ID: ...]` / `[Session Date: ...]`, which the
+/// engine reads for event time. Those headers must not reach the embedding or
+/// the FTS index: a session id contributes nothing to meaning, and an indexed
+/// date lets a lexical query match a document by its metadata rather than by
+/// what it says. Derived paths (facts, companions, salient terms) already
+/// strip them; embedding and FTS did not.
+///
+/// A document that is nothing but headers is kept as-is rather than reduced
+/// to an empty, unsearchable memory.
+pub fn content_for_index(text: &str) -> &str {
+    let stripped = strip_leading_bracketed_prefixes(text);
+    if stripped.is_empty() {
+        text
+    } else {
+        stripped
+    }
+}
+
 pub fn value_to_text(value: &serde_json::Value) -> Option<String> {
     match value {
         serde_json::Value::String(text) => {
@@ -188,4 +208,38 @@ pub fn extract_companion_texts(text: &str) -> (Option<String>, Vec<String>) {
         .collect::<Vec<_>>();
 
     (gist, fact_like)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_for_index_drops_a_leading_header_block() {
+        let text = "[Session ID: abc]\n[Session Date: 2023/05/20]\nuser: hi\nassistant: hey";
+        assert_eq!(content_for_index(text), "user: hi\nassistant: hey");
+    }
+
+    #[test]
+    fn content_for_index_keeps_a_header_only_document() {
+        // Stripping to nothing would store an empty, unsearchable memory.
+        let text = "[Session Date: 2023/05/20]";
+        assert_eq!(content_for_index(text), text);
+    }
+
+    #[test]
+    fn content_for_index_leaves_ordinary_text_alone() {
+        assert_eq!(content_for_index("user: hi"), "user: hi");
+        assert_eq!(content_for_index(""), "");
+    }
+
+    #[test]
+    fn the_date_header_is_read_before_it_is_stripped() {
+        let text = "[Session Date: 2023/05/20]\nuser: hi";
+        assert_eq!(
+            extract_bracketed_header_value(text, "Session Date").as_deref(),
+            Some("2023/05/20")
+        );
+        assert!(!content_for_index(text).contains("2023/05/20"));
+    }
 }
