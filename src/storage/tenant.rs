@@ -235,20 +235,6 @@ impl TenantStore {
             CREATE INDEX IF NOT EXISTS idx_edges_target_type ON edges(target, edge_type);
             CREATE INDEX IF NOT EXISTS idx_edges_label ON edges(label);
 
-            -- Metrics
-            CREATE TABLE IF NOT EXISTS metrics (
-                memory_id TEXT NOT NULL,
-                ordinal INTEGER NOT NULL,
-                entity_id TEXT NOT NULL,
-                timestamp_ms INTEGER NOT NULL,
-                label TEXT NOT NULL,
-                value REAL NOT NULL,
-                unit TEXT,
-                source_text TEXT,
-                PRIMARY KEY(memory_id, ordinal)
-            );
-            CREATE INDEX IF NOT EXISTS idx_metrics_entity_label ON metrics(entity_id, label, timestamp_ms);
-
             -- FTS5
             CREATE VIRTUAL TABLE IF NOT EXISTS fts_memories USING fts5(
                 memory_id UNINDEXED,
@@ -438,6 +424,7 @@ impl TenantStore {
         ",
         )?;
 
+        conn.execute_batch(METRICS_DDL)?;
         Self::migrate(conn)?;
 
         Ok(())
