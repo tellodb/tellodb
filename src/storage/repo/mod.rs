@@ -8,6 +8,7 @@ pub mod memories;
 pub mod prefs;
 pub mod schema;
 pub mod sessions;
+pub mod traits;
 
 pub(super) mod prelude {
     pub(super) use anyhow::{Context, Result};

@@ -37,6 +37,7 @@ use crate::features::{Feature, Features};
 use crate::heuristics::Profile;
 use crate::lifecycle::{evaluate_lifecycle, LifecycleMetadata};
 use crate::metrics;
+use crate::storage::repo::traits::{RetrospectiveRepo, VectorRepo};
 use crate::storage::{
     build_session_router_text, AgentObservation, FactVersionStatus, GraphEdgeEntry, MemoryCard,
     MemoryKind, SessionRouterRecord, TenantStore,
@@ -540,7 +541,7 @@ async fn generate_embeddings(
 
 // ── Phase 3: Dedup + observation building ──
 fn build_observations(
-    tenant: &TenantStore,
+    tenant: &dyn VectorRepo,
     expanded_payloads: Vec<IngestPayload>,
     semantic_embeddings: Vec<Vec<f32>>,
     diag: &mut IngestDiagnostics,
@@ -925,8 +926,11 @@ async fn commit_batches(
     // Retrospective links
     if !batches.retrospective_candidates.is_empty() {
         let stage_start = Instant::now();
-        let retrospective_links =
-            build_retrospective_links(state, tenant, &batches.retrospective_candidates)?;
+        let retrospective_links = build_retrospective_links(
+            state,
+            tenant.retrospective_repo(),
+            &batches.retrospective_candidates,
+        )?;
         diag.count(Feature::RetrospectiveLinks.name(), retrospective_links.len());
         batches.memory_links_batch.extend(retrospective_links);
         diag.retrospective_ms = stage_start.elapsed().as_millis() as u64;
@@ -1428,7 +1432,7 @@ fn truncate_router_value(text: &str, max_chars: usize) -> String {
 
 fn build_retrospective_links(
     state: &EngineState,
-    tenant: &TenantStore,
+    tenant: &dyn RetrospectiveRepo,
     candidates: &[RetrospectiveCandidate],
 ) -> Result<Vec<(String, String, String)>, StatusCode> {
     let mut links = Vec::new();
@@ -1721,7 +1725,7 @@ async fn execute_ingest_pipeline(
 
     // Phase 3: Dedup + observation building
     let prepared = build_observations(
-        tenant,
+        tenant.vector_repo(),
         expanded_payloads,
         semantic_embeddings,
         &mut diag,

@@ -7,3 +7,4 @@ pub use manager::TenantDatabaseManager;
 pub use tenant::TenantStore;
 pub use types::*;
 pub mod repo;
+pub use repo::traits::{QueryRepo, RetrospectiveRepo, VectorRepo};

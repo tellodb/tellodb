@@ -20,6 +20,7 @@ use crate::metrics;
 use crate::ml::cosine_similarity;
 use crate::retrieval::lanes::Lane;
 use crate::retrieval::{rrf_fuse, ScoringWeights};
+use crate::storage::repo::traits::QueryRepo;
 use crate::storage::{
     AgentObservation, MemoryCard, MemoryCardSearchInput, MemoryKind, TenantStore,
 };
@@ -111,7 +112,7 @@ pub struct QueryDiagnostics {
 /// dropped, newest first. The stored profile is an append-only log of recent
 /// facts, so without this the context block contradicted the fact history.
 fn current_core_profile(
-    tenant: &TenantStore,
+    tenant: &dyn QueryRepo,
     entity_id: &str,
     point_in_time_ms: Option<u64>,
 ) -> anyhow::Result<Option<String>> {
@@ -144,7 +145,7 @@ fn current_core_profile(
 }
 
 fn build_entity_observation_block(
-    tenant: &TenantStore,
+    tenant: &dyn QueryRepo,
     entity_id: &str,
     query_text: &str,
     results: &[QueryResult],
@@ -207,7 +208,7 @@ pub async fn query_handler(
                 Some(eid) => Some((
                     eid.to_string(),
                     build_entity_observation_block(
-                        &tenant,
+                        tenant.query_repo(),
                         eid,
                         &block_query_text,
                         &results,
