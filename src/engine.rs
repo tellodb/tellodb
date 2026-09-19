@@ -33,8 +33,6 @@ pub async fn build_state(
         info!(enabled = ?config.lanes.enabled_names(), "Retrieval lanes restricted");
     }
 
-    let extractor = crate::extract::init(&config.extractor)?;
-    info!(extractor = extractor.name(), "Fact extractor");
     crate::api::ingest::embed_text::init(config.embedding.text);
 
     let cache_path = config
@@ -42,8 +40,18 @@ pub async fn build_state(
         .cache_path
         .clone()
         .unwrap_or_else(|| paths.embedding_cache().to_path_buf());
-    let semantic = Arc::new(semantic::SemanticInference::with_cache_path(Some(cache_path)).await?);
+    config.embedding.cache_path = Some(cache_path.clone());
+    let semantic = Arc::new(
+        semantic::SemanticInference::with_config(
+            Some(cache_path),
+            &config.embedding,
+            &config.rerank,
+        )
+        .await?,
+    );
     config.embedding.dimension = Some(semantic.embedding_dim());
+    let extractor = crate::extract::init(&config.extractor)?;
+    info!(extractor = extractor.name(), "Fact extractor");
     info!(
         model_id = %semantic.embedding_model_id(),
         dims = %semantic.embedding_dim(),

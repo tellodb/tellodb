@@ -5,39 +5,17 @@ use fastembed::{
 };
 use ort::ep::CUDA;
 
+use crate::config::{Config, EmbeddingConfig, RerankConfig};
 use lru::LruCache;
 use parking_lot::{Condvar, Mutex};
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
-/// Default size of the rerank-result LRU cache. Each entry holds a Vec<f32>
-/// of length ≤ 32 (one NEURAL_BATCH chunk). Override with
-/// `TEMPORAL_MEMORY_RERANK_CACHE_SIZE`.
-const DEFAULT_RERANK_CACHE_SIZE: usize = 4096;
-
-/// Texts per ONNX call. Batches are formed after sorting by length, so each
-/// batch pads only to its own longest text. Padding a mixed batch to its
-/// longest member made ingest ~3x slower (see `examples/embed_throughput.rs`).
-const DEFAULT_EMBED_BATCH: usize = 32;
-
-/// Token limit per text. Attention cost grows with length, so this is the
-/// main quality/speed knob; it is part of the embedding cache key.
-const DEFAULT_EMBED_MAX_TOKENS: usize = 512;
-
 /// Device the models were initialised on; readable without an instance.
 static DEVICE_LABEL: OnceLock<&'static str> = OnceLock::new();
-
-fn env_usize(name: &str) -> Option<usize> {
-    std::env::var(name).ok().and_then(|v| v.trim().parse::<usize>().ok())
-}
-
-fn env_flag_off(name: &str) -> bool {
-    std::env::var(name)
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"))
-        .unwrap_or(false)
-}
+static DEVICE_FLAGS: OnceLock<(bool, bool)> = OnceLock::new();
 
 fn hash_text(text: &str) -> [u8; 32] {
     use sha2::{Digest, Sha256};
@@ -295,7 +273,7 @@ impl ModelFiles {
 /// Model files compiled into the binary (`--features bundled-models`, with
 /// `TELLODB_BUNDLE_DIR` pointing at a model snapshot at build time), then
 /// `TELLODB_MODEL_DIR` at run time. `None` downloads through fastembed.
-fn local_model_files() -> Result<Option<(String, ModelFiles)>> {
+fn local_model_files(model_dir: Option<&Path>) -> Result<Option<(String, ModelFiles)>> {
     #[cfg(feature = "bundled-models")]
     {
         let files = ModelFiles {
@@ -317,8 +295,8 @@ fn local_model_files() -> Result<Option<(String, ModelFiles)>> {
         return Ok(Some(("bundled".to_string(), files)));
     }
     #[allow(unreachable_code)]
-    match std::env::var("TELLODB_MODEL_DIR").ok().filter(|d| !d.trim().is_empty()) {
-        Some(dir) => Ok(Some((dir.clone(), ModelFiles::read_dir(std::path::Path::new(&dir))?))),
+    match model_dir {
+        Some(dir) => Ok(Some((dir.display().to_string(), ModelFiles::read_dir(dir)?))),
         None => Ok(None),
     }
 }
@@ -363,10 +341,9 @@ pub(crate) fn execution_providers_for(
     eps
 }
 
-/// The device selected by `TEMPORAL_MEMORY_DEVICE`, as `(use_gpu, use_coreml)`.
+/// The device selected during model initialization, as `(use_gpu, use_coreml)`.
 pub(crate) fn selected_device() -> (bool, bool) {
-    let device = std::env::var("TEMPORAL_MEMORY_DEVICE").unwrap_or_default().to_lowercase();
-    (device == "gpu" || device == "cuda", device == "coreml" || device == "mps" || device == "mac")
+    DEVICE_FLAGS.get().copied().unwrap_or((false, false))
 }
 
 const BGE_QUERY_INSTRUCTION: &str = "Represent this sentence for searching relevant passages: ";
@@ -411,32 +388,34 @@ pub struct SemanticInference {
 }
 
 impl SemanticInference {
-    /// Loads models; the embedding cache path comes from
-    /// `TELLODB_EMBEDDING_CACHE_PATH` or the data root in the environment.
     pub async fn new() -> Result<Self> {
-        let cache_path =
-            std::env::var("TELLODB_EMBEDDING_CACHE_PATH").map(PathBuf::from).ok().or_else(|| {
-                crate::runtime_paths::RuntimePaths::from_env()
-                    .ok()
-                    .map(|p| p.embedding_cache().to_path_buf())
-            });
-        Self::with_cache_path(cache_path).await
+        let config = Config::from_env()?;
+        let cache_path = config.embedding.cache_path.clone().or_else(|| {
+            crate::runtime_paths::RuntimePaths::from_env()
+                .ok()
+                .map(|paths| paths.embedding_cache().to_path_buf())
+        });
+        Self::with_config(cache_path, &config.embedding, &config.rerank).await
     }
 
-    /// Loads models with an explicit embedding cache location (`None` keeps
-    /// the cache in memory only).
     pub async fn with_cache_path(cache_path: Option<PathBuf>) -> Result<Self> {
-        let embedding_model_id = std::env::var("TEMPORAL_MEMORY_EMBEDDING_MODEL")
-            .or_else(|_| std::env::var("TELLODB_EMBEDDING_MODEL"))
-            .unwrap_or_else(|_| "BAAI/bge-small-en-v1.5".to_string());
-        let model_name = parse_embedding_model(&embedding_model_id)?;
-        let embedding_dim = TextEmbedding::get_model_info(&model_name)
-            .map(|info| info.dim)
-            .unwrap_or_else(|_| embedding_dimensions_for_model(&embedding_model_id));
+        let config = Config::from_env()?;
+        Self::with_config(cache_path, &config.embedding, &config.rerank).await
+    }
 
-        let threads = env_usize("TELLODB_THREADS")
-            .filter(|&n| n >= 1)
-            .unwrap_or_else(|| num_cpus::get_physical().max(1));
+    pub async fn with_config(
+        cache_path: Option<PathBuf>,
+        embedding: &EmbeddingConfig,
+        rerank: &RerankConfig,
+    ) -> Result<Self> {
+        let embedding_model_id = embedding.model_id.clone();
+        let model_name = parse_embedding_model(&embedding_model_id)?;
+        let embedding_dim =
+            TextEmbedding::get_model_info(&model_name).map(|info| info.dim).unwrap_or_else(|_| {
+                embedding_dimensions_for_model(&embedding_model_id, embedding.dimension)
+            });
+
+        let threads = embedding.threads.max(1);
         // Sizes the rayon pool used by ingest NLP. ONNX Runtime threads are set
         // by fastembed to all visible CPUs per session; on Linux restrict them
         // with `taskset`, which `available_parallelism` respects.
@@ -444,7 +423,7 @@ impl SemanticInference {
             tracing::debug!(error = %err, "rayon global pool already initialised");
         }
 
-        let device_env = std::env::var("TEMPORAL_MEMORY_DEVICE").unwrap_or_default().to_lowercase();
+        let device_env = embedding.device.trim().to_ascii_lowercase();
         let use_gpu = device_env == "gpu" || device_env == "cuda";
         let use_coreml = device_env == "coreml" || device_env == "mps" || device_env == "mac";
         let device_label: &'static str = if use_gpu {
@@ -455,32 +434,16 @@ impl SemanticInference {
             "CPU"
         };
         let _ = DEVICE_LABEL.set(device_label);
+        let _ = DEVICE_FLAGS.set((use_gpu, use_coreml));
 
-        // One executor by default: each session already uses every core, so
-        // more sessions on CPU only oversubscribe.
-        let n_embed = env_usize("TEMPORAL_MEMORY_EMBED_EXECUTORS")
-            .filter(|n| (1..=32).contains(n))
-            .unwrap_or(1);
-        let max_tokens = env_usize("TELLODB_EMBED_MAX_TOKENS")
-            .filter(|n| (16..=8192).contains(n))
-            .unwrap_or(DEFAULT_EMBED_MAX_TOKENS);
-        let embed_batch =
-            env_usize("TELLODB_EMBED_BATCH").filter(|&n| n >= 1).unwrap_or(DEFAULT_EMBED_BATCH);
+        let n_embed = embedding.executors.clamp(1, 32);
+        let max_tokens = embedding.max_tokens.clamp(16, 8192);
+        let embed_batch = embedding.batch.max(1);
 
-        let rerank_model = parse_reranker_model(
-            std::env::var("TELLODB_RERANK_MODEL").ok().as_deref().unwrap_or("bge-reranker-base"),
-        )?;
-        let rerank_enabled = !env_flag_off("TELLODB_RERANK") && rerank_model.is_some();
-        let n_rerank = if rerank_enabled {
-            env_usize("TEMPORAL_MEMORY_RERANK_EXECUTORS")
-                .filter(|n| (1..=16).contains(n))
-                .unwrap_or(1)
-        } else {
-            0
-        };
-        let cache_size = env_usize("TEMPORAL_MEMORY_RERANK_CACHE_SIZE")
-            .filter(|&n| n >= 64)
-            .unwrap_or(DEFAULT_RERANK_CACHE_SIZE);
+        let rerank_model = parse_reranker_model(&rerank.model)?;
+        let rerank_enabled = rerank.enabled && rerank_model.is_some();
+        let n_rerank = if rerank_enabled { rerank.executors.clamp(1, 16) } else { 0 };
+        let cache_size = rerank.cache_size.max(64);
 
         tracing::info!(
             model = %embedding_model_id,
@@ -496,7 +459,7 @@ impl SemanticInference {
 
         let execution_providers = || execution_providers_for(use_gpu, use_coreml);
 
-        let local_files = local_model_files()?;
+        let local_files = local_model_files(embedding.model_dir.as_deref())?;
         let mut executors = Vec::with_capacity(n_embed);
         for i in 0..n_embed {
             let model = match &local_files {
@@ -548,12 +511,10 @@ impl SemanticInference {
             rerankers.push(Arc::new(Mutex::new(TextRerank::try_new(options)?)));
         }
 
-        let cache = EmbeddingCache::new(cache_path, !env_flag_off("TELLODB_EMBED_CACHE"));
+        let cache = EmbeddingCache::new(cache_path, embedding.cache_enabled);
 
-        let query_instruction = query_instruction_for(
-            &embedding_model_id,
-            std::env::var("TELLODB_QUERY_INSTRUCTION").ok().as_deref(),
-        );
+        let query_instruction =
+            query_instruction_for(&embedding_model_id, embedding.query_instruction.as_deref());
 
         Ok(Self {
             rerank_model_id: rerank_model.filter(|_| n_rerank > 0).map(|(id, _)| id),
@@ -848,8 +809,8 @@ fn rerank_cache_key(q: &str, texts: &[String]) -> u64 {
     hasher.finish()
 }
 
-fn embedding_dimensions_for_model(id: &str) -> usize {
-    if let Some(dim) = env_usize("TEMPORAL_MEMORY_EMBEDDING_DIM") {
+fn embedding_dimensions_for_model(id: &str, configured: Option<usize>) -> usize {
+    if let Some(dim) = configured {
         return dim;
     }
     match id {
