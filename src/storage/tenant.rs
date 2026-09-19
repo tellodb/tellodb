@@ -429,6 +429,36 @@ pub(crate) fn memory_turn_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Memor
     Ok((memory_id, parent, turn))
 }
 
+pub(crate) fn memory_card_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryCard> {
+    let lifecycle_str: Option<String> = row.get(17)?;
+    Ok(MemoryCard {
+        card_id: row.get(0)?,
+        entity_id: row.get(1)?,
+        user_id: row.get(2)?,
+        source_memory_id: row.get(3)?,
+        source_session_id: row.get(4)?,
+        subject: row.get(5)?,
+        predicate: row.get(6)?,
+        object: row.get(7)?,
+        memory_text: row.get(8)?,
+        card_type: row.get(9)?,
+        confidence: row.get(10)?,
+        is_latest: row.get::<_, i32>(11)? != 0,
+        is_static: row.get::<_, i32>(12)? != 0,
+        is_inference: row.get::<_, i32>(13)? != 0,
+        expires_at: row.get(14)?,
+        root_card_id: row.get(15)?,
+        parent_card_id: row.get(16)?,
+        lifecycle: lifecycle_str.and_then(|s| serde_json::from_str(&s).ok()),
+        source_turn_index: 0,
+        document_time: 0,
+        conversation_time: 0,
+        event_time: None,
+        created_at_ms: row.get(18)?,
+        updated_at_ms: row.get(19)?,
+    })
+}
+
 /// Adds a row to its turn; chunks of one memory are joined in rowid order.
 pub(crate) fn merge_turn(
     turns: &mut std::collections::HashMap<String, LedgerTurn>,

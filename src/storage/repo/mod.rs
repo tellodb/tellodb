@@ -36,8 +36,8 @@ pub(super) mod prelude {
     pub(super) use super::{in_placeholders, padded_in_chunk, IN_CHUNK};
     pub(super) use crate::storage::tenant::{
         bytes_to_vec_f32, contains_term_count, fts_entity_tok, fts_quote, fts_rowid,
-        memory_turn_row, merge_router_records, merge_turn, same_fact_object, unix_timestamp_ms,
-        vec_f32_to_bytes, EdgeNeighbour, GraphEdge, GraphEdgeBatch, TenantStore,
+        memory_card_row, memory_turn_row, merge_router_records, merge_turn, same_fact_object,
+        unix_timestamp_ms, vec_f32_to_bytes, EdgeNeighbour, GraphEdge, GraphEdgeBatch, TenantStore,
         CARD_CONFIDENCE_WEIGHT, CARD_ENTITY_WEIGHT, CARD_LATEST_BOOST, CARD_LEXICAL_WEIGHT,
         CARD_ROUTE_BOOST, CARD_STALE_PENALTY, CARD_TEMPORAL_WEIGHT, DECISION_TYPE_BOOST,
         EVENT_TYPE_BOOST, FACT_TYPE_BOOST, FOCUS_MATCH_MIN_LEN, FTS_MIN_TERM_LEN,

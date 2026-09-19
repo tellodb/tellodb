@@ -57,35 +57,7 @@ impl TenantStore {
                     lifecycle, created_at_ms, updated_at_ms
              FROM memory_cards WHERE card_id = ?1",
         )?;
-        let res = stmt.query_row(params![card_id], |row| {
-            let lifecycle_str: Option<String> = row.get(17)?;
-            Ok(MemoryCard {
-                card_id: row.get(0)?,
-                entity_id: row.get(1)?,
-                user_id: row.get(2)?,
-                source_memory_id: row.get(3)?,
-                source_session_id: row.get(4)?,
-                subject: row.get(5)?,
-                predicate: row.get(6)?,
-                object: row.get(7)?,
-                memory_text: row.get(8)?,
-                card_type: row.get(9)?,
-                confidence: row.get(10)?,
-                is_latest: row.get::<_, i32>(11)? != 0,
-                is_static: row.get::<_, i32>(12)? != 0,
-                is_inference: row.get::<_, i32>(13)? != 0,
-                expires_at: row.get(14)?,
-                root_card_id: row.get(15)?,
-                parent_card_id: row.get(16)?,
-                lifecycle: lifecycle_str.and_then(|s| serde_json::from_str(&s).ok()),
-                source_turn_index: 0,
-                document_time: 0,
-                conversation_time: 0,
-                event_time: None,
-                created_at_ms: row.get(18)?,
-                updated_at_ms: row.get(19)?,
-            })
-        });
+        let res = stmt.query_row(params![card_id], memory_card_row);
         match res {
             Ok(card) => Ok(Some(card)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -243,36 +215,7 @@ impl TenantStore {
              FROM memory_cards WHERE source_memory_id = ?1
              ORDER BY is_latest DESC, updated_at_ms DESC LIMIT 1",
         )?;
-        let res = stmt.query_row(params![source_memory_id], |row| {
-            Ok(MemoryCard {
-                card_id: row.get(0)?,
-                entity_id: row.get(1)?,
-                user_id: row.get(2)?,
-                source_memory_id: row.get(3)?,
-                source_session_id: row.get(4)?,
-                source_turn_index: 0,
-                document_time: 0,
-                conversation_time: 0,
-                event_time: None,
-                subject: row.get(5)?,
-                predicate: row.get(6)?,
-                object: row.get(7)?,
-                memory_text: row.get(8)?,
-                card_type: row.get(9)?,
-                confidence: row.get(10)?,
-                is_latest: row.get::<_, i32>(11)? != 0,
-                is_static: row.get::<_, i32>(12)? != 0,
-                is_inference: row.get::<_, i32>(13)? != 0,
-                expires_at: row.get(14)?,
-                root_card_id: row.get(15)?,
-                parent_card_id: row.get(16)?,
-                lifecycle: row
-                    .get::<_, Option<String>>(17)?
-                    .and_then(|s| serde_json::from_str(&s).ok()),
-                created_at_ms: row.get(18)?,
-                updated_at_ms: row.get(19)?,
-            })
-        });
+        let res = stmt.query_row(params![source_memory_id], memory_card_row);
         match res {
             Ok(card) => Ok(Some(card)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -300,41 +243,10 @@ impl TenantStore {
                 in_placeholders(IN_CHUNK)
             );
             let mut stmt = conn.prepare_cached(&sql)?;
-            let rows = stmt.query_map(
-                rusqlite::params_from_iter(values),
-                |row| -> rusqlite::Result<(String, MemoryCard)> {
-                    let lifecycle_str: Option<String> = row.get(17)?;
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        MemoryCard {
-                            card_id: row.get(0)?,
-                            entity_id: row.get(1)?,
-                            user_id: row.get(2)?,
-                            source_memory_id: row.get(3)?,
-                            source_session_id: row.get(4)?,
-                            subject: row.get(5)?,
-                            predicate: row.get(6)?,
-                            object: row.get(7)?,
-                            memory_text: row.get(8)?,
-                            card_type: row.get(9)?,
-                            confidence: row.get(10)?,
-                            is_latest: row.get::<_, i32>(11)? != 0,
-                            is_static: row.get::<_, i32>(12)? != 0,
-                            is_inference: row.get::<_, i32>(13)? != 0,
-                            expires_at: row.get(14)?,
-                            root_card_id: row.get(15)?,
-                            parent_card_id: row.get(16)?,
-                            lifecycle: lifecycle_str.and_then(|s| serde_json::from_str(&s).ok()),
-                            source_turn_index: 0,
-                            document_time: 0,
-                            conversation_time: 0,
-                            event_time: None,
-                            created_at_ms: row.get(18)?,
-                            updated_at_ms: row.get(19)?,
-                        },
-                    ))
-                },
-            )?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(values), |row| {
+                let card = memory_card_row(row)?;
+                Ok((card.card_id.clone(), card))
+            })?;
             for row in rows {
                 let (card_id, card) = row?;
                 results.insert(card_id, card);
