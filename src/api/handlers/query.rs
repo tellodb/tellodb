@@ -734,6 +734,11 @@ enum RetrievalProfile {
 }
 
 fn retrieval_profile() -> RetrievalProfile {
+    static CACHED: std::sync::OnceLock<RetrievalProfile> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(retrieval_profile_uncached)
+}
+
+fn retrieval_profile_uncached() -> RetrievalProfile {
     match std::env::var("TEMPORAL_MEMORY_RETRIEVAL_PROFILE")
         .unwrap_or_else(|_| "fast".to_string())
         .to_ascii_lowercase()

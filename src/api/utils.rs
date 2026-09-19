@@ -34,6 +34,22 @@ pub const MIN_PHRASE_LEN: usize = 2;
 pub const DECAY_FLOOR: f32 = 0.35;
 pub const LAST_WEEK_DAY_OFFSET: u32 = 6;
 
+/// Reads an environment-tuned setting once.
+///
+/// These are read on the query path, and re-reading them per query lets a
+/// mutation mid-run change retrieval behaviour between two queries of the
+/// same benchmark, which would show up as irreproducible results rather than
+/// as an error. Reading once also means one lock and one allocation per
+/// process instead of per query.
+macro_rules! env_setting {
+    ($name:ident, $ty:ty, $body:expr) => {
+        fn $name() -> $ty {
+            static CACHED: std::sync::OnceLock<$ty> = std::sync::OnceLock::new();
+            *CACHED.get_or_init(|| $body)
+        }
+    };
+}
+
 pub fn env_bool(name: &str, default: bool) -> bool {
     match env::var(name) {
         Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
@@ -49,69 +65,100 @@ pub fn temporal_recency_scoring_enabled() -> bool {
     env_bool("TEMPORAL_MEMORY_ENABLE_TEMPORAL_RECENCY_SCORING", true)
 }
 
-pub fn scoped_semantic_top() -> usize {
+env_setting!(scoped_semantic_top_uncached, usize, {
     env::var("TEMPORAL_MEMORY_SCOPED_SEMANTIC_TOP")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&v| v >= SEMANTIC_TOP_DEFAULT)
         .unwrap_or(SEMANTIC_TOP_SCOPED_DEFAULT)
+});
+
+pub fn scoped_semantic_top() -> usize {
+    scoped_semantic_top_uncached()
 }
 
-pub fn scoped_semantic_start(max_top: usize) -> usize {
+env_setting!(scoped_semantic_start_uncapped, usize, {
     env::var("TEMPORAL_MEMORY_SCOPED_SEMANTIC_START")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&v| v >= SEMANTIC_TOP_DEFAULT)
         .unwrap_or(SEMANTIC_TOP_SCOPED_START_DEFAULT)
-        .min(max_top)
+});
+
+pub fn scoped_semantic_start(max_top: usize) -> usize {
+    scoped_semantic_start_uncapped().min(max_top)
 }
 
-pub fn scoped_semantic_step() -> usize {
+env_setting!(scoped_semantic_step_uncached, usize, {
     env::var("TEMPORAL_MEMORY_SCOPED_SEMANTIC_STEP")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&v| v > 0)
         .unwrap_or(SEMANTIC_TOP_SCOPED_STEP_DEFAULT)
+});
+
+pub fn scoped_semantic_step() -> usize {
+    scoped_semantic_step_uncached()
 }
 
-pub fn scoped_semantic_min_hits(limit: usize, max_top: usize) -> usize {
+env_setting!(scoped_semantic_min_hits_override, Option<usize>, {
     env::var("TEMPORAL_MEMORY_SCOPED_MIN_HITS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&v| v > 0)
+});
+
+pub fn scoped_semantic_min_hits(limit: usize, max_top: usize) -> usize {
+    scoped_semantic_min_hits_override()
         .unwrap_or_else(|| limit.saturating_mul(2).max(SEMANTIC_TOP_SCOPED_MIN_HITS_DEFAULT))
         .min(max_top)
 }
 
-pub fn scoped_ann_stop_max_attempts() -> usize {
+env_setting!(scoped_ann_stop_max_attempts_uncached, usize, {
     env::var("TEMPORAL_MEMORY_SCOPED_STOP_MAX_ATTEMPTS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&v| v > 0)
         .unwrap_or(SCOPED_ANN_STOP_MAX_ATTEMPTS_DEFAULT)
+});
+
+pub fn scoped_ann_stop_max_attempts() -> usize {
+    scoped_ann_stop_max_attempts_uncached()
 }
 
-pub fn scoped_ann_stop_min_similarity() -> f32 {
+env_setting!(scoped_ann_stop_min_similarity_uncached, f32, {
     env::var("TEMPORAL_MEMORY_SCOPED_STOP_MIN_SIM")
         .ok()
         .and_then(|v| v.parse::<f32>().ok())
         .filter(|v| v.is_finite() && *v >= -1.0 && *v <= 1.0)
         .unwrap_or(SCOPED_ANN_STOP_MIN_SIMILARITY_DEFAULT)
+});
+
+pub fn scoped_ann_stop_min_similarity() -> f32 {
+    scoped_ann_stop_min_similarity_uncached()
 }
 
-pub fn scoped_ann_stop_max_hit_gain() -> usize {
+env_setting!(scoped_ann_stop_max_hit_gain_uncached, usize, {
     env::var("TEMPORAL_MEMORY_SCOPED_STOP_MAX_HIT_GAIN")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(SCOPED_ANN_STOP_MAX_HIT_GAIN_DEFAULT)
+});
+
+pub fn scoped_ann_stop_max_hit_gain() -> usize {
+    scoped_ann_stop_max_hit_gain_uncached()
 }
 
-pub fn scoped_ann_stop_min_similarity_gain() -> f32 {
+env_setting!(scoped_ann_stop_min_similarity_gain_uncached, f32, {
     env::var("TEMPORAL_MEMORY_SCOPED_STOP_MIN_SIM_GAIN")
         .ok()
         .and_then(|v| v.parse::<f32>().ok())
         .filter(|v| v.is_finite() && *v >= 0.0)
         .unwrap_or(SCOPED_ANN_STOP_MIN_SIMILARITY_GAIN_DEFAULT)
+});
+
+pub fn scoped_ann_stop_min_similarity_gain() -> f32 {
+    scoped_ann_stop_min_similarity_gain_uncached()
 }
 
 pub struct ScopedAnnState {
