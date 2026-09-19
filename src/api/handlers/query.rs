@@ -2204,13 +2204,21 @@ pub(crate) fn rerank_policy_name() -> &'static str {
     }
 }
 
+/// Default `gate`: rerank only when stage-1 retrieval is actually uncertain.
+///
+/// The previous default, `heuristic`, decided from the query string — it
+/// fires on " and ", "would", "might", "why ", or merely a long question — so
+/// it reranked 93% of LongMemEval dev. A gate that opens for almost every
+/// query is not a gate, and the cross-encoder is the largest query stage
+/// (169 ms p50) for a recall difference that is not distinguishable from zero
+/// (-0.7, CI -2.0…+0.0). `gate` uses the retrieval scores it is supposed to.
 fn rerank_policy() -> RerankPolicy {
     static POLICY: std::sync::OnceLock<RerankPolicy> = std::sync::OnceLock::new();
     *POLICY.get_or_init(|| {
         match std::env::var("TELLODB_RERANK_POLICY").unwrap_or_default().trim() {
             "always" => RerankPolicy::Always,
-            "gate" => RerankPolicy::Gate,
-            _ => RerankPolicy::Heuristic,
+            "heuristic" => RerankPolicy::Heuristic,
+            _ => RerankPolicy::Gate,
         }
     })
 }
@@ -3190,6 +3198,15 @@ pub fn execute_query_pipeline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_rerank_policy_is_the_confidence_gate() {
+        // The string heuristic reranked 93% of LongMemEval dev, because it
+        // fires on " and ", "would", "might" or a long question. If this ever
+        // reverts to `heuristic`, the cross-encoder silently becomes an
+        // always-on 169 ms stage again.
+        assert_eq!(rerank_policy_name(), "gate");
+    }
 
     #[test]
     fn rerank_gate_flags_close_top_hits() {
