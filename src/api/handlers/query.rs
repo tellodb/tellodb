@@ -702,7 +702,7 @@ fn query_allows_stale_cards(query: &str, plan: &QueryPlan) -> bool {
         || lower.contains("old ")
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RetrievalBudget {
     semantic_top: usize,
     fts_top: usize,
@@ -716,11 +716,12 @@ struct RetrievalBudget {
     card_limit: usize,
 }
 
+#[repr(usize)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RetrievalProfile {
-    Fast,
-    Balanced,
-    Research,
+    Fast = 0,
+    Balanced = 1,
+    Research = 2,
 }
 
 fn retrieval_profile() -> RetrievalProfile {
@@ -744,7 +745,16 @@ fn auto_rerank_enabled(profile: RetrievalProfile) -> bool {
     env_bool("TEMPORAL_MEMORY_AUTO_RERANK", matches!(profile, RetrievalProfile::Research))
 }
 
-fn retrieval_budget_for_plan(plan: &QueryPlan, profile: RetrievalProfile) -> RetrievalBudget {
+#[repr(usize)]
+#[derive(Clone, Copy)]
+enum QueryShape {
+    Hard = 0,
+    Temporal = 1,
+    Numeric = 2,
+    Simple = 3,
+}
+
+fn query_shape(plan: &QueryPlan) -> QueryShape {
     let hard = plan.needs_decomposition
         || plan.cross_entity
         || plan.coverage_mode
@@ -757,119 +767,119 @@ fn retrieval_budget_for_plan(plan: &QueryPlan, profile: RetrievalProfile) -> Ret
         || plan.ordinal_rank.is_some();
     let numeric = matches!(plan.intent, QueryIntent::NumericAggregation);
 
-    if matches!(profile, RetrievalProfile::Fast) {
-        return if hard {
-            RetrievalBudget {
-                semantic_top: 320,
-                fts_top: 80,
-                semantic_query_limit: 3,
-                fts_query_limit: 3,
-                session_router_limit: 12,
-                route_probe_query_limit: 1,
-                route_probe_hit_limit: 10,
-                route_take_simple: 6,
-                route_take_hard: 10,
-                card_limit: 84,
-            }
-        } else if temporal {
-            RetrievalBudget {
-                semantic_top: 280,
-                fts_top: 72,
-                semantic_query_limit: 1,
-                fts_query_limit: 1,
-                session_router_limit: 8,
-                route_probe_query_limit: 1,
-                route_probe_hit_limit: 8,
-                route_take_simple: 6,
-                route_take_hard: 8,
-                card_limit: 64,
-            }
-        } else if numeric {
-            RetrievalBudget {
-                semantic_top: 260,
-                fts_top: 64,
-                semantic_query_limit: 1,
-                fts_query_limit: 1,
-                session_router_limit: 8,
-                route_probe_query_limit: 0,
-                route_probe_hit_limit: 0,
-                route_take_simple: 6,
-                route_take_hard: 8,
-                card_limit: 56,
-            }
-        } else {
-            RetrievalBudget {
-                semantic_top: 240,
-                fts_top: 64,
-                semantic_query_limit: 1,
-                fts_query_limit: 1,
-                session_router_limit: 6,
-                route_probe_query_limit: 0,
-                route_probe_hit_limit: 0,
-                route_take_simple: 5,
-                route_take_hard: 7,
-                card_limit: 48,
-            }
-        };
-    }
-
-    if matches!(profile, RetrievalProfile::Balanced) {
-        return if hard {
-            RetrievalBudget {
-                semantic_top: 420,
-                fts_top: 96,
-                semantic_query_limit: 3,
-                fts_query_limit: 3,
-                session_router_limit: 14,
-                route_probe_query_limit: 1,
-                route_probe_hit_limit: 12,
-                route_take_simple: 8,
-                route_take_hard: 12,
-                card_limit: 120,
-            }
-        } else if temporal {
-            RetrievalBudget {
-                semantic_top: 320,
-                fts_top: 80,
-                semantic_query_limit: 2,
-                fts_query_limit: 2,
-                session_router_limit: 10,
-                route_probe_query_limit: 1,
-                route_probe_hit_limit: 10,
-                route_take_simple: 8,
-                route_take_hard: 10,
-                card_limit: 88,
-            }
-        } else if numeric {
-            RetrievalBudget {
-                semantic_top: 300,
-                fts_top: 72,
-                semantic_query_limit: 2,
-                fts_query_limit: 2,
-                session_router_limit: 10,
-                route_probe_query_limit: 1,
-                route_probe_hit_limit: 10,
-                route_take_simple: 7,
-                route_take_hard: 9,
-                card_limit: 72,
-            }
-        } else {
-            RetrievalBudget {
-                semantic_top: 240,
-                fts_top: 64,
-                semantic_query_limit: 1,
-                fts_query_limit: 1,
-                session_router_limit: 8,
-                route_probe_query_limit: 0,
-                route_probe_hit_limit: 0,
-                route_take_simple: 6,
-                route_take_hard: 8,
-                card_limit: 56,
-            }
-        };
-    }
-
     if hard {
+        QueryShape::Hard
+    } else if temporal {
+        QueryShape::Temporal
+    } else if numeric {
+        QueryShape::Numeric
+    } else {
+        QueryShape::Simple
+    }
+}
+
+const BUDGETS: [[RetrievalBudget; 4]; 3] = [
+    [
+        RetrievalBudget {
+            semantic_top: 320,
+            fts_top: 80,
+            semantic_query_limit: 3,
+            fts_query_limit: 3,
+            session_router_limit: 12,
+            route_probe_query_limit: 1,
+            route_probe_hit_limit: 10,
+            route_take_simple: 6,
+            route_take_hard: 10,
+            card_limit: 84,
+        },
+        RetrievalBudget {
+            semantic_top: 280,
+            fts_top: 72,
+            semantic_query_limit: 1,
+            fts_query_limit: 1,
+            session_router_limit: 8,
+            route_probe_query_limit: 1,
+            route_probe_hit_limit: 8,
+            route_take_simple: 6,
+            route_take_hard: 8,
+            card_limit: 64,
+        },
+        RetrievalBudget {
+            semantic_top: 260,
+            fts_top: 64,
+            semantic_query_limit: 1,
+            fts_query_limit: 1,
+            session_router_limit: 8,
+            route_probe_query_limit: 0,
+            route_probe_hit_limit: 0,
+            route_take_simple: 6,
+            route_take_hard: 8,
+            card_limit: 56,
+        },
+        RetrievalBudget {
+            semantic_top: 240,
+            fts_top: 64,
+            semantic_query_limit: 1,
+            fts_query_limit: 1,
+            session_router_limit: 6,
+            route_probe_query_limit: 0,
+            route_probe_hit_limit: 0,
+            route_take_simple: 5,
+            route_take_hard: 7,
+            card_limit: 48,
+        },
+    ],
+    [
+        RetrievalBudget {
+            semantic_top: 420,
+            fts_top: 96,
+            semantic_query_limit: 3,
+            fts_query_limit: 3,
+            session_router_limit: 14,
+            route_probe_query_limit: 1,
+            route_probe_hit_limit: 12,
+            route_take_simple: 8,
+            route_take_hard: 12,
+            card_limit: 120,
+        },
+        RetrievalBudget {
+            semantic_top: 320,
+            fts_top: 80,
+            semantic_query_limit: 2,
+            fts_query_limit: 2,
+            session_router_limit: 10,
+            route_probe_query_limit: 1,
+            route_probe_hit_limit: 10,
+            route_take_simple: 8,
+            route_take_hard: 10,
+            card_limit: 88,
+        },
+        RetrievalBudget {
+            semantic_top: 300,
+            fts_top: 72,
+            semantic_query_limit: 2,
+            fts_query_limit: 2,
+            session_router_limit: 10,
+            route_probe_query_limit: 1,
+            route_probe_hit_limit: 10,
+            route_take_simple: 7,
+            route_take_hard: 9,
+            card_limit: 72,
+        },
+        RetrievalBudget {
+            semantic_top: 240,
+            fts_top: 64,
+            semantic_query_limit: 1,
+            fts_query_limit: 1,
+            session_router_limit: 8,
+            route_probe_query_limit: 0,
+            route_probe_hit_limit: 0,
+            route_take_simple: 6,
+            route_take_hard: 8,
+            card_limit: 56,
+        },
+    ],
+    [
         RetrievalBudget {
             semantic_top: 640,
             fts_top: 160,
@@ -881,8 +891,7 @@ fn retrieval_budget_for_plan(plan: &QueryPlan, profile: RetrievalProfile) -> Ret
             route_take_simple: 10,
             route_take_hard: 16,
             card_limit: 180,
-        }
-    } else if temporal {
+        },
         RetrievalBudget {
             semantic_top: 420,
             fts_top: 100,
@@ -894,8 +903,7 @@ fn retrieval_budget_for_plan(plan: &QueryPlan, profile: RetrievalProfile) -> Ret
             route_take_simple: 10,
             route_take_hard: 14,
             card_limit: 120,
-        }
-    } else if numeric {
+        },
         RetrievalBudget {
             semantic_top: 360,
             fts_top: 84,
@@ -907,8 +915,7 @@ fn retrieval_budget_for_plan(plan: &QueryPlan, profile: RetrievalProfile) -> Ret
             route_take_simple: 9,
             route_take_hard: 12,
             card_limit: 96,
-        }
-    } else {
+        },
         RetrievalBudget {
             semantic_top: 240,
             fts_top: 64,
@@ -920,8 +927,12 @@ fn retrieval_budget_for_plan(plan: &QueryPlan, profile: RetrievalProfile) -> Ret
             route_take_simple: 8,
             route_take_hard: 10,
             card_limit: 72,
-        }
-    }
+        },
+    ],
+];
+
+fn retrieval_budget_for_plan(plan: &QueryPlan, profile: RetrievalProfile) -> RetrievalBudget {
+    BUDGETS[profile as usize][query_shape(plan) as usize]
 }
 
 /// Edge-graph scores for each seed memory: a breadth-first walk of up to
@@ -3121,6 +3132,203 @@ mod tests {
         assert!(
             RerankDecision::GateUncertain.applies() && !RerankDecision::GateConfident.applies()
         );
+    }
+
+    #[test]
+    fn retrieval_budget_table_matches_existing_values() {
+        const EXPECTED: [[RetrievalBudget; 4]; 3] = [
+            [
+                RetrievalBudget {
+                    semantic_top: 320,
+                    fts_top: 80,
+                    semantic_query_limit: 3,
+                    fts_query_limit: 3,
+                    session_router_limit: 12,
+                    route_probe_query_limit: 1,
+                    route_probe_hit_limit: 10,
+                    route_take_simple: 6,
+                    route_take_hard: 10,
+                    card_limit: 84,
+                },
+                RetrievalBudget {
+                    semantic_top: 280,
+                    fts_top: 72,
+                    semantic_query_limit: 1,
+                    fts_query_limit: 1,
+                    session_router_limit: 8,
+                    route_probe_query_limit: 1,
+                    route_probe_hit_limit: 8,
+                    route_take_simple: 6,
+                    route_take_hard: 8,
+                    card_limit: 64,
+                },
+                RetrievalBudget {
+                    semantic_top: 260,
+                    fts_top: 64,
+                    semantic_query_limit: 1,
+                    fts_query_limit: 1,
+                    session_router_limit: 8,
+                    route_probe_query_limit: 0,
+                    route_probe_hit_limit: 0,
+                    route_take_simple: 6,
+                    route_take_hard: 8,
+                    card_limit: 56,
+                },
+                RetrievalBudget {
+                    semantic_top: 240,
+                    fts_top: 64,
+                    semantic_query_limit: 1,
+                    fts_query_limit: 1,
+                    session_router_limit: 6,
+                    route_probe_query_limit: 0,
+                    route_probe_hit_limit: 0,
+                    route_take_simple: 5,
+                    route_take_hard: 7,
+                    card_limit: 48,
+                },
+            ],
+            [
+                RetrievalBudget {
+                    semantic_top: 420,
+                    fts_top: 96,
+                    semantic_query_limit: 3,
+                    fts_query_limit: 3,
+                    session_router_limit: 14,
+                    route_probe_query_limit: 1,
+                    route_probe_hit_limit: 12,
+                    route_take_simple: 8,
+                    route_take_hard: 12,
+                    card_limit: 120,
+                },
+                RetrievalBudget {
+                    semantic_top: 320,
+                    fts_top: 80,
+                    semantic_query_limit: 2,
+                    fts_query_limit: 2,
+                    session_router_limit: 10,
+                    route_probe_query_limit: 1,
+                    route_probe_hit_limit: 10,
+                    route_take_simple: 8,
+                    route_take_hard: 10,
+                    card_limit: 88,
+                },
+                RetrievalBudget {
+                    semantic_top: 300,
+                    fts_top: 72,
+                    semantic_query_limit: 2,
+                    fts_query_limit: 2,
+                    session_router_limit: 10,
+                    route_probe_query_limit: 1,
+                    route_probe_hit_limit: 10,
+                    route_take_simple: 7,
+                    route_take_hard: 9,
+                    card_limit: 72,
+                },
+                RetrievalBudget {
+                    semantic_top: 240,
+                    fts_top: 64,
+                    semantic_query_limit: 1,
+                    fts_query_limit: 1,
+                    session_router_limit: 8,
+                    route_probe_query_limit: 0,
+                    route_probe_hit_limit: 0,
+                    route_take_simple: 6,
+                    route_take_hard: 8,
+                    card_limit: 56,
+                },
+            ],
+            [
+                RetrievalBudget {
+                    semantic_top: 640,
+                    fts_top: 160,
+                    semantic_query_limit: 5,
+                    fts_query_limit: 5,
+                    session_router_limit: 24,
+                    route_probe_query_limit: 4,
+                    route_probe_hit_limit: 20,
+                    route_take_simple: 10,
+                    route_take_hard: 16,
+                    card_limit: 180,
+                },
+                RetrievalBudget {
+                    semantic_top: 420,
+                    fts_top: 100,
+                    semantic_query_limit: 3,
+                    fts_query_limit: 3,
+                    session_router_limit: 16,
+                    route_probe_query_limit: 2,
+                    route_probe_hit_limit: 16,
+                    route_take_simple: 10,
+                    route_take_hard: 14,
+                    card_limit: 120,
+                },
+                RetrievalBudget {
+                    semantic_top: 360,
+                    fts_top: 84,
+                    semantic_query_limit: 3,
+                    fts_query_limit: 3,
+                    session_router_limit: 14,
+                    route_probe_query_limit: 2,
+                    route_probe_hit_limit: 14,
+                    route_take_simple: 9,
+                    route_take_hard: 12,
+                    card_limit: 96,
+                },
+                RetrievalBudget {
+                    semantic_top: 240,
+                    fts_top: 64,
+                    semantic_query_limit: 2,
+                    fts_query_limit: 2,
+                    session_router_limit: 10,
+                    route_probe_query_limit: 1,
+                    route_probe_hit_limit: 12,
+                    route_take_simple: 8,
+                    route_take_hard: 10,
+                    card_limit: 72,
+                },
+            ],
+        ];
+        let profiles =
+            [RetrievalProfile::Fast, RetrievalProfile::Balanced, RetrievalProfile::Research];
+        let shapes =
+            [QueryShape::Hard, QueryShape::Temporal, QueryShape::Numeric, QueryShape::Simple];
+
+        for (profile_index, profile) in profiles.into_iter().enumerate() {
+            for (shape_index, shape) in shapes.into_iter().enumerate() {
+                assert_eq!(
+                    retrieval_budget_for_plan(&plan_for_shape(shape), profile),
+                    EXPECTED[profile_index][shape_index],
+                    "profile {profile_index}, shape {shape_index}"
+                );
+            }
+        }
+    }
+
+    fn plan_for_shape(shape: QueryShape) -> QueryPlan {
+        let (intent, needs_decomposition) = match shape {
+            QueryShape::Hard => (QueryIntent::General, true),
+            QueryShape::Temporal => (QueryIntent::TemporalAggregation, false),
+            QueryShape::Numeric => (QueryIntent::NumericAggregation, false),
+            QueryShape::Simple => (QueryIntent::General, false),
+        };
+        QueryPlan {
+            semantic_queries: Vec::new(),
+            fts_queries: Vec::new(),
+            coverage_facets: Vec::new(),
+            requirements: Vec::new(),
+            prefer_distilled: false,
+            prefer_episodic: false,
+            temporal_terms: Vec::new(),
+            lexical_terms: Vec::new(),
+            intent,
+            subject_entities: Vec::new(),
+            cross_entity: false,
+            needs_decomposition,
+            coverage_mode: false,
+            ordinal_rank: None,
+            fact_key: None,
+            prefers_latest: false,
+        }
     }
 
     #[test]
