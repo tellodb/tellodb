@@ -107,6 +107,9 @@ mkdir -p "$CACHE_DIR/hf" "$CACHE_DIR/xdg" "$CACHE_DIR/models"
 ENV_FILE="$REPO_ROOT/.env.tellodb"
 cat > "$ENV_FILE" <<ENVEOF
 # Written by scripts/setup_gpu_box.sh — source this before running benchmarks.
+# cargo first: benchmark scripts build, and a non-interactive shell (tmux, ssh
+# command, cron) does not source ~/.cargo/env on its own.
+export PATH="\$HOME/.cargo/bin:\$PATH"
 export HF_HOME="$CACHE_DIR/hf"
 export HUGGINGFACE_HUB_CACHE="$CACHE_DIR/hf/hub"
 export XDG_CACHE_HOME="$CACHE_DIR/xdg"
