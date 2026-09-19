@@ -31,6 +31,7 @@ use axum::{
     response::IntoResponse,
 };
 use std::collections::{HashMap, HashSet};
+use std::ops::{Deref, DerefMut};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Default)]
@@ -702,7 +703,7 @@ fn query_allows_stale_cards(query: &str, plan: &QueryPlan) -> bool {
         || lower.contains("old ")
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct RetrievalBudget {
     semantic_top: usize,
     fts_top: usize,
@@ -1263,17 +1264,8 @@ const NEURAL_BATCH: usize = 32;
 // prevent zero-or-near-zero-similarity noise from contaminating RRF.
 const MIN_HIT_SIMILARITY: f32 = 0.30;
 
-struct QueryPipelineState {
-    payload: QueryPayload,
-    state: EngineState,
-    tenant: std::sync::Arc<TenantStore>,
-    limit: usize,
-    enable_neural_rerank: bool,
-    weights: ScoringWeights,
-
-    total_start: Instant,
-    route_start: Instant,
-
+#[derive(Default)]
+struct QueryPipelineData {
     raw_query_text: String,
     query_text: String,
     include_evidence: bool,
@@ -1298,13 +1290,39 @@ struct QueryPipelineState {
 
     neural_scores: HashMap<String, f32>,
 
-    now_ms: u64,
     fused: Vec<(String, u64, f32)>,
     graph_scores: HashMap<String, f32>,
 
     observations: HashMap<String, AgentObservation>,
     memory_cards: HashMap<String, MemoryCard>,
     invalidated_facts: HashSet<String>,
+}
+
+struct QueryPipelineState {
+    payload: QueryPayload,
+    state: EngineState,
+    tenant: std::sync::Arc<TenantStore>,
+    limit: usize,
+    enable_neural_rerank: bool,
+    weights: ScoringWeights,
+    total_start: Instant,
+    route_start: Instant,
+    now_ms: u64,
+    data: QueryPipelineData,
+}
+
+impl Deref for QueryPipelineState {
+    type Target = QueryPipelineData;
+
+    fn deref(&self) -> &Self::Target {
+        &self.data
+    }
+}
+
+impl DerefMut for QueryPipelineState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.data
+    }
 }
 
 impl QueryPipelineState {
@@ -1334,65 +1352,8 @@ impl QueryPipelineState {
             },
             total_start: Instant::now(),
             route_start: Instant::now(),
-            raw_query_text: String::new(),
-            query_text: String::new(),
-            include_evidence: false,
-            verify_evidence: false,
-            proof_mode: String::new(),
-            evidence_radius: 0,
-            plan: QueryPlan {
-                semantic_queries: Vec::new(),
-                fts_queries: Vec::new(),
-                coverage_facets: Vec::new(),
-                requirements: Vec::new(),
-                prefer_distilled: false,
-                prefer_episodic: false,
-                temporal_terms: Vec::new(),
-                lexical_terms: Vec::new(),
-                intent: QueryIntent::General,
-                subject_entities: Vec::new(),
-                cross_entity: false,
-                needs_decomposition: false,
-                coverage_mode: false,
-                ordinal_rank: None,
-                fact_key: None,
-                prefers_latest: false,
-            },
-            primary_qembed: Vec::new(),
-            budget: RetrievalBudget {
-                semantic_top: 0,
-                fts_top: 0,
-                semantic_query_limit: 0,
-                fts_query_limit: 0,
-                session_router_limit: 0,
-                route_probe_query_limit: 0,
-                route_probe_hit_limit: 0,
-                route_take_simple: 0,
-                route_take_hard: 0,
-                card_limit: 0,
-            },
-            semantic_top: 0,
-            fts_top: 0,
-            adaptive_profile: QueryAdaptiveProfile {
-                semantic_scale: 0.0,
-                lexical_scale: 0.0,
-                route_sessions: HashSet::new(),
-                route_strength: 0.0,
-            },
-            diag: QueryDiagnostics::default(),
-            session_route_scores: HashMap::new(),
-            routed_memory_ids: HashMap::new(),
-            primary_hnsw_raw: Vec::new(),
-            semantic_ranked_lists: Vec::new(),
-            fts_ranked_lists: Vec::new(),
-            card_ranked_items: Vec::new(),
-            neural_scores: HashMap::new(),
             now_ms,
-            fused: Vec::new(),
-            graph_scores: HashMap::new(),
-            observations: HashMap::new(),
-            memory_cards: HashMap::new(),
-            invalidated_facts: HashSet::new(),
+            data: QueryPipelineData::default(),
         }
     }
 }
@@ -2578,15 +2539,15 @@ fn score_hydrate(s: &mut QueryPipelineState) -> Result<(), StatusCode> {
     // Graph, link and edge lanes traverse tenant-wide structures, so they can
     // surface another entity's memories. Enforce the requested scope once,
     // here, where every candidate's owner is known.
-    if let Some(scope) = s.payload.entity_id.as_deref() {
-        let (observations, cards) = (&s.observations, &s.memory_cards);
+    if let Some(scope) = s.payload.entity_id.clone() {
+        let (observations, cards) = (&s.data.observations, &s.data.memory_cards);
         let in_scope = |mid: &String| {
             observations.get(mid).map_or(true, |o| o.entity_id == scope)
                 && cards.get(mid).map_or(true, |c| c.entity_id == scope)
         };
-        s.fused.retain(|(mid, _, _)| in_scope(mid));
-        let kept: HashSet<&String> = s.fused.iter().map(|(mid, _, _)| mid).collect();
-        s.observations.retain(|mid, _| kept.contains(mid));
+        s.data.fused.retain(|(mid, _, _)| in_scope(mid));
+        let kept: HashSet<String> = s.data.fused.iter().map(|(mid, _, _)| mid.clone()).collect();
+        s.data.observations.retain(|mid, _| kept.contains(mid));
     }
     Ok(())
 }
@@ -3102,7 +3063,7 @@ pub fn execute_query_pipeline(
     rerank_phase(&mut s);
     fusion_phase(&mut s);
     let results = score_phase(&mut s)?;
-    Ok((results, s.diag))
+    Ok((results, std::mem::take(&mut s.data.diag)))
 }
 
 #[cfg(test)]

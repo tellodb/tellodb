@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use crate::api::types::EvidenceCard;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct QueryPlan {
     pub semantic_queries: Vec<String>,
     pub fts_queries: Vec<String>,
@@ -43,13 +43,14 @@ pub struct QueryRequirement {
     pub require_all_entities: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum QueryIntent {
     NumericAggregation,
     TemporalAggregation,
     Recommendation,
     Inference,
     PeripheralMention,
+    #[default]
     General,
 }
 
@@ -59,7 +60,7 @@ pub enum QueryModality {
     Lexical,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct QueryAdaptiveProfile {
     pub semantic_scale: f32,
     pub lexical_scale: f32,
