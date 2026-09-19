@@ -4147,6 +4147,26 @@ mod tests {
     }
 
     #[test]
+    fn entity_tokens_survive_the_porter_tokenizer() {
+        // The token goes through `porter unicode61`, whose suffix rules
+        // rewrite endings like ED, EED and AT. Hex digits include a-f, so a
+        // token can consist only of letters and be eligible for stemming. If
+        // two entities stemmed alike, one entity would read another's rows.
+        let dir = tempfile::tempdir().unwrap();
+        let store = TenantStore::new(&dir.path().join("t.db")).unwrap();
+        // Characters whose UTF-8 bytes are all a-f, so the hex is all letters.
+        let ids = ["\u{caa}", "\u{cab}", "\u{cae}", "\u{caa}\u{cab}", "feed", "deed", "aed"];
+        for id in ids {
+            store.fts_index_text(&format!("{id}::s::0"), "shared words", id).unwrap();
+        }
+        for id in ids {
+            let hits = store.fts_search("shared", 10, Some(id)).unwrap();
+            assert_eq!(hits.len(), 1, "entity {id:?} matched {hits:?}");
+            assert!(hits[0].0.starts_with(&format!("{id}::")), "{id:?} -> {hits:?}");
+        }
+    }
+
+    #[test]
     fn entity_tokens_are_single_tokens_and_distinct() {
         assert_eq!(fts_entity_tok("ab"), "e6162");
         assert_ne!(fts_entity_tok("alice"), fts_entity_tok("bob"));
