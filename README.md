@@ -71,6 +71,7 @@ wins. An unset value uses the default shown below.
 | `TELLODB_HEURISTICS` | `generic` | Heuristic profile: `generic` or `legacy-tuned`. |
 | `TELLODB_LANES` | `all` | Query lanes allowlist: `vector`, `fts`, `cards`, `rerank`, `graph`, and `route`. |
 | `TELLODB_RETRIEVAL_PROFILE` | `fast` | Retrieval budget profile: `fast`, `balanced`, or `research`. |
+| `TELLODB_EXPANSION_RULES` | bundled `rules/expansions.v1.json` | Optional path to a versioned query-expansion rules document. |
 | `TELLODB_AUTO_RERANK` | unset | Optional boolean override for automatic reranking. |
 | `TELLODB_SCOPED_SEMANTIC_TOP` | `3000` | Maximum scoped vector candidates. |
 | `TELLODB_SCOPED_SEMANTIC_START` | `256` | Initial scoped vector search size. |

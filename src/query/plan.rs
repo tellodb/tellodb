@@ -1,5 +1,5 @@
 use super::{
-    build_hyde_query, build_query_adaptive_profile, build_query_plan_with_profile,
+    build_hyde_query, build_query_adaptive_profile, build_query_plan_with_profile_and_rules,
     elapsed_ms_and_us, parse_temporal_window, rewrite_query_for_retrieval, Feature, HashMap,
     Instant, MemoryKind, QueryDiagnostics, QueryIntent, QueryPipelineState, QueryPlan,
     RetrievalProfile, ScorableObservation,
@@ -380,10 +380,11 @@ pub(crate) fn plan_phase(s: &mut QueryPipelineState) {
     s.evidence_radius = s.payload.max_evidence_turns_per_session.unwrap_or(0).min(3) as u32;
 
     let planning_start = Instant::now();
-    s.plan = build_query_plan_with_profile(
+    s.plan = build_query_plan_with_profile_and_rules(
         &s.query_text,
         s.state.intent_classifier.as_deref(),
         s.state.config.heuristics,
+        &s.state.config.expansion_rules,
     );
 
     if let Some(hyde_query) = build_hyde_query(&s.query_text, &s.plan) {

@@ -14,6 +14,7 @@ pub use types::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::heuristics::Profile;
 
     #[test]
     fn purchase_queries_are_slot_routed() {
@@ -103,5 +104,26 @@ mod tests {
         assert!(plan.lexical_terms.iter().any(|term| term == "device"));
         assert!(plan.lexical_terms.iter().any(|term| term == "computer"));
         assert!(plan.lexical_terms.iter().any(|term| term == "issue"));
+    }
+
+    #[test]
+    fn custom_expansion_rules_replace_builtin_lexicon() {
+        let rules = crate::config::ExpansionRules {
+            version: "v1".to_string(),
+            rules: vec![crate::config::ExpansionRule {
+                trigger_tokens: vec!["nebula".to_string()],
+                expansions: vec!["starlight".to_string()],
+            }],
+        };
+        let terms = build_query_expansion_terms_with_profile_and_rules(
+            "What does the nebula mean?",
+            None,
+            QueryIntent::General,
+            &[],
+            Profile::Generic,
+            &rules,
+        );
+        assert!(terms.iter().any(|term| term == "starlight"));
+        assert!(!terms.iter().any(|term| term == "museum"));
     }
 }

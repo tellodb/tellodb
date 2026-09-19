@@ -1,0 +1,53 @@
+{
+  "version": "v1",
+  "rules": [
+    {
+      "trigger_tokens": ["kid", "kids", "child", "children", "daughter", "son", "family"],
+      "expansions": ["kid", "child", "children", "daughter", "son", "family", "museum", "dinosaur", "park", "camping", "nature", "love", "fun"]
+    },
+    {
+      "trigger_tokens": ["destress", "de-stress", "relax", "unwind", "stress"],
+      "expansions": ["destress", "relax", "unwind", "stress", "relief", "escape", "dance", "music", "yoga", "nature", "art"]
+    },
+    {
+      "trigger_tokens": ["volunteer", "volunteering", "charity", "donate", "donation"],
+      "expansions": ["volunteer", "volunteering", "charity", "community", "church", "shelter", "donate", "homeless", "fundraiser"]
+    },
+    {
+      "trigger_tokens": ["patriotic", "political", "politics", "office", "vote", "campaign"],
+      "expansions": ["country", "community", "office", "politics", "campaign", "vote", "public", "service", "serve", "serving", "proud", "volunteer", "rights", "activist"]
+    },
+    {
+      "trigger_tokens": ["pet", "dog", "animal", "turtle"],
+      "expansions": ["pet", "dog", "animal", "companion", "family", "training", "shelter", "veterinarian"]
+    },
+    {
+      "trigger_tokens": ["workshop", "course", "class", "training", "mentor", "mentorship"],
+      "expansions": ["workshop", "course", "class", "training", "mentor", "program"]
+    },
+    {
+      "trigger_tokens": ["paint", "painting", "pottery", "art", "artist", "draw", "drawing"],
+      "expansions": ["art", "paint", "painting", "draw", "drawing", "creative", "pottery"]
+    },
+    {
+      "trigger_tokens": ["promotion", "promoted", "promote"],
+      "expansions": ["promoted", "promotion", "role", "position", "manager", "lead"]
+    },
+    {
+      "trigger_tokens": ["electronic", "electronics", "device", "smartwatch", "watch"],
+      "expansions": ["device", "phone", "laptop", "computer", "watch", "smartwatch", "fitness", "tracker", "broken", "issue"]
+    },
+    {
+      "trigger_tokens": ["digestive", "stomach", "indigestion", "nausea"],
+      "expansions": ["digestive", "stomach", "indigestion", "nausea", "sick", "ache"]
+    },
+    {
+      "trigger_tokens": ["popular", "fanbase", "famous", "audience", "followers"],
+      "expansions": ["popular", "fanbase", "audience", "follower", "brand", "global", "music"]
+    },
+    {
+      "trigger_tokens": ["health", "fitness", "lifestyle", "stress", "challenge", "cope"],
+      "expansions": ["health", "fitness", "exercise", "diet", "stress", "challenge", "cope", "wellbeing", "mental", "nature", "creative"]
+    }
+  ]
+}

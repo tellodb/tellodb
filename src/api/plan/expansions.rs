@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use super::types::CoverageFacet;
 use super::types::QueryIntent;
 use super::types::QueryRequirement;
+use crate::config::ExpansionRules;
 use crate::core::calendar::extract_temporal_terms;
 use crate::core::text::{
     dedupe_preserve_order, extract_salient_terms, has_token, is_low_signal_keyword,
@@ -75,9 +76,9 @@ pub fn build_keyword_query(query: &str) -> Option<String> {
     (!keyword_query.is_empty()).then_some(keyword_query)
 }
 
-fn push_expansion_terms(out: &mut Vec<String>, terms: &[&str]) {
+fn push_expansion_terms<T: AsRef<str>>(out: &mut Vec<String>, terms: &[T]) {
     for term in terms {
-        push_expansion_term(out, term, 3);
+        push_expansion_term(out, term.as_ref(), 3);
     }
 }
 
@@ -88,147 +89,47 @@ fn push_expansion_term(out: &mut Vec<String>, term: &str, min_len: usize) {
     }
 }
 
-struct ExpansionRule {
-    trigger_tokens: &'static [&'static str],
-    expansions: &'static [&'static str],
-}
-
-const EXPANSION_RULES: &[ExpansionRule] = &[
-    ExpansionRule {
-        trigger_tokens: &["kid", "kids", "child", "children", "daughter", "son", "family"],
-        expansions: &[
-            "kid", "child", "children", "daughter", "son", "family", "museum", "dinosaur", "park",
-            "camping", "nature", "love", "fun",
-        ],
-    },
-    ExpansionRule {
-        trigger_tokens: &["destress", "de-stress", "relax", "unwind", "stress"],
-        expansions: &[
-            "destress", "relax", "unwind", "stress", "relief", "escape", "dance", "music", "yoga",
-            "nature", "art",
-        ],
-    },
-    ExpansionRule {
-        trigger_tokens: &["volunteer", "volunteering", "charity", "donate", "donation"],
-        expansions: &[
-            "volunteer",
-            "volunteering",
-            "charity",
-            "community",
-            "church",
-            "shelter",
-            "donate",
-            "homeless",
-            "fundraiser",
-        ],
-    },
-    ExpansionRule {
-        trigger_tokens: &["patriotic", "political", "politics", "office", "vote", "campaign"],
-        expansions: &[
-            "country",
-            "community",
-            "office",
-            "politics",
-            "campaign",
-            "vote",
-            "public",
-            "service",
-            "serve",
-            "serving",
-            "proud",
-            "volunteer",
-            "rights",
-            "activist",
-        ],
-    },
-    ExpansionRule {
-        trigger_tokens: &["pet", "dog", "animal", "turtle"],
-        expansions: &[
-            "pet",
-            "dog",
-            "animal",
-            "companion",
-            "family",
-            "training",
-            "shelter",
-            "veterinarian",
-        ],
-    },
-    ExpansionRule {
-        trigger_tokens: &["workshop", "course", "class", "training", "mentor", "mentorship"],
-        expansions: &["workshop", "course", "class", "training", "mentor", "program"],
-    },
-    ExpansionRule {
-        trigger_tokens: &["paint", "painting", "pottery", "art", "artist", "draw", "drawing"],
-        expansions: &["art", "paint", "painting", "draw", "drawing", "creative", "pottery"],
-    },
-    ExpansionRule {
-        trigger_tokens: &["promotion", "promoted", "promote"],
-        expansions: &["promoted", "promotion", "role", "position", "manager", "lead"],
-    },
-    ExpansionRule {
-        trigger_tokens: &["electronic", "electronics", "device", "smartwatch", "watch"],
-        expansions: &[
-            "device",
-            "phone",
-            "laptop",
-            "computer",
-            "watch",
-            "smartwatch",
-            "fitness",
-            "tracker",
-            "broken",
-            "issue",
-        ],
-    },
-    ExpansionRule {
-        trigger_tokens: &["digestive", "stomach", "indigestion", "nausea"],
-        expansions: &["digestive", "stomach", "indigestion", "nausea", "sick", "ache"],
-    },
-    ExpansionRule {
-        trigger_tokens: &["popular", "fanbase", "famous", "audience", "followers"],
-        expansions: &["popular", "fanbase", "audience", "follower", "brand", "global", "music"],
-    },
-    ExpansionRule {
-        trigger_tokens: &["health", "fitness", "lifestyle", "stress", "challenge", "cope"],
-        expansions: &[
-            "health",
-            "fitness",
-            "exercise",
-            "diet",
-            "stress",
-            "challenge",
-            "cope",
-            "wellbeing",
-            "mental",
-            "nature",
-            "creative",
-        ],
-    },
-];
-
 pub fn build_query_expansion_terms(
     query: &str,
     slot_key: Option<&str>,
     intent: QueryIntent,
     subject_entities: &[String],
 ) -> Vec<String> {
-    build_query_expansion_terms_with_profile(
+    build_query_expansion_terms_with_profile_and_rules(
         query,
         slot_key,
         intent,
         subject_entities,
         Profile::Generic,
+        ExpansionRules::builtin(),
     )
 }
 
-#[allow(clippy::too_many_lines)]
 pub fn build_query_expansion_terms_with_profile(
     query: &str,
     slot_key: Option<&str>,
     intent: QueryIntent,
     subject_entities: &[String],
     profile: Profile,
+) -> Vec<String> {
+    build_query_expansion_terms_with_profile_and_rules(
+        query,
+        slot_key,
+        intent,
+        subject_entities,
+        profile,
+        ExpansionRules::builtin(),
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+pub fn build_query_expansion_terms_with_profile_and_rules(
+    query: &str,
+    slot_key: Option<&str>,
+    intent: QueryIntent,
+    subject_entities: &[String],
+    profile: Profile,
+    rules: &ExpansionRules,
 ) -> Vec<String> {
     let lower = query.to_ascii_lowercase();
     let tokens = normalize_alpha_tokens(query)
@@ -319,9 +220,9 @@ pub fn build_query_expansion_terms_with_profile(
         }
     }
 
-    for rule in EXPANSION_RULES {
-        if has_any_singular(rule.trigger_tokens) {
-            push_expansion_terms(&mut terms, rule.expansions);
+    for rule in rules.iter() {
+        if rule.trigger_tokens.iter().any(|needle| has(needle)) {
+            push_expansion_terms(&mut terms, &rule.expansions);
         }
     }
 

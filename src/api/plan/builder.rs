@@ -2,7 +2,7 @@ use super::expansions::{
     build_coverage_facets, build_cross_entity_subqueries, build_expansion_query,
     build_fact_slot_queries, build_hypothetical_semantic_queries, build_inference_semantic_hints,
     build_keyword_query, build_peripheral_fts_query, build_purchase_queries,
-    build_query_expansion_terms_with_profile, build_query_requirements,
+    build_query_expansion_terms_with_profile_and_rules, build_query_requirements,
     infer_query_fact_key_with_profile, is_purchase_query,
 };
 use super::intent::{
@@ -13,6 +13,7 @@ use super::scoring::{
     query_prefers_episodic,
 };
 use super::types::{QueryIntent, QueryPlan};
+use crate::config::ExpansionRules;
 use crate::core::calendar::extract_temporal_terms;
 use crate::core::text::{dedupe_preserve_order, is_low_signal_keyword, singularize_token};
 use crate::fts::tokenize_for_similarity;
@@ -29,17 +30,28 @@ pub fn build_query_plan_with_profile(
     classifier: Option<&QueryIntentClassifier>,
     profile: Profile,
 ) -> QueryPlan {
+    build_query_plan_with_profile_and_rules(query, classifier, profile, ExpansionRules::builtin())
+}
+
+#[allow(clippy::too_many_lines)]
+pub fn build_query_plan_with_profile_and_rules(
+    query: &str,
+    classifier: Option<&QueryIntentClassifier>,
+    profile: Profile,
+    rules: &ExpansionRules,
+) -> QueryPlan {
     let keyword_query = build_keyword_query(query);
     let subject_entities = extract_subject_entities(query);
     let ordinal_rank = extract_ordinal_rank(query);
     let inferred_intent = classify_query_intent(query, classifier);
     let slot_key = infer_query_fact_key_with_profile(query, profile);
-    let expansion_terms = build_query_expansion_terms_with_profile(
+    let expansion_terms = build_query_expansion_terms_with_profile_and_rules(
         query,
         slot_key.as_deref(),
         inferred_intent,
         &subject_entities,
         profile,
+        rules,
     );
     let cross_entity = {
         let lower = query.to_ascii_lowercase();

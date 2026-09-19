@@ -1,6 +1,8 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use std::env;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use crate::api::types::RankingConfig;
 use crate::features::Features;
@@ -17,12 +19,79 @@ const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_CONTEXT_WINDOW: u32 = 1;
 const DEFAULT_PREDICATE_CANON_TAU: f32 = 0.86;
 const DEFAULT_EXTRACTOR_THRESHOLD: f32 = 0.5;
+const BUILTIN_EXPANSION_RULES_JSON: &str =
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/rules/expansions.v1.json"));
 pub(crate) const LEGACY_ENV_REMOVAL_DATE: &str = "2027-01-01";
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct ExpansionRule {
+    pub trigger_tokens: Vec<String>,
+    pub expansions: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct ExpansionRules {
+    pub version: String,
+    pub rules: Vec<ExpansionRule>,
+}
+
+impl ExpansionRules {
+    pub fn builtin() -> &'static Self {
+        static RULES: OnceLock<ExpansionRules> = OnceLock::new();
+        RULES.get_or_init(|| {
+            Self::from_json(BUILTIN_EXPANSION_RULES_JSON)
+                .expect("bundled expansion rules must be valid")
+        })
+    }
+
+    pub fn from_json(raw: &str) -> Result<Self> {
+        let rules: Self = serde_json::from_str(raw).context("parse expansion rules JSON")?;
+        if rules.version != "v1" {
+            bail!("unsupported expansion rules version '{}'", rules.version);
+        }
+        if rules.rules.is_empty() {
+            bail!("expansion rules must contain at least one rule");
+        }
+        if rules
+            .rules
+            .iter()
+            .any(|rule| rule.trigger_tokens.is_empty() || rule.expansions.is_empty())
+        {
+            bail!("expansion rules cannot contain empty triggers or expansions");
+        }
+        Ok(rules)
+    }
+
+    pub fn from_path(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let raw = fs::read_to_string(path)
+            .with_context(|| format!("read expansion rules from {}", path.display()))?;
+        Self::from_json(&raw)
+    }
+
+    pub fn from_env() -> Result<Self> {
+        match value("TELLODB_EXPANSION_RULES", None).filter(|path| !path.trim().is_empty()) {
+            Some(path) => Self::from_path(path),
+            None => Ok(Self::default()),
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &ExpansionRule> {
+        self.rules.iter()
+    }
+}
+
+impl Default for ExpansionRules {
+    fn default() -> Self {
+        Self::builtin().clone()
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
     pub features: Features,
     pub heuristics: Profile,
+    pub expansion_rules: ExpansionRules,
     pub lanes: Lanes,
     pub ranking: RankingConfig,
     pub scoring: ScoringWeights,
@@ -181,6 +250,7 @@ impl Default for Config {
         Self {
             features: Features::default(),
             heuristics: Profile::Generic,
+            expansion_rules: ExpansionRules::default(),
             lanes: Lanes::default(),
             ranking: RankingConfig::default(),
             scoring: ScoringWeights::default(),
@@ -201,6 +271,7 @@ impl Config {
         let defaults = Self::default();
         let features = Features::parse(&value("TELLODB_DISABLE", None).unwrap_or_default())?;
         let heuristics = Profile::parse(&value("TELLODB_HEURISTICS", None).unwrap_or_default())?;
+        let expansion_rules = ExpansionRules::from_env()?;
         let lanes = Lanes::parse(&value("TELLODB_LANES", None).unwrap_or_default())?;
         let dimensions = usize_value("TELLODB_EMBEDDING_DIM", None).filter(|value| *value > 0);
         let embedding = EmbeddingConfig::from_env(&defaults.embedding, dimensions);
@@ -217,6 +288,7 @@ impl Config {
         Ok(Self {
             features,
             heuristics,
+            expansion_rules,
             lanes,
             ranking: RankingConfig::default(),
             scoring: ScoringWeights::default(),
@@ -650,6 +722,24 @@ mod tests {
         assert_eq!(config.retrieval.scoped_semantic_top, 3000);
         assert_eq!(config.embedding.max_tokens, 512);
         assert_eq!(config.rerank.top, 25);
+        assert_eq!(config.expansion_rules.version, "v1");
+        assert_eq!(config.expansion_rules.rules.len(), 12);
+    }
+
+    #[test]
+    fn custom_expansion_rules_document_is_versioned_and_validated() {
+        let rules = ExpansionRules::from_json(
+            r#"{
+                "version": "v1",
+                "rules": [{
+                    "trigger_tokens": ["nebula"],
+                    "expansions": ["starlight"]
+                }]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(rules.rules[0].trigger_tokens, ["nebula"]);
+        assert_eq!(rules.rules[0].expansions, ["starlight"]);
     }
 
     #[test]
