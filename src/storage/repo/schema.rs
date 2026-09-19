@@ -275,6 +275,7 @@ impl TenantStore {
         Ok(count > 0)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn migrate(conn: &rusqlite::Connection) -> Result<()> {
         if !Self::has_column(conn, "memories", "content_hash")? {
             conn.execute_batch(
@@ -324,6 +325,30 @@ impl TenantStore {
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_fact_versions_memory ON fact_versions(memory_id);",
         )?;
+
+        if version < SCHEMA_VERSION {
+            let rows: Vec<(i64, String, String, String)> = {
+                let mut stmt = conn.prepare_cached(
+                    "SELECT rowid, content, entity_id, kind FROM memories ORDER BY rowid",
+                )?;
+                let mapped = stmt.query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })?;
+                mapped.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let tx = conn.unchecked_transaction()?;
+            {
+                let mut update =
+                    tx.prepare_cached("UPDATE memories SET content_hash = ?1 WHERE rowid = ?2")?;
+                for (rowid, content, entity_id, kind) in rows {
+                    update.execute(params![
+                        content_hash(&content, &entity_id, MemoryKind::parse(&kind)),
+                        rowid,
+                    ])?;
+                }
+            }
+            tx.commit()?;
+        }
 
         // Structures that were written on ingest but never read by retrieval.
         conn.execute_batch(

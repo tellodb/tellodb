@@ -114,7 +114,7 @@ pub(crate) fn fts_rowid(key: &str) -> i64 {
 }
 
 /// Schema version recorded in `PRAGMA user_version`.
-pub(crate) const SCHEMA_VERSION: i64 = 4;
+pub(crate) const SCHEMA_VERSION: i64 = 5;
 
 impl TenantStore {
     pub fn new(path: &Path) -> Result<Self> {
@@ -529,6 +529,38 @@ mod tests {
             let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
             assert_eq!(version, SCHEMA_VERSION);
         }
+    }
+
+    #[test]
+    fn content_hash_migration_preserves_dedup_identity() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tenant.db");
+        {
+            let store = TenantStore::new(&path).unwrap();
+            store
+                .insert_observations_batch(&[(
+                    100,
+                    "m1".to_string(),
+                    AgentObservation {
+                        entity_id: "alice".to_string(),
+                        textual_content: "I live in Denver.".to_string(),
+                        kind: MemoryKind::Fact,
+                        content_hash: "legacy-debug-hash".to_string(),
+                        created_at_ms: 100,
+                        ..Default::default()
+                    },
+                )])
+                .unwrap();
+            let conn = store.get_conn().unwrap();
+            conn.execute("PRAGMA user_version = 4", []).unwrap();
+        }
+
+        let store = TenantStore::new(&path).unwrap();
+        let expected =
+            crate::storage::types::content_hash("I live in Denver.", "alice", MemoryKind::Fact);
+        let hashes = store.stored_content_hashes(&["m1".to_string()]).unwrap();
+        assert_eq!(hashes.get("m1"), Some(&expected));
+        assert_eq!(store.existing_content_hashes(&[expected]).unwrap().len(), 1);
     }
 
     #[test]

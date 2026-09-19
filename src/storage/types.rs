@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 
 use crate::lifecycle::LifecycleMetadata;
 
@@ -50,6 +51,23 @@ impl MemoryKind {
     pub fn is_decay_exempt(&self) -> bool {
         matches!(self, MemoryKind::Preference | MemoryKind::Decision)
     }
+}
+
+pub(crate) fn content_hash(text: &str, entity_id: &str, kind: MemoryKind) -> String {
+    use sha2::Digest;
+
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(text.as_bytes());
+    hasher.update([58, 58]);
+    hasher.update(entity_id.as_bytes());
+    hasher.update([58, 58]);
+    hasher.update(kind.as_str().as_bytes());
+    let digest = hasher.finalize();
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
 }
 
 #[derive(Debug, PartialEq, Clone, Default)]

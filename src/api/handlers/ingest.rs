@@ -28,31 +28,13 @@ use crate::graph::EdgeType;
 use crate::ml::cosine_similarity;
 use std::sync::Arc;
 
-/// Compute a deterministic content hash for dedup.
-/// Uses the text content, entity_id, and kind so that re-ingesting
-/// the same factual statement is naturally idempotent.
-fn content_hash(text: &str, entity_id: &str, kind: &str) -> String {
-    use sha2::Digest;
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(text.as_bytes());
-    hasher.update(CONTENT_HASH_SEPARATOR);
-    hasher.update(entity_id.as_bytes());
-    hasher.update(CONTENT_HASH_SEPARATOR);
-    hasher.update(kind.as_bytes());
-    let result = hasher.finalize();
-    let mut output = String::with_capacity(result.len() * 2);
-    for byte in result {
-        let _ = write!(output, "{byte:02x}");
-    }
-    output
-}
 type RetrospectiveCandidate = (String, String, String, u64, String, String);
-const CONTENT_HASH_SEPARATOR: &[u8] = &[58, 58];
 use crate::features::{Feature, Features};
 use crate::heuristics::Profile;
 use crate::lifecycle::{evaluate_lifecycle, LifecycleMetadata};
 use crate::metrics;
 use crate::storage::repo::traits::{RetrospectiveRepo, VectorRepo};
+use crate::storage::types::content_hash;
 use crate::storage::{
     build_session_router_text, AgentObservation, MemoryCard, MemoryKind, SessionRouterRecord,
     TenantStore,
@@ -600,9 +582,7 @@ fn build_observations(
             semantic_seen.push((payload.entity_id.clone(), embedding.clone()));
         }
 
-        // Keep the legacy Debug representation in content hashes until the Phase 7 migration
-        // recomputes existing hashes; changing it would break deduplication.
-        let hash = content_hash(&payload.textual_content, &payload.entity_id, &format!("{kind:?}"));
+        let hash = content_hash(&payload.textual_content, &payload.entity_id, kind);
         let obs = AgentObservation {
             entity_id: payload.entity_id.clone(),
             textual_content: payload.textual_content.clone(),
@@ -1382,12 +1362,10 @@ async fn execute_ingest_pipeline(
         let keep: Vec<bool> = expanded_payloads
             .iter()
             .map(|p| {
-                // Keep the legacy Debug representation in content hashes until the Phase 7 migration
-                // recomputes existing hashes; changing it would break deduplication.
                 let hash = content_hash(
                     &p.textual_content,
                     &p.entity_id,
-                    &format!("{:?}", MemoryKind::parse(p.kind.as_deref().unwrap_or_default())),
+                    MemoryKind::parse(p.kind.as_deref().unwrap_or_default()),
                 );
                 stored.get(&p.memory_id) != Some(&hash)
             })
