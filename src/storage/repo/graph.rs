@@ -368,18 +368,18 @@ impl TenantStore {
         &self,
         entity: &str,
         _label: Option<&str>,
-        direction: &str,
+        direction: crate::graph::Direction,
         limit: usize,
     ) -> Result<Vec<GraphEdge>> {
         let conn = self.get_conn()?;
         let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match direction {
-            "Inbound" => (
+            crate::graph::Direction::In => (
                 "SELECT edge_id, source, target, edge_type, label, weight, timestamp_ms, memory_id
                  FROM edges WHERE target = ?1 ORDER BY timestamp_ms DESC LIMIT ?2"
                     .to_string(),
                 vec![Box::new(entity.to_string()), Box::new(limit as i64)],
             ),
-            "Both" => (
+            crate::graph::Direction::Both => (
                 format!(
                     "SELECT edge_id, source, target, edge_type, label, weight, timestamp_ms, memory_id
                      FROM edges WHERE (source = ?1 OR target = ?1) AND edge_type != '{}'

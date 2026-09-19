@@ -292,7 +292,7 @@ impl Engine {
     pub fn explore_graph(&self, node: &str, limit: usize) -> Result<Vec<String>> {
         Ok(self
             .tenant
-            .graph_query_edges(node, None, "Both", limit.clamp(1, 500))?
+            .graph_query_edges(node, None, crate::graph::Direction::Both, limit.clamp(1, 500))?
             .iter()
             .map(|e| format!("{} --[{}]--> {}", e.source, e.label, e.target))
             .collect())

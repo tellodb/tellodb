@@ -10,6 +10,7 @@ use crate::api::utils::{
 };
 use crate::api::{EngineState, PlatformWriteOp};
 use crate::error::{EngineError, EngineResult};
+use crate::graph::Direction;
 use crate::metrics;
 use crate::query::execute_query_pipeline;
 use crate::storage::repo::traits::QueryRepo;
@@ -290,14 +291,6 @@ pub async fn query_handler(
     Ok((StatusCode::OK, h, Json(results)))
 }
 
-fn parse_graph_direction_str(direction: Option<&str>) -> &'static str {
-    match direction.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
-        Some("in" | "inbound") => "Inbound",
-        Some("both") => "Both",
-        _ => "Outbound",
-    }
-}
-
 fn scoped_graph_node_id(requested: Option<String>) -> EngineResult<String> {
     let node_id = match requested {
         Some(id) if !id.trim().is_empty() => id.trim().to_string(),
@@ -326,7 +319,7 @@ pub async fn graph_query_handler(
         tenant_clone.graph_query_edges(
             &subject,
             payload.edge_type.as_deref(),
-            parse_graph_direction_str(payload.direction.as_deref()),
+            Direction::parse(payload.direction.as_deref()),
             payload.limit.unwrap_or(50).min(500),
         )
     })
@@ -356,7 +349,7 @@ pub async fn graph_walk_handler(
         tenant_clone.graph_query_edges(
             &node,
             edge_type,
-            parse_graph_direction_str(payload.direction.as_deref()),
+            Direction::parse(payload.direction.as_deref()),
             payload.limit.unwrap_or(250).min(2_000),
         )
     })
@@ -386,7 +379,7 @@ pub async fn graph_export_handler(
         tenant_clone.graph_query_edges(
             &seed,
             edge_type,
-            parse_graph_direction_str(payload.direction.as_deref()),
+            Direction::parse(payload.direction.as_deref()),
             payload.max_nodes.unwrap_or(500).min(5_000),
         )
     })

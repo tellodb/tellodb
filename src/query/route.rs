@@ -1,4 +1,5 @@
 use super::*;
+use crate::graph::EdgeType;
 
 pub(crate) fn collect_edge_cluster_scores_for_seeds(
     tenant: &TenantStore,
@@ -47,7 +48,7 @@ pub(crate) fn collect_edge_cluster_scores_for_seeds(
             let mut seen_next = HashSet::new();
             for node in frontier.iter() {
                 for (linked_mid, weight, edge_type) in neighbours.get(node).into_iter().flatten() {
-                    let intent_mult = intent_weight_for_edge(edge_type.as_str(), intent);
+                    let intent_mult = intent_weight_for_edge(EdgeType::from_str(edge_type), intent);
                     *scores.entry(linked_mid.clone()).or_insert(0.0) +=
                         path_weight * weight * intent_mult;
                     if seen_next.insert(linked_mid.as_str()) {
@@ -69,21 +70,20 @@ pub(crate) fn collect_edge_cluster_scores_for_seeds(
 
 /// Returns 1.5 for edges that align with the query intent, 1.0 otherwise.
 pub(crate) fn intent_weight_for_edge(
-    edge_type: &str,
+    edge_type: EdgeType,
     intent: Option<crate::api::plan::types::QueryIntent>,
 ) -> f32 {
     use crate::api::plan::types::QueryIntent;
-    let et = edge_type.to_ascii_lowercase();
     match intent {
         Some(QueryIntent::Inference) | Some(QueryIntent::Recommendation) => {
-            if et == "caused_by" || et == "leads_to" || et == "prefers" {
+            if matches!(edge_type, EdgeType::CausedBy | EdgeType::LeadsTo | EdgeType::Prefers) {
                 1.5
             } else {
                 1.0
             }
         }
         Some(QueryIntent::PeripheralMention) => {
-            if et == "updates" || et == "supports" || et == "contradicts" {
+            if matches!(edge_type, EdgeType::Updates | EdgeType::Supports) {
                 1.5
             } else {
                 1.0
@@ -253,19 +253,25 @@ mod tests {
 
     #[test]
     fn inference_edges_get_causal_weight() {
-        assert_eq!(intent_weight_for_edge("caused_by", Some(QueryIntent::Inference)), 1.5);
-        assert_eq!(intent_weight_for_edge("supports", Some(QueryIntent::Inference)), 1.0);
+        assert_eq!(intent_weight_for_edge(EdgeType::CausedBy, Some(QueryIntent::Inference)), 1.5);
+        assert_eq!(intent_weight_for_edge(EdgeType::Supports, Some(QueryIntent::Inference)), 1.0);
     }
 
     #[test]
     fn peripheral_edges_get_support_weight() {
-        assert_eq!(intent_weight_for_edge("supports", Some(QueryIntent::PeripheralMention)), 1.5);
-        assert_eq!(intent_weight_for_edge("prefers", Some(QueryIntent::PeripheralMention)), 1.0);
+        assert_eq!(
+            intent_weight_for_edge(EdgeType::Supports, Some(QueryIntent::PeripheralMention)),
+            1.5
+        );
+        assert_eq!(
+            intent_weight_for_edge(EdgeType::Prefers, Some(QueryIntent::PeripheralMention)),
+            1.0
+        );
     }
 
     #[test]
     fn general_edges_keep_neutral_weight() {
-        assert_eq!(intent_weight_for_edge("caused_by", Some(QueryIntent::General)), 1.0);
-        assert_eq!(intent_weight_for_edge("caused_by", None), 1.0);
+        assert_eq!(intent_weight_for_edge(EdgeType::CausedBy, Some(QueryIntent::General)), 1.0);
+        assert_eq!(intent_weight_for_edge(EdgeType::CausedBy, None), 1.0);
     }
 }

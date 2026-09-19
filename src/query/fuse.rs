@@ -1,4 +1,5 @@
 use super::*;
+use crate::graph::Direction;
 
 pub(crate) fn fusion_phase(s: &mut QueryPipelineState) {
     let stage_start = Instant::now();
@@ -197,7 +198,7 @@ pub(crate) fn fusion_phase(s: &mut QueryPipelineState) {
 
             let mut batched_edges = Vec::new();
             for seed in &entity_seeds {
-                if let Ok(edges) = s.tenant.graph_query_edges(seed, None, "Both", 50) {
+                if let Ok(edges) = s.tenant.graph_query_edges(seed, None, Direction::Both, 50) {
                     batched_edges.extend(edges.into_iter().filter(|e| !e.memory_id.is_empty()));
                 }
             }

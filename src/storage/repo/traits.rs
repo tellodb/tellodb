@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 
+use crate::graph::Direction;
 use crate::storage::tenant::TenantStore;
 use crate::storage::types::{
     AgentObservation, FactVersionRow, LedgerTurn, MemoryCard, MemoryCardSearchHit,
@@ -96,7 +97,7 @@ pub trait GraphRepo: Send + Sync {
         &self,
         entity: &str,
         label: Option<&str>,
-        direction: &str,
+        direction: Direction,
         limit: usize,
     ) -> Result<Vec<crate::storage::tenant::GraphEdge>>;
     fn graph_edge_summaries_for_label(
@@ -307,7 +308,7 @@ impl GraphRepo for TenantStore {
         &self,
         entity: &str,
         label: Option<&str>,
-        direction: &str,
+        direction: Direction,
         limit: usize,
     ) -> Result<Vec<crate::storage::tenant::GraphEdge>> {
         TenantStore::graph_query_edges(self, entity, label, direction, limit)
