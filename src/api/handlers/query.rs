@@ -11,10 +11,10 @@ use crate::api::types::{
 };
 use crate::api::utils::{
     apply_decay_with_policy, clip_profile_to_budget, cosine_similarity_from_distance,
-    elapsed_ms_and_us, env_bool, extract_named_phrases, insert_f32_header,
-    insert_stage_timing_headers, insert_u64_header, parse_temporal_window,
-    scoped_semantic_min_hits, scoped_semantic_start, scoped_semantic_step, scoped_semantic_top,
-    should_apply_neural_rerank, temporal_recency_scoring_enabled, SEMANTIC_TOP_DEFAULT,
+    elapsed_ms_and_us, extract_named_phrases, insert_f32_header, insert_stage_timing_headers,
+    insert_u64_header, parse_temporal_window, scoped_semantic_min_hits, scoped_semantic_start,
+    scoped_semantic_step, scoped_semantic_top, should_apply_neural_rerank,
+    temporal_recency_scoring_enabled, SEMANTIC_TOP_DEFAULT,
 };
 use crate::api::{EngineState, PlatformWriteOp};
 use crate::features::{self, Feature};
@@ -727,23 +727,31 @@ enum RetrievalProfile {
 
 fn retrieval_profile() -> RetrievalProfile {
     static CACHED: std::sync::OnceLock<RetrievalProfile> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(retrieval_profile_uncached)
-}
-
-fn retrieval_profile_uncached() -> RetrievalProfile {
-    match std::env::var("TEMPORAL_MEMORY_RETRIEVAL_PROFILE")
-        .unwrap_or_else(|_| "fast".to_string())
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "research" | "full" | "v2" => RetrievalProfile::Research,
-        "balanced" | "default" => RetrievalProfile::Balanced,
-        _ => RetrievalProfile::Fast,
-    }
+    *CACHED.get_or_init(|| {
+        match std::env::var("TEMPORAL_MEMORY_RETRIEVAL_PROFILE")
+            .unwrap_or_else(|_| "fast".to_string())
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "research" | "full" | "v2" => RetrievalProfile::Research,
+            "balanced" | "default" => RetrievalProfile::Balanced,
+            _ => RetrievalProfile::Fast,
+        }
+    })
 }
 
 fn auto_rerank_enabled(profile: RetrievalProfile) -> bool {
-    env_bool("TEMPORAL_MEMORY_AUTO_RERANK", matches!(profile, RetrievalProfile::Research))
+    static OVERRIDE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    let configured = *OVERRIDE.get_or_init(|| {
+        std::env::var("TEMPORAL_MEMORY_AUTO_RERANK").ok().and_then(|value| {
+            match value.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => Some(true),
+                "0" | "false" | "no" | "off" => Some(false),
+                _ => None,
+            }
+        })
+    });
+    configured.unwrap_or(matches!(profile, RetrievalProfile::Research))
 }
 
 #[repr(usize)]

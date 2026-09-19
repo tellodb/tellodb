@@ -71,10 +71,13 @@ async fn request_timeout_middleware(req: Request, next: Next) -> Result<Response
     if UNTIMED.contains(&path.as_str()) || path == "/v1/admin/reset" {
         return Ok(next.run(req).await);
     }
-    let timeout_secs: u64 = std::env::var("TELLODB_REQUEST_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(30);
+    static TIMEOUT_SECS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let timeout_secs = *TIMEOUT_SECS.get_or_init(|| {
+        std::env::var("TELLODB_REQUEST_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30)
+    });
     match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), next.run(req)).await {
         Ok(resp) => Ok(resp),
         Err(_) => {

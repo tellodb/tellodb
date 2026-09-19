@@ -61,8 +61,12 @@ pub fn env_bool(name: &str, default: bool) -> bool {
     }
 }
 
-pub fn temporal_recency_scoring_enabled() -> bool {
+env_setting!(temporal_recency_scoring_enabled_cached, bool, {
     env_bool("TEMPORAL_MEMORY_ENABLE_TEMPORAL_RECENCY_SCORING", true)
+});
+
+pub fn temporal_recency_scoring_enabled() -> bool {
+    temporal_recency_scoring_enabled_cached()
 }
 
 env_setting!(scoped_semantic_top_uncached, usize, {
