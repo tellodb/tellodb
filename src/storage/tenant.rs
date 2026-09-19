@@ -624,7 +624,7 @@ impl TenantStore {
                 let rid = if let Some(rid) = existing_rid {
                     update_stmt.execute(params![
                         obs.textual_content,
-                        format!("{:?}", obs.kind),
+                        obs.kind.as_str(),
                         ts,
                         obs.entity_id,
                         obs.content_hash,
@@ -640,7 +640,7 @@ impl TenantStore {
                         mem_id,
                         obs.entity_id,
                         obs.textual_content,
-                        format!("{:?}", obs.kind),
+                        obs.kind.as_str(),
                         obs.content_hash,
                         ts,
                         obs.session_id,
@@ -823,7 +823,7 @@ impl TenantStore {
                 entity_id: row.get(0)?,
                 textual_content: row.get(1)?,
                 embedding: Vec::new(),
-                kind: parse_kind_enum(row.get::<_, String>(2)?.as_str()),
+                kind: MemoryKind::parse(row.get::<_, String>(2)?.as_str()),
                 content_hash: String::new(),
                 created_at_ms: row.get(3)?,
                 session_id: row.get(4)?,
@@ -864,7 +864,7 @@ impl TenantStore {
                     entity_id: row.get::<_, String>(1)?,
                     textual_content: row.get::<_, String>(2)?,
                     embedding: Vec::new(),
-                    kind: parse_kind_enum(row.get::<_, String>(3)?.as_str()),
+                    kind: MemoryKind::parse(row.get::<_, String>(3)?.as_str()),
                     content_hash: String::new(),
                     created_at_ms: row.get::<_, i64>(4)? as u64,
                     session_id: row.get(5)?,
@@ -3260,22 +3260,6 @@ fn contains_term_count(lower_haystack: &str, terms: &[String]) -> usize {
             !needle.is_empty() && lower_haystack.contains(needle.as_str())
         })
         .count()
-}
-
-fn parse_kind_enum(kind: &str) -> MemoryKind {
-    if kind.contains("Preference") {
-        MemoryKind::Preference
-    } else if kind.contains("Decision") {
-        MemoryKind::Decision
-    } else if kind.contains("Lesson") {
-        MemoryKind::Lesson
-    } else if kind.contains("Fact") {
-        MemoryKind::Fact
-    } else if kind.contains("SessionSummary") {
-        MemoryKind::SessionSummary
-    } else {
-        MemoryKind::Conversational
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

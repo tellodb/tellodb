@@ -642,6 +642,8 @@ fn build_observations(
             semantic_seen.push((payload.entity_id.clone(), embedding.clone()));
         }
 
+        // Keep the legacy Debug representation in content hashes until the Phase 7 migration
+        // recomputes existing hashes; changing it would break deduplication.
         let hash =
             content_hash(&payload.textual_content, &payload.entity_id, &format!("{:?}", kind));
         let obs = AgentObservation {
@@ -1697,6 +1699,8 @@ async fn execute_ingest_pipeline(
         let keep: Vec<bool> = expanded_payloads
             .iter()
             .map(|p| {
+                // Keep the legacy Debug representation in content hashes until the Phase 7 migration
+                // recomputes existing hashes; changing it would break deduplication.
                 let hash = content_hash(
                     &p.textual_content,
                     &p.entity_id,

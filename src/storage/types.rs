@@ -15,6 +15,38 @@ pub enum MemoryKind {
 }
 
 impl MemoryKind {
+    pub const ALL: [MemoryKind; 6] = [
+        MemoryKind::Conversational,
+        MemoryKind::Decision,
+        MemoryKind::Lesson,
+        MemoryKind::Preference,
+        MemoryKind::SessionSummary,
+        MemoryKind::Fact,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MemoryKind::Conversational => "conversational",
+            MemoryKind::Decision => "decision",
+            MemoryKind::Lesson => "lesson",
+            MemoryKind::Preference => "preference",
+            MemoryKind::SessionSummary => "session_summary",
+            MemoryKind::Fact => "fact",
+        }
+    }
+
+    pub fn parse(s: &str) -> MemoryKind {
+        match s {
+            "conversational" | "Conversational" => MemoryKind::Conversational,
+            "decision" | "Decision" => MemoryKind::Decision,
+            "lesson" | "Lesson" => MemoryKind::Lesson,
+            "preference" | "Preference" => MemoryKind::Preference,
+            "session_summary" | "SessionSummary" => MemoryKind::SessionSummary,
+            "fact" | "Fact" => MemoryKind::Fact,
+            _ => MemoryKind::Conversational,
+        }
+    }
+
     pub fn is_decay_exempt(&self) -> bool {
         matches!(self, MemoryKind::Preference | MemoryKind::Decision)
     }
@@ -276,4 +308,32 @@ pub struct MemoryCardSearchInput<'a> {
     pub route_sessions: &'a HashSet<String>,
     pub include_stale: bool,
     pub limit: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MemoryKind;
+
+    #[test]
+    fn memory_kind_canonical_names_round_trip() {
+        for kind in MemoryKind::ALL {
+            assert_eq!(MemoryKind::parse(kind.as_str()), kind);
+        }
+    }
+
+    #[test]
+    fn memory_kind_legacy_debug_names_parse() {
+        let legacy = [
+            ("Conversational", MemoryKind::Conversational),
+            ("Decision", MemoryKind::Decision),
+            ("Lesson", MemoryKind::Lesson),
+            ("Preference", MemoryKind::Preference),
+            ("SessionSummary", MemoryKind::SessionSummary),
+            ("Fact", MemoryKind::Fact),
+        ];
+
+        for (value, expected) in legacy {
+            assert_eq!(MemoryKind::parse(value), expected);
+        }
+    }
 }
