@@ -1470,3 +1470,7 @@ async fn execute_ingest_pipeline(
     }
     Ok((batches.consolidation_tasks, diag))
 }
+
+#[cfg(test)]
+#[path = "ingest_tests.rs"]
+mod tests;
