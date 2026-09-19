@@ -23,6 +23,7 @@ pub use std::ops::{Deref, DerefMut};
 pub use std::sync::Arc;
 pub use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+pub(crate) mod fuse;
 pub(crate) mod plan;
 pub(crate) mod rerank;
 pub(crate) mod retrieve;
@@ -30,6 +31,7 @@ pub(crate) mod route;
 
 pub(crate) use plan::query_allows_stale_cards;
 pub(crate) use plan::{auto_rerank_enabled, retrieval_profile};
+pub(crate) use route::collect_edge_cluster_scores_for_seeds;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
