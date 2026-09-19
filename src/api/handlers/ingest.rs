@@ -240,51 +240,12 @@ pub async fn ingest_handler(
     Extension(principal): Extension<RequestPrincipal>,
     Json(payload): Json<IngestPayload>,
 ) -> Result<impl IntoResponse, EngineError> {
-    let profile_text = payload.textual_content.clone();
-    let profile_ts = payload.timestamp;
-
-    let tenant_id = principal_user_id(&principal).unwrap_or("default");
-    let tenant = state.tenant_store(tenant_id)?;
-
-    let (tasks, diag) = process_ingest_batch(&state, &tenant, vec![payload]).await?;
-
-    spawn_consolidation_tasks(tenant.clone(), tasks);
-
-    let mut headers = HeaderMap::new();
-    insert_stage_timing_headers(&mut headers, "x-tm-embed", diag.embed_ms, diag.embed_us);
-    insert_stage_timing_headers(
-        &mut headers,
-        "x-tm-derived-embed",
-        diag.derived_embed_ms,
-        diag.derived_embed_us,
-    );
-    insert_stage_timing_headers(&mut headers, "x-tm-storage", diag.storage_ms, diag.storage_us);
-    insert_stage_timing_headers(&mut headers, "x-tm-fts", diag.fts_ms, diag.fts_us);
-    insert_stage_timing_headers(&mut headers, "x-tm-vector", diag.vector_ms, diag.vector_us);
-    insert_stage_timing_headers(&mut headers, "x-tm-graph", diag.graph_ms, diag.graph_us);
-    insert_stage_timing_headers(&mut headers, "x-tm-fact", diag.fact_ms, diag.fact_us);
-    insert_stage_timing_headers(
-        &mut headers,
-        "x-tm-analytics",
-        diag.analytics_ms,
-        diag.analytics_us,
-    );
-    insert_stage_timing_headers(&mut headers, "x-tm-total", diag.total_ms, diag.total_us);
-    if let Ok(value) = HeaderValue::from_str(&diag.counts_header()) {
-        headers.insert("x-tm-ingest-counts", value);
-    }
-
-    if let Some(user_id) = principal_user_id(&principal) {
-        std::mem::drop(state.platform_write_tx.send(PlatformWriteOp::Profile {
-            user_id: user_id.to_string(),
-            text: profile_text,
-            timestamp_ms: profile_ts,
-            source: "ingest".to_string(),
-        }));
-    }
-    record_usage_for_principal(&state, &principal, "ingest");
-    metrics::increment_ingest();
-    Ok((StatusCode::CREATED, headers))
+    batch_ingest_handler(
+        State(state),
+        Extension(principal),
+        Json(BatchIngestPayload { items: vec![payload] }),
+    )
+    .await
 }
 
 pub async fn batch_ingest_handler(
@@ -305,6 +266,24 @@ pub async fn batch_ingest_handler(
 
     spawn_consolidation_tasks(tenant.clone(), tasks);
 
+    let headers = ingest_timing_headers(&diag);
+
+    if let Some(user_id) = principal_user_id(&principal) {
+        for (text, timestamp_ms) in profile_items {
+            std::mem::drop(state.platform_write_tx.send(PlatformWriteOp::Profile {
+                user_id: user_id.to_string(),
+                text,
+                timestamp_ms,
+                source: "ingest".to_string(),
+            }));
+        }
+    }
+    record_usage_for_principal(&state, &principal, "ingest");
+    metrics::increment_ingest();
+    Ok((StatusCode::CREATED, headers))
+}
+
+fn ingest_timing_headers(diag: &IngestDiagnostics) -> HeaderMap {
     let mut headers = HeaderMap::new();
     insert_stage_timing_headers(&mut headers, "x-tm-embed", diag.embed_ms, diag.embed_us);
     insert_stage_timing_headers(
@@ -328,20 +307,7 @@ pub async fn batch_ingest_handler(
     if let Ok(value) = HeaderValue::from_str(&diag.counts_header()) {
         headers.insert("x-tm-ingest-counts", value);
     }
-
-    if let Some(user_id) = principal_user_id(&principal) {
-        for (text, timestamp_ms) in profile_items {
-            std::mem::drop(state.platform_write_tx.send(PlatformWriteOp::Profile {
-                user_id: user_id.to_string(),
-                text,
-                timestamp_ms,
-                source: "ingest".to_string(),
-            }));
-        }
-    }
-    record_usage_for_principal(&state, &principal, "ingest");
-    metrics::increment_ingest();
-    Ok((StatusCode::CREATED, headers))
+    headers
 }
 
 pub(crate) async fn process_ingest_batch(
