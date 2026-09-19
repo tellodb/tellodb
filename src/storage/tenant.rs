@@ -176,13 +176,13 @@ impl TenantStore {
         Ok(())
     }
 
-    pub(crate) fn allocate_vector_ids(
+    pub(crate) fn allocate_vector_ids<'a>(
         &self,
-        items: &[(u64, String, &AgentObservation)],
+        items: impl IntoIterator<Item = (u64, &'a str, &'a AgentObservation)>,
     ) -> Result<Vec<Option<u64>>> {
         let mut conn = self.get_conn()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let mut rowids = Vec::with_capacity(items.len());
+        let mut rowids = Vec::new();
         {
             let mut select_stmt =
                 tx.prepare_cached("SELECT rowid FROM memories WHERE memory_id = ?1")?;
@@ -201,7 +201,7 @@ impl TenantStore {
             )?;
             let mut del_vec_stmt =
                 tx.prepare_cached("DELETE FROM vector_lookup WHERE vector_id = ?1")?;
-            for &(ts, ref mem_id, obs) in items {
+            for (ts, mem_id, obs) in items {
                 let existing_rid: Option<i64> =
                     select_stmt.query_row(params![mem_id], |row| row.get(0)).ok();
                 let rid = if let Some(rid) = existing_rid {

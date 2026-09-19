@@ -5,9 +5,9 @@ impl TenantStore {
         &self,
         items: &[(u64, String, AgentObservation)],
     ) -> Result<Vec<Option<u64>>> {
-        let mapped: Vec<(u64, String, &AgentObservation)> =
-            items.iter().map(|(ts, mid, obs)| (*ts, mid.clone(), obs)).collect();
-        self.allocate_vector_ids(&mapped)
+        self.allocate_vector_ids(items.iter().map(|(timestamp, memory_id, observation)| {
+            (*timestamp, memory_id.as_str(), observation)
+        }))
     }
 
     pub fn insert_observation(
@@ -16,7 +16,7 @@ impl TenantStore {
         memory_id: &str,
         obs: &AgentObservation,
     ) -> Result<()> {
-        self.insert_observations_batch(&[(timestamp, memory_id.to_string(), obs.clone())])?;
+        self.allocate_vector_ids(std::iter::once((timestamp, memory_id, obs)))?;
         Ok(())
     }
 
