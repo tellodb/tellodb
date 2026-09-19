@@ -653,4 +653,27 @@ mod tests {
         assert_eq!(config.embedding.max_tokens, 512);
         assert_eq!(config.rerank.top, 25);
     }
+
+    #[test]
+    fn empty_environment_matches_default_config() {
+        const CHILD_MARKER: &str = "TELLODB_CONFIG_EMPTY_ENV_CHILD";
+
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .env_clear()
+                .env(CHILD_MARKER, "1")
+                .args([
+                    "--exact",
+                    "config::tests::empty_environment_matches_default_config",
+                    "--nocapture",
+                ])
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        let actual = Config::from_env().unwrap();
+        assert_eq!(format!("{actual:?}"), format!("{:?}", Config::default()));
+    }
 }

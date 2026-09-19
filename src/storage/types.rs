@@ -313,6 +313,8 @@ pub struct MemoryCardSearchInput<'a> {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::MemoryKind;
 
     #[test]
@@ -374,5 +376,20 @@ mod tests {
         assert_eq!(MemoryKind::parse(""), MemoryKind::Conversational);
         assert_eq!(MemoryKind::parse("DECISIONS"), MemoryKind::Conversational);
         assert_eq!(MemoryKind::parse("UNKNOWN"), MemoryKind::Conversational);
+    }
+
+    proptest! {
+        #[test]
+        fn generated_canonical_names_round_trip(index in 0usize..MemoryKind::ALL.len()) {
+            let kind = MemoryKind::ALL[index];
+            prop_assert_eq!(MemoryKind::parse(kind.as_str()), kind);
+        }
+
+        #[test]
+        fn generated_debug_names_round_trip(index in 0usize..MemoryKind::ALL.len()) {
+            let kind = MemoryKind::ALL[index];
+            let debug_name = format!("{kind:?}");
+            prop_assert_eq!(MemoryKind::parse(&debug_name), kind);
+        }
     }
 }

@@ -36,7 +36,20 @@ pub fn rrf_fuse(lanes: &[Vec<(String, f32)>], c: f32) -> Vec<(String, f32)> {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
+
+    fn rrf_lane() -> impl Strategy<Value = Vec<(String, f32)>> {
+        prop::collection::vec(
+            (
+                prop::collection::vec(any::<char>(), 0..8)
+                    .prop_map(|characters| characters.into_iter().collect::<String>()),
+                any::<f32>().prop_filter("finite score", |score| score.is_finite()),
+            ),
+            0..8,
+        )
+    }
 
     #[test]
     fn rrf_ties_do_not_depend_on_input_order() {
@@ -50,5 +63,34 @@ mod tests {
         );
         let fused = rrf_fuse(&[lane_a, lane_b], 60.0);
         assert_eq!(fused.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(), ["m1", "m2", "m3"]);
+    }
+
+    proptest! {
+        #[test]
+        fn adding_an_empty_lane_changes_nothing(
+            lanes in prop::collection::vec(rrf_lane(), 0..5),
+            c in 1.0f32..1000.0,
+        ) {
+            let mut with_empty = lanes.clone();
+            with_empty.push(Vec::new());
+            prop_assert_eq!(rrf_fuse(&lanes, c), rrf_fuse(&with_empty, c));
+        }
+
+        #[test]
+        fn rrf_score_is_monotone_in_rank(count in 2usize..64) {
+            let lane = (0..count)
+                .map(|rank| (format!("item-{rank:03}"), 1.0))
+                .collect::<Vec<_>>();
+            let fused = rrf_fuse(&[lane], 60.0);
+
+            for pair in fused.windows(2) {
+                prop_assert!(pair[0].1 >= pair[1].1);
+            }
+            for (rank, (item, score)) in fused.iter().enumerate() {
+                prop_assert_eq!(item, &format!("item-{rank:03}"));
+                let expected = 1.0 / (60.0 + (rank + 1) as f32);
+                prop_assert!((*score - expected).abs() <= f32::EPSILON);
+            }
+        }
     }
 }

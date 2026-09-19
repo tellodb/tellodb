@@ -215,7 +215,26 @@ fn decode_component(component: &str) -> Result<String, MemoryIdError> {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::{MemoryId, Tag};
+
+    fn memory_component() -> impl Strategy<Value = String> {
+        prop::collection::vec(
+            prop_oneof![
+                Just("%".to_string()),
+                Just("::".to_string()),
+                any::<char>().prop_map(|character| character.to_string()),
+            ],
+            0..16,
+        )
+        .prop_map(|parts| {
+            parts.into_iter().fold(String::new(), |mut value, part| {
+                value.push_str(&part);
+                value
+            })
+        })
+    }
 
     #[test]
     fn structured_ids_round_trip_with_legacy_rendering() {
@@ -265,5 +284,18 @@ mod tests {
     #[test]
     fn malformed_percent_escape_is_rejected() {
         assert!(MemoryId::parse("a%2::b::0").is_err());
+    }
+
+    proptest! {
+        #[test]
+        fn generated_components_round_trip(
+            entity in memory_component(),
+            session in memory_component(),
+            turn in any::<u32>(),
+        ) {
+            let id = MemoryId::new(entity, session, turn);
+            let rendered = id.as_str().to_string();
+            prop_assert_eq!(MemoryId::parse(&rendered), Ok(id));
+        }
     }
 }
