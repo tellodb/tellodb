@@ -25,10 +25,9 @@ mod tests {
 
     #[test]
     fn inference_plan_adds_archetype_expansion_terms() {
-        let plan = build_query_plan(
-            "What fields would Caroline be likely to pursue in her education?",
-            None,
-        );
+        // Synthetic phrasing: the LoCoMo wording this once used made the test
+        // pass for the wrong reason, since a rule was written against it.
+        let plan = build_query_plan("What fields would Robin pursue in her education?", None);
         assert!(plan.lexical_terms.iter().any(|term| term == "career"));
         assert!(plan.lexical_terms.iter().any(|term| term == "education"));
         assert!(plan
@@ -38,14 +37,29 @@ mod tests {
     }
 
     #[test]
-    fn park_preference_plan_bridges_to_outdoor_evidence() {
-        let plan = build_query_plan(
-            "Would Melanie be more interested in going to a national park or a theme park?",
-            None,
-        );
-        assert!(plan.lexical_terms.iter().any(|term| term == "camping"));
-        assert!(plan.lexical_terms.iter().any(|term| term == "hiking"));
-        assert!(plan.lexical_terms.iter().any(|term| term == "amusement"));
+    fn park_preference_bridges_to_outdoor_evidence_only_when_tuned() {
+        use crate::heuristics::{with_profile, Profile};
+        let question = "Would Robin prefer a national park or a theme park?";
+
+        // "national park" and "theme park" are literal phrases taken from a
+        // benchmark question, so only the tuned profile bridges them.
+        with_profile(Profile::LegacyTuned, || {
+            let plan = build_query_plan(question, None);
+            assert!(plan.lexical_terms.iter().any(|term| term == "camping"));
+            assert!(plan.lexical_terms.iter().any(|term| term == "hiking"));
+            assert!(plan.lexical_terms.iter().any(|term| term == "amusement"));
+        });
+        with_profile(Profile::Generic, || {
+            let plan = build_query_plan(question, None);
+            assert!(!plan.lexical_terms.iter().any(|term| term == "amusement"));
+        });
+
+        // The generic profile still expands a topic-class trigger, which is
+        // not about any particular question.
+        with_profile(Profile::Generic, || {
+            let plan = build_query_plan("Where does Robin like to go outdoors?", None);
+            assert!(plan.lexical_terms.iter().any(|term| term == "camping"));
+        });
     }
 
     #[test]

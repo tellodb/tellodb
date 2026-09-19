@@ -307,9 +307,10 @@ pub fn build_query_expansion_terms(
     }
 
     if has_any_singular(&["education", "edu", "educaton", "field", "career", "job", "profession"])
-        || lower.contains("career path")
-        || lower.contains("career option")
-        || lower.contains("future job")
+        || (crate::heuristics::benchmark_tuned_rules()
+            && (lower.contains("career path")
+                || lower.contains("career option")
+                || lower.contains("future job")))
     {
         push_expansion_terms(
             &mut terms,
@@ -318,8 +319,8 @@ pub fn build_query_expansion_terms(
     }
 
     if has_any_singular(&["book", "books", "bookshelf", "library", "read", "reading"])
-        || lower.contains("dr. seuss")
-        || lower.contains("dr seuss")
+        || (crate::heuristics::benchmark_tuned_rules()
+            && (lower.contains("dr. seuss") || lower.contains("dr seuss")))
     {
         push_expansion_terms(
             &mut terms,
@@ -338,7 +339,9 @@ pub fn build_query_expansion_terms(
         );
     }
 
-    if lower.contains("national park") || has_any_singular(&["outdoor", "outdoors", "nature"]) {
+    if (crate::heuristics::benchmark_tuned_rules() && lower.contains("national park"))
+        || has_any_singular(&["outdoor", "outdoors", "nature"])
+    {
         push_expansion_terms(
             &mut terms,
             &[
@@ -347,7 +350,9 @@ pub fn build_query_expansion_terms(
             ],
         );
     }
-    if lower.contains("theme park") || lower.contains("amusement park") {
+    if crate::heuristics::benchmark_tuned_rules()
+        && (lower.contains("theme park") || lower.contains("amusement park"))
+    {
         push_expansion_terms(
             &mut terms,
             &["theme", "amusement", "ride", "roller", "coaster", "fun"],

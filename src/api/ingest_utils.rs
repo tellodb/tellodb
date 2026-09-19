@@ -907,7 +907,22 @@ mod tests {
 
     #[test]
     fn test_infer_fact_key_previous_last_name() {
-        assert_eq!(infer_fact_key("my old name is Smith"), Some("previous_last_name".to_string()));
+        use crate::heuristics::{with_profile, Profile};
+        // Keyed on a benchmark question, so it fires only under the tuned
+        // profile and the generic profile must fall through to a generic key
+        // or to none at all.
+        with_profile(Profile::LegacyTuned, || {
+            assert_eq!(
+                infer_fact_key("my old name is Smith"),
+                Some("previous_last_name".to_string())
+            );
+        });
+        with_profile(Profile::Generic, || {
+            assert_ne!(
+                infer_fact_key("my old name is Smith"),
+                Some("previous_last_name".to_string())
+            );
+        });
     }
 
     #[test]
@@ -920,26 +935,62 @@ mod tests {
 
     #[test]
     fn test_infer_fact_key_commute_duration() {
-        assert_eq!(
-            infer_fact_key("my commute takes 30 minutes"),
-            Some("commute_duration".to_string())
-        );
+        use crate::heuristics::{with_profile, Profile};
+        // Keyed on a benchmark question, so it fires only under the tuned
+        // profile and the generic profile must fall through to a generic key
+        // or to none at all.
+        with_profile(Profile::LegacyTuned, || {
+            assert_eq!(
+                infer_fact_key("my commute takes 30 minutes"),
+                Some("commute_duration".to_string())
+            );
+        });
+        with_profile(Profile::Generic, || {
+            assert_ne!(
+                infer_fact_key("my commute takes 30 minutes"),
+                Some("commute_duration".to_string())
+            );
+        });
     }
 
     #[test]
     fn test_infer_fact_key_internet_plan() {
-        assert_eq!(
-            infer_fact_key("I upgraded my internet plan to 500 mbps"),
-            Some("internet_plan_speed".to_string())
-        );
+        use crate::heuristics::{with_profile, Profile};
+        // Keyed on a benchmark question, so it fires only under the tuned
+        // profile and the generic profile must fall through to a generic key
+        // or to none at all.
+        with_profile(Profile::LegacyTuned, || {
+            assert_eq!(
+                infer_fact_key("I upgraded my internet plan to 500 mbps"),
+                Some("internet_plan_speed".to_string())
+            );
+        });
+        with_profile(Profile::Generic, || {
+            assert_ne!(
+                infer_fact_key("I upgraded my internet plan to 500 mbps"),
+                Some("internet_plan_speed".to_string())
+            );
+        });
     }
 
     #[test]
     fn test_infer_fact_key_spotify_playlist() {
-        assert_eq!(
-            infer_fact_key("I created a spotify playlist named vibes"),
-            Some("spotify_playlist_name".to_string())
-        );
+        use crate::heuristics::{with_profile, Profile};
+        // Keyed on a benchmark question, so it fires only under the tuned
+        // profile and the generic profile must fall through to a generic key
+        // or to none at all.
+        with_profile(Profile::LegacyTuned, || {
+            assert_eq!(
+                infer_fact_key("I created a spotify playlist named vibes"),
+                Some("spotify_playlist_name".to_string())
+            );
+        });
+        with_profile(Profile::Generic, || {
+            assert_ne!(
+                infer_fact_key("I created a spotify playlist named vibes"),
+                Some("spotify_playlist_name".to_string())
+            );
+        });
     }
 
     #[test]

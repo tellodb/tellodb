@@ -87,6 +87,7 @@ pub async fn version_handler(
             rerank: state.semantic.rerank_mode().to_string(),
             rerank_policy: crate::api::handlers::query::rerank_policy_name(),
             lanes: crate::retrieval::lanes::lanes().enabled_names(),
+            heuristics: crate::heuristics::profile().name(),
             rerank_margin: crate::api::handlers::query::rerank_margin(),
             rerank_top: crate::api::handlers::query::rerank_top(),
             embed_max_tokens: state.semantic.embed_max_tokens(),

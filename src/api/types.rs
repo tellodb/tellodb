@@ -132,6 +132,9 @@ pub struct VersionResponse {
     /// Retrieval lanes in use, so a run record cannot claim a baseline
     /// configuration the engine was not actually running.
     pub lanes: Vec<&'static str>,
+    /// `generic` or `legacy-tuned`: whether rules written against benchmark
+    /// questions were allowed to fire.
+    pub heuristics: &'static str,
     pub rerank_margin: f32,
     pub rerank_top: usize,
     pub embed_max_tokens: usize,

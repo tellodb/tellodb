@@ -26,6 +26,9 @@ pub async fn build_state(paths: &RuntimePaths, auth: api::AuthConfig) -> Result<
         info!(disabled = ?features.disabled_names(), "Ingest structures disabled");
     }
 
+    let heuristics = crate::heuristics::init_from_env()?;
+    info!(profile = heuristics.name(), "Heuristics profile");
+
     let lanes = crate::retrieval::lanes::init_from_env()?;
     if lanes != crate::retrieval::lanes::Lanes::default() {
         info!(enabled = ?lanes.enabled_names(), "Retrieval lanes restricted");

@@ -259,24 +259,30 @@ pub fn infer_fact_key(text: &str) -> Option<String> {
     if has_token(&tokens, "graduated") && has_token(&tokens, "degree") {
         return Some("degree".to_string());
     }
-    if normalized.contains("last name before") || normalized.contains("old name") {
+    if crate::heuristics::benchmark_tuned_rules()
+        && (normalized.contains("last name before") || normalized.contains("old name"))
+    {
         return Some("previous_last_name".to_string());
     }
     if normalized.contains("previous occupation") {
         return Some("previous_occupation".to_string());
     }
-    if has_token(&tokens, "commute") && (has_token(&tokens, "take") || has_token(&tokens, "takes"))
+    if crate::heuristics::benchmark_tuned_rules()
+        && has_token(&tokens, "commute")
+        && (has_token(&tokens, "take") || has_token(&tokens, "takes"))
     {
         return Some("commute_duration".to_string());
     }
-    if normalized.contains("internet plan")
+    if crate::heuristics::benchmark_tuned_rules()
+        && normalized.contains("internet plan")
         && (has_token(&tokens, "mbps")
             || has_token(&tokens, "speed")
             || has_token(&tokens, "upgraded"))
     {
         return Some("internet_plan_speed".to_string());
     }
-    if has_token(&tokens, "spotify")
+    if crate::heuristics::benchmark_tuned_rules()
+        && has_token(&tokens, "spotify")
         && (has_token(&tokens, "playlist") || has_token(&tokens, "playlists"))
         && (has_token(&tokens, "created")
             || has_token(&tokens, "called")
