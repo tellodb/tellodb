@@ -22,6 +22,7 @@ use crate::api::{EngineState, PlatformWriteOp};
 use crate::features::{self, Feature};
 use crate::metrics;
 use crate::ml::cosine_similarity;
+use crate::retrieval::lanes::{self, Lane};
 use crate::retrieval::{rrf_fuse, ScoringWeights};
 use crate::storage::{
     AgentObservation, MemoryCard, MemoryCardSearchInput, MemoryKind, TenantStore,
@@ -1646,7 +1647,7 @@ fn plan_phase(s: &mut QueryPipelineState) {
 }
 
 fn route_phase(s: &mut QueryPipelineState) {
-    if !features::enabled(Feature::SessionRouter) {
+    if !features::enabled(Feature::SessionRouter) || !lanes::enabled(Lane::Route) {
         return;
     }
     let route_probe_queries = if s.budget.route_probe_query_limit == 0 {
@@ -1799,6 +1800,9 @@ fn retrieval_phase(s: &mut QueryPipelineState) {
 }
 
 fn retrieval_ann(s: &mut QueryPipelineState) {
+    if !lanes::enabled(Lane::Vector) {
+        return;
+    }
     let stage_start = Instant::now();
     let embed_dim = s.state.semantic.embedding_dim();
     let semantic_queries = s
@@ -2042,6 +2046,9 @@ fn retrieval_ann(s: &mut QueryPipelineState) {
 }
 
 fn retrieval_fts(s: &mut QueryPipelineState) {
+    if !lanes::enabled(Lane::Fts) {
+        return;
+    }
     let stage_start = Instant::now();
     let mut fts_ranked_lists = Vec::new();
     let mut fts_memory_ids_to_lookup = Vec::new();
@@ -2105,8 +2112,11 @@ fn retrieval_fts(s: &mut QueryPipelineState) {
 fn retrieval_cards(s: &mut QueryPipelineState) {
     let stage_start = Instant::now();
     let mut card_ranked_items = Vec::new();
-    let entity_scope =
-        s.payload.entity_id.as_ref().filter(|_| features::enabled(Feature::MemoryCards));
+    let entity_scope = s
+        .payload
+        .entity_id
+        .as_ref()
+        .filter(|_| features::enabled(Feature::MemoryCards) && lanes::enabled(Lane::Cards));
     if let Some(entity_id) = entity_scope {
         let include_stale_cards = query_allows_stale_cards(&s.query_text, &s.plan);
         let card_hits = s
@@ -2236,6 +2246,10 @@ pub(crate) fn rerank_gate_uncertain(hnsw_raw: &[(u64, f32)], margin: f32) -> boo
 
 fn rerank_phase(s: &mut QueryPipelineState) {
     s.neural_scores = HashMap::new();
+    if !lanes::enabled(Lane::Rerank) {
+        s.diag.rerank_reason = RerankDecision::Disabled;
+        return;
+    }
     if !s.state.semantic.is_rerank_enabled() {
         s.diag.rerank_reason = RerankDecision::Disabled;
         return;
@@ -2434,9 +2448,11 @@ fn fusion_phase(s: &mut QueryPipelineState) {
 
     use rayon::prelude::*;
     let intent_for_graph = s.plan.intent;
-    let links_on =
-        features::enabled(Feature::DerivedLinks) || features::enabled(Feature::RetrospectiveLinks);
-    let edges_on = features::enabled(Feature::GraphEdges);
+    let graph_lane = lanes::enabled(Lane::Graph);
+    let links_on = graph_lane
+        && (features::enabled(Feature::DerivedLinks)
+            || features::enabled(Feature::RetrospectiveLinks));
+    let edges_on = graph_lane && features::enabled(Feature::GraphEdges);
     let seeds_start = Instant::now();
     let link_start = Instant::now();
     let link_scores: Vec<HashMap<String, f32>> = if links_on {

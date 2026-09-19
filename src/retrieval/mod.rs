@@ -1,3 +1,4 @@
+pub mod lanes;
 pub mod scoring;
 pub use scoring::ScoringWeights;
 

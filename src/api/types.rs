@@ -129,6 +129,9 @@ pub struct VersionResponse {
     pub ranking_config: RankingConfig,
     pub rerank: String,
     pub rerank_policy: &'static str,
+    /// Retrieval lanes in use, so a run record cannot claim a baseline
+    /// configuration the engine was not actually running.
+    pub lanes: Vec<&'static str>,
     pub rerank_margin: f32,
     pub rerank_top: usize,
     pub embed_max_tokens: usize,
