@@ -1,20 +1,20 @@
 //! `POST /mcp`: the same Model Context Protocol server as `tellodb mcp`,
 //! reached over HTTP with API-key auth and tenant scoping. The protocol and
-//! the tools live in [`crate::mcp_stdio`]; this module only authorizes the
-//! caller and hands the request over.
+//! the tools live in [`crate::mcp_stdio`]; this module handles the request.
 
 use crate::api::auth::{
-    authorize_request, principal_namespace_prefix, principal_user_id, record_usage_for_principal,
+    principal_namespace_prefix, principal_user_id, record_usage_for_principal, RequestPrincipal,
 };
 use crate::api::EngineState;
 use crate::db::Engine;
 use crate::mcp_stdio::McpServer;
-use axum::http::HeaderMap;
-use axum::{extract::State, Json};
+use axum::{
+    extract::{Extension, State},
+    Json,
+};
 use serde_json::{json, Value};
 
 const JSONRPC_INTERNAL_ERROR: i32 = -32000;
-const JSONRPC_UNAUTHORIZED: i32 = -32001;
 
 fn rpc_error(id: Value, code: i32, message: impl Into<String>) -> Json<Value> {
     Json(json!({
@@ -26,7 +26,7 @@ fn rpc_error(id: Value, code: i32, message: impl Into<String>) -> Json<Value> {
 
 pub async fn mcp_handler(
     State(state): State<EngineState>,
-    headers: HeaderMap,
+    Extension(principal): Extension<RequestPrincipal>,
     Json(request): Json<Value>,
 ) -> Json<Value> {
     let id = request.get("id").cloned().unwrap_or(Value::Null);
@@ -34,14 +34,6 @@ pub async fn mcp_handler(
         return rpc_error(id, -32600, "Invalid JSON-RPC version");
     }
 
-    // Same credentials and tenant scoping as the REST API: MCP tools read and
-    // write memories.
-    let principal = match authorize_request(&headers, &state) {
-        Ok(principal) => principal,
-        Err(status) => {
-            return rpc_error(id, JSONRPC_UNAUTHORIZED, format!("Unauthorized ({status})"))
-        }
-    };
     let tenant_id = principal_user_id(&principal).unwrap_or("default");
     let tenant = match state.tenant_store(tenant_id) {
         Ok(tenant) => tenant,
@@ -68,7 +60,7 @@ mod tests {
 
     #[test]
     fn errors_are_json_rpc_errors_with_the_request_id() {
-        let Json(unauthorized) = rpc_error(json!("req-1"), JSONRPC_UNAUTHORIZED, "Unauthorized");
+        let Json(unauthorized) = rpc_error(json!("req-1"), -32001, "Unauthorized");
         assert_eq!(unauthorized["jsonrpc"], "2.0");
         assert_eq!(unauthorized["id"], json!("req-1"));
         assert_eq!(unauthorized["error"]["code"], -32001);

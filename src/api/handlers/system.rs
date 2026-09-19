@@ -1,14 +1,13 @@
-use axum::http::HeaderMap;
 use axum::{
-    extract::{Json, State},
+    extract::{Extension, Json, State},
     http::StatusCode,
     response::IntoResponse,
 };
 use std::time::Instant;
 
 use crate::api::auth::{
-    authorize_request, principal_namespace_prefix, principal_user_id, record_usage_for_principal,
-    scope_entity_id,
+    principal_namespace_prefix, principal_user_id, record_usage_for_principal, scope_entity_id,
+    RequestPrincipal,
 };
 use crate::api::types::*;
 use crate::api::utils::RESET_CONFIRM_PHRASE;
@@ -26,15 +25,22 @@ const WARMUP_PROBE_TEXT: &str = "warmup probe";
 const API_DELETE_REASON: &str = "api_delete";
 const GRAPH_EDGE_LIMIT: usize = 1000;
 
+fn require_global_principal(principal: &RequestPrincipal) -> Result<(), StatusCode> {
+    if matches!(principal, RequestPrincipal::GlobalApiKey) {
+        Ok(())
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
+    }
+}
+
 pub async fn metrics_handler() -> impl IntoResponse {
     (StatusCode::OK, [("content-type", "text/plain; charset=utf-8")], metrics::render())
 }
 
 pub async fn status_handler(
     State(state): State<EngineState>,
-    headers: HeaderMap,
+    Extension(principal): Extension<RequestPrincipal>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let principal = authorize_request(&headers, &state)?;
     let tenant_id = principal_user_id(&principal).unwrap_or("default");
     let _tenant = state.tenant_store(tenant_id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let status = EngineStatus {
@@ -48,9 +54,8 @@ pub async fn status_handler(
 
 pub async fn health_handler(
     State(state): State<EngineState>,
-    headers: HeaderMap,
+    Extension(principal): Extension<RequestPrincipal>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let principal = authorize_request(&headers, &state)?;
     let device = crate::semantic::SemanticInference::device_label_static();
     let response = (
         StatusCode::OK,
@@ -71,9 +76,8 @@ pub async fn healthz_handler() -> impl IntoResponse {
 
 pub async fn version_handler(
     State(state): State<EngineState>,
-    headers: HeaderMap,
+    Extension(principal): Extension<RequestPrincipal>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let principal = authorize_request(&headers, &state)?;
     let response = (
         StatusCode::OK,
         Json(VersionResponse {
@@ -106,9 +110,8 @@ pub async fn version_handler(
 
 pub async fn warmup_handler(
     State(state): State<EngineState>,
-    headers: HeaderMap,
+    Extension(principal): Extension<RequestPrincipal>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let principal = authorize_request(&headers, &state)?;
     let semantic = state.semantic.clone();
     let started = Instant::now();
 
@@ -141,10 +144,9 @@ pub async fn warmup_handler(
 
 pub async fn reset_handler(
     State(state): State<EngineState>,
-    headers: HeaderMap,
+    Extension(principal): Extension<RequestPrincipal>,
     Json(payload): Json<ResetPayload>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let principal = authorize_request(&headers, &state)?;
     let tenant_id = principal_user_id(&principal).unwrap_or("default");
     let tenant = state.tenant_store(tenant_id).map_err(|e| {
         tracing::error!("tenant_store lookup failed for tenant_id={}: {:?}", tenant_id, e);
@@ -183,10 +185,9 @@ pub async fn reset_handler(
 
 pub async fn memory_inspect_handler(
     State(state): State<EngineState>,
-    headers: HeaderMap,
+    Extension(principal): Extension<RequestPrincipal>,
     Json(payload): Json<MemoryInspectPayload>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let principal = authorize_request(&headers, &state)?;
     let ns_prefix = principal_namespace_prefix(&principal);
     let tenant_id = principal_user_id(&principal).unwrap_or("default");
     let tenant = state.tenant_store(tenant_id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -272,10 +273,9 @@ pub async fn memory_inspect_handler(
 
 pub async fn memory_delete_handler(
     State(state): State<EngineState>,
-    headers: HeaderMap,
+    Extension(principal): Extension<RequestPrincipal>,
     Json(payload): Json<MemoryDeletePayload>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let principal = authorize_request(&headers, &state)?;
     let ns_prefix = principal_namespace_prefix(&principal);
     let tenant_id = principal_user_id(&principal).unwrap_or("default");
     let tenant = state.tenant_store(tenant_id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -418,10 +418,8 @@ fn get_gpu_metrics() -> Option<(f32, u64, u64)> {
 
 pub async fn hardware_stats_handler(
     State(state): State<EngineState>,
-    headers: HeaderMap,
+    Extension(principal): Extension<RequestPrincipal>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let principal = authorize_request(&headers, &state)?;
-
     let (cpu_usage_percent, ram_total_mb, ram_used_mb) = get_system_metrics();
     let (storage_total_gb, storage_used_gb) = get_disk_metrics(&state.data_root);
 
@@ -447,10 +445,10 @@ pub async fn hardware_stats_handler(
 
 pub async fn cluster_stats_handler(
     State(state): State<EngineState>,
-    headers: HeaderMap,
+    Extension(principal): Extension<RequestPrincipal>,
     axum::extract::Path(cluster_id): axum::extract::Path<String>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    crate::api::auth::authorize_global_api_key(&headers, &state.auth)?;
+    require_global_principal(&principal)?;
 
     let tenant = state.tenant_store(&cluster_id).map_err(|err| {
         tracing::warn!(cluster_id = %cluster_id, error = ?err, "unknown or invalid cluster id");
@@ -473,10 +471,10 @@ pub async fn cluster_stats_handler(
 
 pub async fn storage_stats_handler(
     State(state): State<EngineState>,
-    headers: HeaderMap,
+    Extension(principal): Extension<RequestPrincipal>,
     axum::extract::Path(cluster_id): axum::extract::Path<String>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    crate::api::auth::authorize_global_api_key(&headers, &state.auth)?;
+    require_global_principal(&principal)?;
     let tenant = state.tenant_store(&cluster_id).map_err(|err| {
         tracing::warn!(cluster_id = %cluster_id, error = ?err, "unknown or invalid cluster id");
         StatusCode::NOT_FOUND
@@ -490,10 +488,10 @@ pub async fn storage_stats_handler(
 
 pub async fn cluster_graph_handler(
     State(state): State<EngineState>,
-    headers: HeaderMap,
+    Extension(principal): Extension<RequestPrincipal>,
     axum::extract::Path(cluster_id): axum::extract::Path<String>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    crate::api::auth::authorize_global_api_key(&headers, &state.auth)?;
+    require_global_principal(&principal)?;
     let tenant = state.tenant_store(&cluster_id).map_err(|err| {
         tracing::warn!(cluster_id = %cluster_id, error = ?err, "unknown or invalid cluster id");
         StatusCode::NOT_FOUND
@@ -507,10 +505,10 @@ pub async fn cluster_graph_handler(
 
 pub async fn admin_inject_api_key_handler(
     State(state): State<EngineState>,
-    headers: HeaderMap,
+    Extension(principal): Extension<RequestPrincipal>,
     Json(payload): Json<AdminInjectApiKeyPayload>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    crate::api::auth::authorize_global_api_key(&headers, &state.auth)?;
+    require_global_principal(&principal)?;
 
     state
         .platform
@@ -531,10 +529,10 @@ pub async fn admin_inject_api_key_handler(
 
 pub async fn admin_revoke_api_key_handler(
     State(state): State<EngineState>,
-    headers: HeaderMap,
+    Extension(principal): Extension<RequestPrincipal>,
     axum::extract::Path(key_id): axum::extract::Path<String>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    crate::api::auth::authorize_global_api_key(&headers, &state.auth)?;
+    require_global_principal(&principal)?;
 
     state.platform.admin_revoke_api_key(&key_id).map_err(|err| {
         tracing::warn!("Failed to admin revoke API key: {:?}", err);
@@ -542,4 +540,22 @@ pub async fn admin_revoke_api_key_handler(
     })?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::auth::RequestPrincipal;
+
+    #[test]
+    fn admin_handlers_accept_only_global_principal() {
+        assert_eq!(require_global_principal(&RequestPrincipal::GlobalApiKey), Ok(()));
+
+        let user_principal = RequestPrincipal::UserApiKey(crate::platform::ApiKeyAuth {
+            user_id: "usr_test".to_string(),
+            key_id: "key_test".to_string(),
+            cluster_id: Some("default".to_string()),
+        });
+        assert_eq!(require_global_principal(&user_principal), Err(StatusCode::UNAUTHORIZED));
+    }
 }

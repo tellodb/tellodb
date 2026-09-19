@@ -52,6 +52,16 @@ async fn rate_limit_middleware(
     Ok(next.run(req).await)
 }
 
+async fn auth_middleware(
+    State(state): State<EngineState>,
+    mut req: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let principal = auth::authorize_request(req.headers(), &state)?;
+    req.extensions_mut().insert(principal);
+    Ok(next.run(req).await)
+}
+
 async fn request_timeout_middleware(req: Request, next: Next) -> Result<Response, StatusCode> {
     let path = req.uri().path().to_string();
     // Health probes never time out. Ingest and reset are exempt too: the
@@ -88,7 +98,21 @@ async fn request_timeout_middleware(req: Request, next: Next) -> Result<Response
 }
 
 pub fn build_api(state: EngineState) -> Router {
+    let platform = Router::new()
+        .route("/signup", post(platform_signup_handler))
+        .route("/login", post(platform_login_handler))
+        .route("/logout", post(platform_logout_handler))
+        .route("/me", get(platform_me_handler))
+        .route("/api-keys", post(platform_create_api_key_handler))
+        .route("/api-keys", get(platform_list_api_keys_handler))
+        .route("/api-keys/{prefix}", post(platform_revoke_api_key_handler))
+        .route("/stats", get(platform_stats_handler))
+        .route("/profile", get(platform_profile_handler))
+        .layer(middleware::from_fn_with_state(state.clone(), rate_limit_middleware));
+
     let protected = Router::new()
+        .route("/health", get(health_handler))
+        .route("/version", get(version_handler))
         .route("/status", get(status_handler))
         .route("/warmup", post(warmup_handler))
         .route("/reset", post(reset_handler))
@@ -100,15 +124,6 @@ pub fn build_api(state: EngineState) -> Router {
         .route("/admin/stats/hardware", get(hardware_stats_handler))
         .route("/admin/api_keys", post(admin_inject_api_key_handler))
         .route("/admin/api_keys/{key_id}", delete(admin_revoke_api_key_handler))
-        .route("/signup", post(platform_signup_handler))
-        .route("/login", post(platform_login_handler))
-        .route("/logout", post(platform_logout_handler))
-        .route("/me", get(platform_me_handler))
-        .route("/api-keys", post(platform_create_api_key_handler))
-        .route("/api-keys", get(platform_list_api_keys_handler))
-        .route("/api-keys/{prefix}", post(platform_revoke_api_key_handler))
-        .route("/stats", get(platform_stats_handler))
-        .route("/profile", get(platform_profile_handler))
         .route("/mcp", post(mcp_handler))
         .route("/ingest", post(ingest_handler))
         .route("/batch-ingest", post(batch_ingest_handler))
@@ -125,13 +140,13 @@ pub fn build_api(state: EngineState) -> Router {
         .route("/analytics/query", post(analytics_query_handler))
         .route("/facts/current", get(current_fact_handler))
         .route("/facts/history", get(fact_history_handler))
+        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .layer(middleware::from_fn_with_state(state.clone(), rate_limit_middleware));
 
     Router::new()
-        .route("/health", get(health_handler))
         .route("/healthz", get(healthz_handler))
-        .route("/version", get(version_handler))
         .route("/metrics", get(metrics_handler))
+        .merge(platform)
         .merge(protected)
         .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024)) // 10MB max body
         .layer(middleware::from_fn(request_timeout_middleware))

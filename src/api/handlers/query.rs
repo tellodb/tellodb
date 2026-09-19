@@ -1,6 +1,6 @@
 use crate::api::auth::{
-    authorize_request, principal_namespace_prefix, principal_user_id, record_usage_for_principal,
-    scope_entity_id,
+    principal_namespace_prefix, principal_user_id, record_usage_for_principal, scope_entity_id,
+    RequestPrincipal,
 };
 use crate::api::plan::*;
 use crate::api::types::RankedItem;
@@ -26,7 +26,7 @@ use crate::storage::{
     AgentObservation, MemoryCard, MemoryCardSearchInput, MemoryKind, TenantStore,
 };
 use axum::{
-    extract::{Json, State},
+    extract::{Extension, Json, State},
     http::{HeaderMap, HeaderValue, StatusCode},
     response::IntoResponse,
 };
@@ -175,10 +175,9 @@ fn build_entity_observation_block(
 
 pub async fn query_handler(
     State(state): State<EngineState>,
-    headers: HeaderMap,
+    Extension(principal): Extension<RequestPrincipal>,
     Json(payload): Json<QueryPayload>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let principal = authorize_request(&headers, &state)?;
     let ns_prefix = principal_namespace_prefix(&principal);
     let tenant_id = principal_user_id(&principal).unwrap_or("default");
     let tenant = state.tenant_store(tenant_id).map_err(|e| {
@@ -1102,10 +1101,9 @@ fn scoped_graph_node_id(
 
 pub async fn graph_query_handler(
     State(state): State<EngineState>,
-    headers: HeaderMap,
+    Extension(principal): Extension<RequestPrincipal>,
     Json(payload): Json<GraphQueryPayload>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let principal = authorize_request(&headers, &state)?;
     // If subject is provided, scope it. If not, fallback to scoping the requested user_id.
     let subject = if !payload.subject.trim().is_empty() {
         let ns_prefix = principal_namespace_prefix(&principal);
@@ -1134,10 +1132,9 @@ pub async fn graph_query_handler(
 
 pub async fn graph_walk_handler(
     State(state): State<EngineState>,
-    headers: HeaderMap,
+    Extension(principal): Extension<RequestPrincipal>,
     Json(payload): Json<GraphWalkPayload>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let principal = authorize_request(&headers, &state)?;
     let node = if !payload.node.trim().is_empty() {
         let ns_prefix = principal_namespace_prefix(&principal);
         scope_entity_id(payload.node.trim(), ns_prefix.as_deref())
@@ -1167,10 +1164,9 @@ pub async fn graph_walk_handler(
 
 pub async fn graph_export_handler(
     State(state): State<EngineState>,
-    headers: HeaderMap,
+    Extension(principal): Extension<RequestPrincipal>,
     Json(payload): Json<GraphExportPayload>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let principal = authorize_request(&headers, &state)?;
     let seed = if !payload.seed.trim().is_empty() {
         let ns_prefix = principal_namespace_prefix(&principal);
         scope_entity_id(payload.seed.trim(), ns_prefix.as_deref())
@@ -1200,10 +1196,9 @@ pub async fn graph_export_handler(
 
 pub async fn analytics_query_handler(
     State(state): State<EngineState>,
-    headers: HeaderMap,
+    Extension(principal): Extension<RequestPrincipal>,
     Json(payload): Json<AnalyticsQueryPayload>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let principal = authorize_request(&headers, &state)?;
     let ns_prefix = principal_namespace_prefix(&principal);
     let user_id = crate::api::auth::principal_user_id(&principal).unwrap_or("default");
     let mut payload = payload;

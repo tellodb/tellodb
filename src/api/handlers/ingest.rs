@@ -1,14 +1,14 @@
 use axum::http::{HeaderMap, HeaderValue};
 use axum::{
-    extract::{Json, State},
+    extract::{Extension, Json, State},
     http::StatusCode,
     response::IntoResponse,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::api::auth::{
-    authorize_request, principal_namespace_prefix, principal_user_id, record_usage_for_principal,
-    scope_entity_id,
+    principal_namespace_prefix, principal_user_id, record_usage_for_principal, scope_entity_id,
+    RequestPrincipal,
 };
 use crate::api::ingest::salient::{extract_named_phrases, extract_salient_terms};
 use crate::api::ingest::{alias::*, chunking::*, companion::*, datetime::*, dialogue::*, fact::*};
@@ -234,10 +234,9 @@ struct ArtifactBatches {
 
 pub async fn ingest_handler(
     State(state): State<EngineState>,
-    headers: HeaderMap,
+    Extension(principal): Extension<RequestPrincipal>,
     Json(payload): Json<IngestPayload>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let principal = authorize_request(&headers, &state)?;
     let ns_prefix = principal_namespace_prefix(&principal);
     let profile_text = payload.textual_content.clone();
     let profile_ts = payload.timestamp;
@@ -299,10 +298,9 @@ pub async fn ingest_handler(
 
 pub async fn batch_ingest_handler(
     State(state): State<EngineState>,
-    headers: HeaderMap,
+    Extension(principal): Extension<RequestPrincipal>,
     Json(payload): Json<BatchIngestPayload>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let principal = authorize_request(&headers, &state)?;
     let ns_prefix = principal_namespace_prefix(&principal);
     let profile_items = payload
         .items
