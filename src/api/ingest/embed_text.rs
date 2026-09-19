@@ -16,17 +16,6 @@ pub use crate::config::{EmbedTextConfig, EmbedTextMode};
 use crate::storage::TenantStore;
 use anyhow::Result;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::OnceLock;
-
-static CONFIG: OnceLock<EmbedTextConfig> = OnceLock::new();
-
-pub fn embed_text_config() -> EmbedTextConfig {
-    *CONFIG.get_or_init(|| EmbedTextConfig { mode: EmbedTextMode::Context, window: 1 })
-}
-
-pub fn init(config: EmbedTextConfig) -> EmbedTextConfig {
-    *CONFIG.get_or_init(|| config)
-}
 
 /// A source turn is a memory as sent (or the first chunk of one), as opposed
 /// to derived records such as later chunks, companions and cards.

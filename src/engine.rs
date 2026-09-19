@@ -20,20 +20,15 @@ pub async fn build_state(
     paths.apply_process_env_defaults();
     info!(root = %paths.root().display(), "Runtime data root");
 
-    crate::features::init(config.features);
     if !config.features.disabled_names().is_empty() {
         info!(disabled = ?config.features.disabled_names(), "Ingest structures disabled");
     }
 
-    crate::heuristics::init(config.heuristics);
     info!(profile = config.heuristics.name(), "Heuristics profile");
 
-    crate::retrieval::lanes::init(config.lanes);
     if config.lanes != crate::retrieval::lanes::Lanes::default() {
         info!(enabled = ?config.lanes.enabled_names(), "Retrieval lanes restricted");
     }
-
-    crate::api::ingest::embed_text::init(config.embedding.text);
 
     let cache_path = config
         .embedding
@@ -50,7 +45,7 @@ pub async fn build_state(
         .await?,
     );
     config.embedding.dimension = Some(semantic.embedding_dim());
-    let extractor = crate::extract::init(&config.extractor)?;
+    let extractor = crate::extract::init(&config.extractor, config.heuristics)?;
     info!(extractor = extractor.name(), "Fact extractor");
     info!(
         model_id = %semantic.embedding_model_id(),

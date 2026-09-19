@@ -34,7 +34,8 @@ fn content_hash(text: &str, entity_id: &str, kind: &str) -> String {
     result.iter().map(|b| format!("{:02x}", b)).collect::<String>()
 }
 type RetrospectiveCandidate = (String, String, String, u64, String, String);
-use crate::features::Feature;
+use crate::features::{Feature, Features};
+use crate::heuristics::Profile;
 use crate::lifecycle::{evaluate_lifecycle, LifecycleMetadata};
 use crate::metrics;
 use crate::storage::{
@@ -375,19 +376,6 @@ pub(crate) async fn process_ingest_batch(
     execute_ingest_pipeline(state, tenant, payloads).await
 }
 
-/// Cosine similarity above which two predicate wordings are treated as the
-/// same predicate (`TELLODB_PREDICATE_TAU`, default 0.86).
-fn predicate_canon_tau() -> f32 {
-    static TAU: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *TAU.get_or_init(|| {
-        std::env::var("TELLODB_PREDICATE_TAU")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|v: &f32| v.is_finite() && (0.0..=1.0).contains(v))
-            .unwrap_or(0.86)
-    })
-}
-
 /// Session of a (normalized) payload, if any.
 fn payload_session(payload: &IngestPayload) -> Option<String> {
     payload.session_id.clone().filter(|s| !s.is_empty())
@@ -398,10 +386,12 @@ fn expand_and_enrich_payloads(
     payloads: Vec<IngestPayload>,
     diag: &mut IngestDiagnostics,
     total_start: Instant,
+    features: Features,
+    embed_config: crate::config::EmbedTextConfig,
+    profile: Profile,
 ) -> (Vec<IngestPayload>, Vec<String>) {
     let stage_start = Instant::now();
 
-    let features = crate::features::features();
     let mut expanded_payloads = Vec::new();
     for mut payload in payloads {
         normalize_payload_identity(&mut payload);
@@ -432,7 +422,9 @@ fn expand_and_enrich_payloads(
             expanded_payloads.push(chunked_payload.clone());
             if payload.enable_mining.unwrap_or(true) {
                 let tag_prefix = format!("{}::", chunked_payload.memory_id);
-                for mut companion in build_companion_payloads(&chunked_payload) {
+                for mut companion in
+                    build_companion_payloads_with_profile(&chunked_payload, profile)
+                {
                     let feature = companion
                         .memory_id
                         .strip_prefix(&tag_prefix)
@@ -469,8 +461,7 @@ fn expand_and_enrich_payloads(
 
     let stage_start = Instant::now();
     let mut enriched_texts = Vec::with_capacity(expanded_payloads.len());
-    let legacy_headers = crate::api::ingest::embed_text::embed_text_config().mode
-        == crate::api::ingest::embed_text::EmbedTextMode::Legacy;
+    let legacy_headers = embed_config.mode == crate::config::EmbedTextMode::Legacy;
 
     for (idx, payload) in expanded_payloads.iter().enumerate() {
         if !legacy_headers || payload.kind.as_deref() == Some("synthetic_query") {
@@ -565,6 +556,8 @@ fn build_observations(
     expanded_payloads: Vec<IngestPayload>,
     semantic_embeddings: Vec<Vec<f32>>,
     diag: &mut IngestDiagnostics,
+    features: Features,
+    profile: Profile,
 ) -> Result<Vec<PreparedRecord>, StatusCode> {
     let dedup_build_start = Instant::now();
 
@@ -580,9 +573,10 @@ fn build_observations(
             || kind == MemoryKind::Fact)
             && payload.fact_key.as_ref().map_or(true, |k| k.trim().is_empty())
         {
-            if let Some(inferred_key) =
-                crate::api::plan::infer_query_fact_key(&payload.textual_content)
-            {
+            if let Some(inferred_key) = crate::api::plan::infer_query_fact_key_with_profile(
+                &payload.textual_content,
+                profile,
+            ) {
                 payload.fact_key = Some(inferred_key);
             }
         }
@@ -622,7 +616,7 @@ fn build_observations(
         if index_semantic
             && lifecycle.index_vector
             && enable_semantic_dedup
-            && crate::features::enabled(Feature::SemanticDedup)
+            && features.enabled(Feature::SemanticDedup)
             && (kind == MemoryKind::Fact || kind == MemoryKind::Decision)
         {
             let vectors = tenant.vectors().map_err(|err| {
@@ -669,9 +663,9 @@ fn build_artifacts(
     prepared: Vec<PreparedRecord>,
     inserted_flags: Vec<Option<u64>>,
     diag: &mut IngestDiagnostics,
+    features: Features,
 ) -> ArtifactBatches {
     let artifact_build_start = Instant::now();
-    let features = crate::features::features();
     let mut batches = ArtifactBatches::default();
 
     for (record, vector_id) in prepared.into_iter().zip(inserted_flags.into_iter()) {
@@ -966,7 +960,7 @@ async fn commit_batches(
 
     // Predicate grouping: rule-derived keys vary in wording ("job title" vs
     // "job_title"), which would otherwise keep two chains for one fact.
-    if crate::features::enabled(Feature::PredicateCanon) && !batches.fact_batch.is_empty() {
+    if state.config.features.enabled(Feature::PredicateCanon) && !batches.fact_batch.is_empty() {
         let stage_start = Instant::now();
         let mut keys: Vec<(String, String)> =
             batches.fact_batch.iter().map(|f| (f.entity_id.clone(), f.fact_key.clone())).collect();
@@ -983,12 +977,12 @@ async fn commit_batches(
             by_entity.entry(entity_id).or_default().push((key, embedding));
         }
         let tenant_canon = tenant.clone();
+        let predicate_tau = state.config.ingest.predicate_canon_tau;
         let canonical = tokio::task::spawn_blocking(move || {
-            let tau = predicate_canon_tau();
             let mut canonical = std::collections::HashMap::new();
             for (entity_id, predicates) in by_entity {
                 let assigned =
-                    tenant_canon.canonicalize_predicates(&entity_id, &predicates, tau)?;
+                    tenant_canon.canonicalize_predicates(&entity_id, &predicates, predicate_tau)?;
                 for (predicate, group) in assigned {
                     canonical.insert((entity_id.clone(), predicate), group);
                 }
@@ -1164,7 +1158,7 @@ async fn commit_batches(
 
     // Typed graph edges from memory cards and fact registrations; they feed
     // the entity-graph retrieval lane.
-    if crate::features::enabled(Feature::GraphEdges) {
+    if state.config.features.enabled(Feature::GraphEdges) {
         let stage_start = Instant::now();
         let tenant = tenant.clone();
         let cards = batches.memory_card_batch.clone();
@@ -1651,18 +1645,25 @@ async fn execute_ingest_pipeline(
     let metric_sources: Vec<(String, String, u64, String)> = payloads
         .iter()
         .filter(|p| p.kind.as_deref() != Some("synthetic_query"))
-        .filter(|_| crate::features::enabled(Feature::Metrics))
+        .filter(|_| state.config.features.enabled(Feature::Metrics))
         .map(|p| (p.entity_id.clone(), p.memory_id.clone(), p.timestamp, p.textual_content.clone()))
         .collect();
 
     // Phase 1: Payload preparation
-    let (mut expanded_payloads, mut enriched_texts) =
-        expand_and_enrich_payloads(payloads, &mut diag, total_start);
+    let features = state.config.features;
+    let embed_config = state.config.embedding.text;
+    let (mut expanded_payloads, mut enriched_texts) = expand_and_enrich_payloads(
+        payloads,
+        &mut diag,
+        total_start,
+        features,
+        embed_config,
+        state.config.heuristics,
+    );
 
     // Embedding text: `legacy` keeps the batch-neighbour header built above;
     // `turn` / `context` build text from the turn itself (and stored
     // neighbouring turns), independent of how requests are batched.
-    let embed_config = crate::api::ingest::embed_text::embed_text_config();
     let mut neighbour_updates = Vec::new();
     if embed_config.mode != crate::api::ingest::embed_text::EmbedTextMode::Legacy {
         let (tenant_for_text, payloads_for_text) = (tenant.clone(), expanded_payloads.clone());
@@ -1721,7 +1722,14 @@ async fn execute_ingest_pipeline(
     tracing::debug!("[CP] embed_done: μs={}", total_start.elapsed().as_micros());
 
     // Phase 3: Dedup + observation building
-    let prepared = build_observations(tenant, expanded_payloads, semantic_embeddings, &mut diag)?;
+    let prepared = build_observations(
+        tenant,
+        expanded_payloads,
+        semantic_embeddings,
+        &mut diag,
+        features,
+        state.config.heuristics,
+    )?;
 
     let batch_items: Vec<(u64, String, AgentObservation)> = prepared
         .iter()
@@ -1740,7 +1748,7 @@ async fn execute_ingest_pipeline(
     (diag.storage_ms, diag.storage_us) = elapsed_ms_and_us(stage_start);
 
     // Phase 4: Artifact building
-    let mut batches = build_artifacts(prepared, inserted_flags, &mut diag);
+    let mut batches = build_artifacts(prepared, inserted_flags, &mut diag, features);
 
     // Phase 5: Storage commit
     commit_batches(tenant, state, &mut batches, &mut diag).await?;

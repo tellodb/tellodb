@@ -53,6 +53,7 @@ pub struct RetrievalConfig {
     pub latest_recency_weight: f32,
 }
 
+#[repr(usize)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetrievalProfile {
     Fast,

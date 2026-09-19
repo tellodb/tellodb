@@ -62,7 +62,11 @@ async fn auth_middleware(
     Ok(next.run(req).await)
 }
 
-async fn request_timeout_middleware(req: Request, next: Next) -> Result<Response, StatusCode> {
+async fn request_timeout_middleware(
+    State(state): State<EngineState>,
+    req: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
     let path = req.uri().path().to_string();
     // Health probes never time out. Ingest and reset are exempt too: the
     // timeout drops the response but not the blocking work behind it, so a
@@ -81,13 +85,7 @@ async fn request_timeout_middleware(req: Request, next: Next) -> Result<Response
     if UNTIMED.contains(&path.as_str()) || path == "/v1/admin/reset" {
         return Ok(next.run(req).await);
     }
-    static TIMEOUT_SECS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let timeout_secs = *TIMEOUT_SECS.get_or_init(|| {
-        std::env::var("TELLODB_REQUEST_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(30)
-    });
+    let timeout_secs = state.config.server.request_timeout_secs;
     match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), next.run(req)).await {
         Ok(resp) => Ok(resp),
         Err(_) => {
@@ -149,7 +147,7 @@ pub fn build_api(state: EngineState) -> Router {
         .merge(platform)
         .merge(protected)
         .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024)) // 10MB max body
-        .layer(middleware::from_fn(request_timeout_middleware))
-        .layer(auth::build_cors_layer())
+        .layer(middleware::from_fn_with_state(state.clone(), request_timeout_middleware))
+        .layer(auth::build_cors_layer(&state.config.server.cors_origins))
         .with_state(state)
 }

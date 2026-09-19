@@ -14,9 +14,10 @@
 //! No generative model is involved in either tier.
 
 use crate::api::ingest::fact::{
-    infer_fact_key, is_high_signal_atomic_claim, preference_signal_strength, split_atomic_claims,
+    is_high_signal_atomic_claim, preference_signal_strength, split_atomic_claims,
 };
 use crate::config::ExtractorConfig;
+use crate::heuristics::Profile;
 use anyhow::{bail, Context, Result};
 use std::sync::{Arc, OnceLock};
 
@@ -57,11 +58,12 @@ pub trait Extractor: Send + Sync {
 pub struct RuleExtractor {
     /// Facts kept per memory.
     pub max_facts: usize,
+    pub heuristics: Profile,
 }
 
 impl Default for RuleExtractor {
     fn default() -> Self {
-        Self { max_facts: 4 }
+        Self { max_facts: 4, heuristics: Profile::Generic }
     }
 }
 
@@ -108,7 +110,10 @@ impl Extractor for RuleExtractor {
                     subject,
                     speaker: speaker.clone(),
                     predicate: None,
-                    fact_key: infer_fact_key(&claim),
+                    fact_key: crate::api::ingest::fact::infer_fact_key_with_profile(
+                        &claim,
+                        self.heuristics,
+                    ),
                     object: claim,
                     confidence: 0.90,
                     is_preference,
@@ -215,9 +220,9 @@ impl Extractor for EncoderExtractor {
 
 static EXTRACTOR: OnceLock<Arc<dyn Extractor>> = OnceLock::new();
 
-pub fn init(config: &ExtractorConfig) -> Result<Arc<dyn Extractor>> {
+pub fn init(config: &ExtractorConfig, heuristics: Profile) -> Result<Arc<dyn Extractor>> {
     let extractor: Arc<dyn Extractor> = match config.kind.trim() {
-        "" | "rules" => Arc::new(RuleExtractor::default()),
+        "" | "rules" => Arc::new(RuleExtractor { heuristics, ..RuleExtractor::default() }),
         "encoder" => Arc::new(EncoderExtractor::from_config(config)?),
         other => bail!("unknown TELLODB_EXTRACTOR '{other}' (rules, encoder)"),
     };
@@ -267,7 +272,7 @@ mod tests {
         let text =
             (0..10).map(|i| format!("My pet {i} is named Rex{i}.")).collect::<Vec<_>>().join("\n");
         assert!(
-            RuleExtractor { max_facts: 2 }
+            RuleExtractor { max_facts: 2, heuristics: Profile::Generic }
                 .extract(&text, &ExtractCtx { entity_id: "alice", timestamp_ms: 0, relations: &[] })
                 .len()
                 <= 2

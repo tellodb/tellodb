@@ -6,7 +6,6 @@
 //! startup error, so a typo cannot silently run the full configuration.
 
 use anyhow::{bail, Result};
-use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Feature {
@@ -141,22 +140,6 @@ impl Features {
     pub fn disabled_names(self) -> Vec<&'static str> {
         Feature::ALL.iter().filter(|f| !self.enabled(**f)).map(|f| f.name()).collect()
     }
-}
-
-static FEATURES: OnceLock<Features> = OnceLock::new();
-
-pub fn init(config: Features) -> Features {
-    *FEATURES.get_or_init(|| config)
-}
-
-/// Process-wide switches. Everything is enabled until `init_from_env` runs
-/// (or if `TELLODB_DISABLE` is unset).
-pub fn features() -> Features {
-    *FEATURES.get_or_init(Features::default)
-}
-
-pub fn enabled(feature: Feature) -> bool {
-    features().enabled(feature)
 }
 
 #[cfg(test)]

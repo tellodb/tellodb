@@ -12,8 +12,8 @@ fn file_len(path: &std::path::Path) -> u64 {
 /// Builds the report; `warnings` lists anything that needs attention.
 pub fn report(state: &EngineState, paths: &RuntimePaths) -> Result<Value> {
     let semantic = &state.semantic;
-    let embed = crate::api::ingest::embed_text::embed_text_config();
-    let features = crate::features::features();
+    let embed = state.config.embedding.text;
+    let features = state.config.features;
     let mut warnings: Vec<String> = Vec::new();
 
     let mut tenant_ids: Vec<String> = std::fs::read_dir(paths.root().join("tenants"))

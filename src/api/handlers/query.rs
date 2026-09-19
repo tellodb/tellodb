@@ -13,14 +13,14 @@ use crate::api::utils::{
     apply_decay_with_policy, clip_profile_to_budget, cosine_similarity_from_distance,
     elapsed_ms_and_us, extract_named_phrases, insert_f32_header, insert_stage_timing_headers,
     insert_u64_header, parse_temporal_window, scoped_semantic_min_hits, scoped_semantic_start,
-    scoped_semantic_step, scoped_semantic_top, should_apply_neural_rerank,
-    temporal_recency_scoring_enabled, SEMANTIC_TOP_DEFAULT,
+    should_apply_neural_rerank, SEMANTIC_TOP_DEFAULT,
 };
 use crate::api::{EngineState, PlatformWriteOp};
-use crate::features::{self, Feature};
+use crate::config::{RerankPolicy, RetrievalProfile};
+use crate::features::Feature;
 use crate::metrics;
 use crate::ml::cosine_similarity;
-use crate::retrieval::lanes::{self, Lane};
+use crate::retrieval::lanes::Lane;
 use crate::retrieval::{rrf_fuse, ScoringWeights};
 use crate::storage::{
     AgentObservation, MemoryCard, MemoryCardSearchInput, MemoryKind, TenantStore,
@@ -716,41 +716,12 @@ struct RetrievalBudget {
     card_limit: usize,
 }
 
-#[repr(usize)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RetrievalProfile {
-    Fast = 0,
-    Balanced = 1,
-    Research = 2,
+fn retrieval_profile(config: &crate::config::Config) -> RetrievalProfile {
+    config.retrieval.profile
 }
 
-fn retrieval_profile() -> RetrievalProfile {
-    static CACHED: std::sync::OnceLock<RetrievalProfile> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| {
-        match std::env::var("TEMPORAL_MEMORY_RETRIEVAL_PROFILE")
-            .unwrap_or_else(|_| "fast".to_string())
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "research" | "full" | "v2" => RetrievalProfile::Research,
-            "balanced" | "default" => RetrievalProfile::Balanced,
-            _ => RetrievalProfile::Fast,
-        }
-    })
-}
-
-fn auto_rerank_enabled(profile: RetrievalProfile) -> bool {
-    static OVERRIDE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
-    let configured = *OVERRIDE.get_or_init(|| {
-        std::env::var("TEMPORAL_MEMORY_AUTO_RERANK").ok().and_then(|value| {
-            match value.trim().to_ascii_lowercase().as_str() {
-                "1" | "true" | "yes" | "on" => Some(true),
-                "0" | "false" | "no" | "off" => Some(false),
-                _ => None,
-            }
-        })
-    });
-    configured.unwrap_or(matches!(profile, RetrievalProfile::Research))
+fn auto_rerank_enabled(config: &crate::config::Config, profile: RetrievalProfile) -> bool {
+    config.retrieval.auto_rerank.unwrap_or(matches!(profile, RetrievalProfile::Research))
 }
 
 #[repr(usize)]
@@ -956,12 +927,12 @@ fn collect_edge_cluster_scores_for_seeds(
     tenant: &TenantStore,
     seeds: &[String],
     max_depth: usize,
+    max_node_degree: usize,
     edge_type_filter: Option<&str>,
     intent: Option<crate::api::plan::types::QueryIntent>,
 ) -> (Vec<HashMap<String, f32>>, u64) {
     const NEIGHBORS_PER_NODE: usize = 50;
     const DEPTH_DECAY: f32 = 0.6;
-    let max_node_degree = graph_max_node_degree();
 
     let mut neighbours: HashMap<String, Vec<(String, f32, String)>> = HashMap::new();
     let mut accumulated: Vec<HashMap<String, f32>> = vec![HashMap::new(); seeds.len()];
@@ -1017,36 +988,6 @@ fn collect_edge_cluster_scores_for_seeds(
     }
 
     (accumulated, expanded)
-}
-
-/// Top fused candidates the graph stage expands from (`TELLODB_GRAPH_SEEDS`,
-/// default 24).
-fn graph_seed_count() -> usize {
-    static SEEDS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *SEEDS.get_or_init(|| {
-        std::env::var("TELLODB_GRAPH_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(24)
-    })
-}
-
-/// Hops walked from each seed (`TELLODB_GRAPH_MAX_DEPTH`, default 2).
-fn graph_max_depth() -> usize {
-    static DEPTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *DEPTH.get_or_init(|| {
-        std::env::var("TELLODB_GRAPH_MAX_DEPTH").ok().and_then(|v| v.parse().ok()).unwrap_or(2)
-    })
-}
-
-/// Graph nodes with more edges than this are treated as hubs and not
-/// traversed (`TELLODB_GRAPH_MAX_NODE_DEGREE`, default 128).
-fn graph_max_node_degree() -> usize {
-    static DEGREE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *DEGREE.get_or_init(|| {
-        std::env::var("TELLODB_GRAPH_MAX_NODE_DEGREE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|&v: &usize| v > 0)
-            .unwrap_or(128)
-    })
 }
 
 /// Returns 1.5 for edges that align with the query intent, 1.0 otherwise.
@@ -1376,7 +1317,11 @@ fn plan_phase(s: &mut QueryPipelineState) {
     s.evidence_radius = s.payload.max_evidence_turns_per_session.unwrap_or(0).min(3) as u32;
 
     let planning_start = Instant::now();
-    s.plan = build_query_plan(&s.query_text, s.state.intent_classifier.as_deref());
+    s.plan = build_query_plan_with_profile(
+        &s.query_text,
+        s.state.intent_classifier.as_deref(),
+        s.state.config.heuristics,
+    );
 
     if let Some(hyde_query) = build_hyde_query(&s.query_text, &s.plan) {
         promote_query_variant(&mut s.plan.semantic_queries, hyde_query.clone());
@@ -1394,7 +1339,7 @@ fn plan_phase(s: &mut QueryPipelineState) {
         }
     }
 
-    let retrieval_profile = retrieval_profile();
+    let retrieval_profile = retrieval_profile(&s.state.config);
     s.budget = retrieval_budget_for_plan(&s.plan, retrieval_profile);
     s.fts_top = match s.plan.intent {
         QueryIntent::Inference | QueryIntent::PeripheralMention => 180,
@@ -1403,8 +1348,11 @@ fn plan_phase(s: &mut QueryPipelineState) {
         QueryIntent::Recommendation | QueryIntent::General => 72,
     }
     .min(s.budget.fts_top);
-    s.semantic_top =
-        if s.payload.entity_id.is_some() { scoped_semantic_top() } else { SEMANTIC_TOP_DEFAULT };
+    s.semantic_top = if s.payload.entity_id.is_some() {
+        s.state.config.retrieval.scoped_semantic_top
+    } else {
+        SEMANTIC_TOP_DEFAULT
+    };
     s.semantic_top = if s.plan.cross_entity || s.plan.ordinal_rank.is_some() {
         s.semantic_top.saturating_mul(2).min(1200)
     } else if matches!(s.plan.intent, QueryIntent::Inference) {
@@ -1437,7 +1385,7 @@ fn plan_phase(s: &mut QueryPipelineState) {
         let query_text_for_routes = s.query_text.clone();
         let tenant_for_routes = s.tenant.clone();
         let session_router_limit = s.budget.session_router_limit;
-        let router_on = features::enabled(Feature::SessionRouter);
+        let router_on = s.state.config.features.enabled(Feature::SessionRouter);
 
         let (sr_hits, win_hits, pivot_hits) = std::thread::scope(|sc| {
             let h_sr = {
@@ -1526,7 +1474,9 @@ fn plan_phase(s: &mut QueryPipelineState) {
 }
 
 fn route_phase(s: &mut QueryPipelineState) {
-    if !features::enabled(Feature::SessionRouter) || !lanes::enabled(Lane::Route) {
+    if !s.state.config.features.enabled(Feature::SessionRouter)
+        || !s.state.config.lanes.enabled(Lane::Route)
+    {
         return;
     }
     let route_probe_queries = if s.budget.route_probe_query_limit == 0 {
@@ -1684,7 +1634,7 @@ fn retrieval_phase(s: &mut QueryPipelineState) {
 }
 
 fn retrieval_ann(s: &mut QueryPipelineState) {
-    if !lanes::enabled(Lane::Vector) {
+    if !s.state.config.lanes.enabled(Lane::Vector) {
         return;
     }
     let stage_start = Instant::now();
@@ -1732,12 +1682,14 @@ fn retrieval_ann(s: &mut QueryPipelineState) {
         let query_limit = s.limit;
         let semantic_top = s.semantic_top;
         let dedup_threshold = s.weights.dedup_similarity_threshold;
+        let retrieval_config = s.state.config.retrieval.clone();
         std::thread::scope(|sc| {
             let mut handles = Vec::with_capacity(embeddings.len());
             for (idx, embedding) in embeddings.iter().enumerate() {
                 let tenant = tenant_clone.clone();
                 let embedding = embedding.clone();
                 let eid = eid.clone();
+                let retrieval_config = retrieval_config.clone();
                 let handle = sc.spawn(move || {
                     let mut hnsw_hits = Vec::new();
                     let mut variant_rerank_seed_ids = Vec::new();
@@ -1746,9 +1698,13 @@ fn retrieval_ann(s: &mut QueryPipelineState) {
                     let mut search_top = semantic_top as u64;
                     let hnsw_raw = if let Some(entity_id) = eid.as_deref() {
                         let scoped_max_top = semantic_top;
-                        let scoped_start = scoped_semantic_start(scoped_max_top);
-                        let scoped_step = scoped_semantic_step();
-                        let scoped_min_hits = scoped_semantic_min_hits(query_limit, scoped_max_top);
+                        let scoped_start = scoped_semantic_start(&retrieval_config, scoped_max_top);
+                        let scoped_step = retrieval_config.scoped_semantic_step;
+                        let scoped_min_hits = scoped_semantic_min_hits(
+                            &retrieval_config,
+                            query_limit,
+                            scoped_max_top,
+                        );
                         let mut current_top = scoped_start;
                         let mut attempts = 0usize;
                         let mut prev_hit_count: Option<usize> = None;
@@ -1823,10 +1779,12 @@ fn retrieval_ann(s: &mut QueryPipelineState) {
                                 prev_hit_count,
                                 prev_top_similarity,
                             };
-                            if crate::api::utils::should_stop_scoped_ann(&scoped_state)
-                                || (attempts >= 2
-                                    && cumulative_hnsw_hits.len() >= scoped_min_hits
-                                    && new_scoped_hits == 0)
+                            if crate::api::utils::should_stop_scoped_ann(
+                                &retrieval_config,
+                                &scoped_state,
+                            ) || (attempts >= 2
+                                && cumulative_hnsw_hits.len() >= scoped_min_hits
+                                && new_scoped_hits == 0)
                             {
                                 break scoped_last_raw;
                             }
@@ -1930,7 +1888,7 @@ fn retrieval_ann(s: &mut QueryPipelineState) {
 }
 
 fn retrieval_fts(s: &mut QueryPipelineState) {
-    if !lanes::enabled(Lane::Fts) {
+    if !s.state.config.lanes.enabled(Lane::Fts) {
         return;
     }
     let stage_start = Instant::now();
@@ -1999,11 +1957,10 @@ fn retrieval_fts(s: &mut QueryPipelineState) {
 fn retrieval_cards(s: &mut QueryPipelineState) {
     let stage_start = Instant::now();
     let mut card_ranked_items = Vec::new();
-    let entity_scope = s
-        .payload
-        .entity_id
-        .as_ref()
-        .filter(|_| features::enabled(Feature::MemoryCards) && lanes::enabled(Lane::Cards));
+    let entity_scope = s.payload.entity_id.as_ref().filter(|_| {
+        s.state.config.features.enabled(Feature::MemoryCards)
+            && s.state.config.lanes.enabled(Lane::Cards)
+    });
     if let Some(entity_id) = entity_scope {
         let include_stale_cards = query_allows_stale_cards(&s.query_text, &s.plan);
         let card_hits = s
@@ -2061,66 +2018,19 @@ impl RerankDecision {
     }
 }
 
-/// `TELLODB_RERANK_POLICY`: `heuristic` (query keywords and intent, the
-/// original behaviour), `always`, or `gate` (rerank only when the top ANN
-/// similarities are too close to call).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RerankPolicy {
-    Heuristic,
-    Always,
-    Gate,
-}
-
-pub(crate) fn rerank_policy_name() -> &'static str {
-    match rerank_policy() {
-        RerankPolicy::Heuristic => "heuristic",
-        RerankPolicy::Always => "always",
-        RerankPolicy::Gate => "gate",
-    }
-}
-
-/// Default `gate`: rerank only when stage-1 retrieval is actually uncertain.
-///
-/// The previous default, `heuristic`, decided from the query string — it
-/// fires on " and ", "would", "might", "why ", or merely a long question — so
-/// it reranked 93% of LongMemEval dev. A gate that opens for almost every
-/// query is not a gate, and the cross-encoder is the largest query stage
-/// (169 ms p50) for a recall difference that is not distinguishable from zero
-/// (-0.7, CI -2.0…+0.0). `gate` uses the retrieval scores it is supposed to.
-fn rerank_policy() -> RerankPolicy {
-    static POLICY: std::sync::OnceLock<RerankPolicy> = std::sync::OnceLock::new();
-    *POLICY.get_or_init(|| {
-        match std::env::var("TELLODB_RERANK_POLICY").unwrap_or_default().trim() {
-            "always" => RerankPolicy::Always,
-            "heuristic" => RerankPolicy::Heuristic,
-            _ => RerankPolicy::Gate,
-        }
-    })
+pub(crate) fn rerank_policy_name(config: &crate::config::Config) -> &'static str {
+    config.rerank.policy.name()
 }
 
 /// Relative similarity gap between the top-1 and top-5 ANN hits below which
 /// the gate reranks (`TELLODB_RERANK_MARGIN`, default 0.05).
-pub(crate) fn rerank_margin() -> f32 {
-    static MARGIN: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *MARGIN.get_or_init(|| {
-        std::env::var("TELLODB_RERANK_MARGIN")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|v: &f32| v.is_finite() && *v >= 0.0)
-            .unwrap_or(0.05)
-    })
+pub(crate) fn rerank_margin(config: &crate::config::Config) -> f32 {
+    config.rerank.margin
 }
 
 /// Candidates sent to the cross-encoder (`TELLODB_RERANK_TOP`, default 25).
-pub(crate) fn rerank_top() -> usize {
-    static TOP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *TOP.get_or_init(|| {
-        std::env::var("TELLODB_RERANK_TOP")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|v| (2..=500).contains(v))
-            .unwrap_or(NEURAL_TOP)
-    })
+pub(crate) fn rerank_top(config: &crate::config::Config) -> usize {
+    config.rerank.top
 }
 
 /// True when stage-1 retrieval is uncertain: the top-1 similarity is within
@@ -2142,7 +2052,7 @@ pub(crate) fn rerank_gate_uncertain(hnsw_raw: &[(u64, f32)], margin: f32) -> boo
 
 fn rerank_phase(s: &mut QueryPipelineState) {
     s.neural_scores = HashMap::new();
-    if !lanes::enabled(Lane::Rerank) {
+    if !s.state.config.lanes.enabled(Lane::Rerank) {
         s.diag.rerank_reason = RerankDecision::Disabled;
         return;
     }
@@ -2150,8 +2060,8 @@ fn rerank_phase(s: &mut QueryPipelineState) {
         s.diag.rerank_reason = RerankDecision::Disabled;
         return;
     }
-    let retrieval_profile = retrieval_profile();
-    let auto_rerank = auto_rerank_enabled(retrieval_profile)
+    let retrieval_profile = retrieval_profile(&s.state.config);
+    let auto_rerank = auto_rerank_enabled(&s.state.config, retrieval_profile)
         && (s.plan.needs_decomposition
             || s.plan.cross_entity
             || s.plan.ordinal_rank.is_some()
@@ -2167,9 +2077,11 @@ fn rerank_phase(s: &mut QueryPipelineState) {
     } else if s.enable_neural_rerank {
         RerankDecision::Requested
     } else {
-        match rerank_policy() {
+        match s.state.config.rerank.policy {
             RerankPolicy::Always => RerankDecision::Always,
-            RerankPolicy::Gate if rerank_gate_uncertain(&s.primary_hnsw_raw, rerank_margin()) => {
+            RerankPolicy::Gate
+                if rerank_gate_uncertain(&s.primary_hnsw_raw, s.state.config.rerank.margin) =>
+            {
                 RerankDecision::GateUncertain
             }
             RerankPolicy::Gate => RerankDecision::GateConfident,
@@ -2184,7 +2096,7 @@ fn rerank_phase(s: &mut QueryPipelineState) {
     s.diag.rerank_reason = decision;
     if decision.applies() {
         let stage_start = Instant::now();
-        let neural_top = rerank_top();
+        let neural_top = s.state.config.rerank.top;
         s.diag.rerank_applied = true;
         let mut rerank_seed_ids = Vec::new();
         for (_weight, list) in &s.semantic_ranked_lists {
@@ -2288,7 +2200,7 @@ fn fusion_phase(s: &mut QueryPipelineState) {
     let stage_start = Instant::now();
     if s.plan.intent == QueryIntent::Inference
         && !s.primary_qembed.is_empty()
-        && features::enabled(Feature::Preferences)
+        && s.state.config.features.enabled(Feature::Preferences)
     {
         if let Some(ref entity_id) = s.payload.entity_id {
             let preference_memories =
@@ -2339,23 +2251,28 @@ fn fusion_phase(s: &mut QueryPipelineState) {
     });
 
     let mut graph_scores: HashMap<String, f32> = HashMap::new();
-    let seed_top: Vec<String> =
-        link_seed_ids.into_iter().take(graph_seed_count()).map(|(mid, _)| mid).collect();
+    let seed_top: Vec<String> = link_seed_ids
+        .into_iter()
+        .take(s.state.config.retrieval.graph_seed_count)
+        .map(|(mid, _)| mid)
+        .collect();
 
     use rayon::prelude::*;
     let intent_for_graph = s.plan.intent;
-    let graph_lane = lanes::enabled(Lane::Graph);
+    let graph_lane = s.state.config.lanes.enabled(Lane::Graph);
     let links_on = graph_lane
-        && (features::enabled(Feature::DerivedLinks)
-            || features::enabled(Feature::RetrospectiveLinks));
-    let edges_on = graph_lane && features::enabled(Feature::GraphEdges);
+        && (s.state.config.features.enabled(Feature::DerivedLinks)
+            || s.state.config.features.enabled(Feature::RetrospectiveLinks));
+    let edges_on = graph_lane && s.state.config.features.enabled(Feature::GraphEdges);
     let seeds_start = Instant::now();
     let link_start = Instant::now();
     let link_scores: Vec<HashMap<String, f32>> = if links_on {
         seed_top
             .par_iter()
             .map(|seed_mid| {
-                s.tenant.get_link_cluster_scores(seed_mid, graph_max_depth()).unwrap_or_default()
+                s.tenant
+                    .get_link_cluster_scores(seed_mid, s.state.config.retrieval.graph_max_depth)
+                    .unwrap_or_default()
             })
             .collect()
     } else {
@@ -2367,7 +2284,8 @@ fn fusion_phase(s: &mut QueryPipelineState) {
         collect_edge_cluster_scores_for_seeds(
             &s.tenant,
             &seed_top,
-            graph_max_depth(),
+            s.state.config.retrieval.graph_max_depth,
+            s.state.config.retrieval.graph_max_node_degree,
             None,
             Some(intent_for_graph),
         )
@@ -2645,7 +2563,7 @@ fn score_loop(s: &mut QueryPipelineState) -> Vec<EvidenceCard> {
         fs += ordinal_signal_bonus(obs.kind, &scorable, plan);
 
         let graph_score = graph_scores.get(mid).copied().unwrap_or(0.0);
-        let temporal_adjust = if temporal_recency_scoring_enabled() {
+        let temporal_adjust = if s.state.config.temporal.recency_scoring {
             temporal_consistency_adjustment(obs.kind, created_at_ms, now_ms, plan_intent)
         } else {
             0.0
@@ -2731,7 +2649,7 @@ fn score_loop(s: &mut QueryPipelineState) -> Vec<EvidenceCard> {
         });
     }
     if plan.prefers_latest {
-        apply_latest_preference(&mut scored);
+        apply_latest_preference(&mut scored, s.state.config.retrieval.latest_recency_weight);
     }
     (s.diag.scoring_loop_ms, s.diag.scoring_loop_us) = elapsed_ms_and_us(loop_start);
     scored
@@ -2742,15 +2660,7 @@ fn score_loop(s: &mut QueryPipelineState) -> Vec<EvidenceCard> {
 /// and by the candidate's own (squared) relative score, so newer versions of
 /// relevant facts win without promoting recent unrelated memories
 /// (`TELLODB_LATEST_RECENCY_WEIGHT`, default 0.35).
-fn apply_latest_preference(scored: &mut [EvidenceCard]) {
-    static WEIGHT: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    let weight = *WEIGHT.get_or_init(|| {
-        std::env::var("TELLODB_LATEST_RECENCY_WEIGHT")
-            .ok()
-            .and_then(|v| v.parse::<f32>().ok())
-            .filter(|w| w.is_finite() && *w >= 0.0)
-            .unwrap_or(0.35)
-    });
+fn apply_latest_preference(scored: &mut [EvidenceCard], weight: f32) {
     let (Some(oldest), Some(newest)) = (
         scored.iter().map(|c| c.created_at_ms).min(),
         scored.iter().map(|c| c.created_at_ms).max(),
@@ -2809,7 +2719,7 @@ fn score_build_response(
     if let (Some(ref fact_key), Some(ref entity_id)) =
         (s.plan.fact_key.as_ref(), s.payload.entity_id.as_ref())
     {
-        let fact_value = if features::enabled(Feature::Facts) {
+        let fact_value = if s.state.config.features.enabled(Feature::Facts) {
             s.tenant.get_current_fact_value(entity_id, fact_key)
         } else {
             Ok(None)
@@ -3080,7 +2990,7 @@ mod tests {
         // fires on " and ", "would", "might" or a long question. If this ever
         // reverts to `heuristic`, the cross-encoder silently becomes an
         // always-on 169 ms stage again.
-        assert_eq!(rerank_policy_name(), "gate");
+        assert_eq!(rerank_policy_name(&crate::config::Config::default()), "gate");
     }
 
     #[test]

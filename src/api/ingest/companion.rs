@@ -1,6 +1,6 @@
 use crate::api::ingest::dialogue::extract_bracketed_header_value;
 use crate::api::ingest::fact::build_atomic_memory_card_payloads;
-use crate::api::ingest::fact::infer_fact_key;
+use crate::api::ingest::fact::infer_fact_key_with_profile;
 use crate::api::ingest::salient::{
     build_keyword_companion_text, extract_named_phrases, extract_salient_terms,
     truncate_for_companion,
@@ -9,6 +9,7 @@ use crate::api::types::IngestPayload;
 use crate::api::utils::derived_memory_id;
 use crate::api::utils::extract_temporal_terms;
 use crate::api::utils::normalize_fact_text;
+use crate::heuristics::Profile;
 
 pub fn build_event_companion_text(payload: &IngestPayload) -> Option<String> {
     let dialogue_lines =
@@ -95,6 +96,13 @@ pub fn build_relation_companion_payloads(payload: &IngestPayload) -> Vec<IngestP
 }
 
 pub fn build_companion_payloads(payload: &IngestPayload) -> Vec<IngestPayload> {
+    build_companion_payloads_with_profile(payload, Profile::Generic)
+}
+
+pub fn build_companion_payloads_with_profile(
+    payload: &IngestPayload,
+    profile: Profile,
+) -> Vec<IngestPayload> {
     // Companions are per conversation turn; memories outside a session get none.
     if payload.session_id.as_deref().map_or(true, str::is_empty) {
         return Vec::new();
@@ -162,7 +170,7 @@ pub fn build_companion_payloads(payload: &IngestPayload) -> Vec<IngestPayload> {
     }
 
     for (idx, fact_text) in fact_texts.into_iter().enumerate() {
-        let fact_key = infer_fact_key(&fact_text);
+        let fact_key = infer_fact_key_with_profile(&fact_text, profile);
         let fact_content = if let Some(slot_key) = fact_key.as_deref() {
             format!("Canonical fact about {}: {}", slot_key.replace('_', " "), fact_text)
         } else {

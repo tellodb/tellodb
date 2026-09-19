@@ -6,16 +6,30 @@ use crate::api::utils::{
     dedupe_preserve_order, extract_temporal_terms, is_low_signal_keyword, singularize_token,
 };
 use crate::fts::tokenize_for_similarity;
+use crate::heuristics::Profile;
 use crate::ml::QueryIntentClassifier;
 
 pub fn build_query_plan(query: &str, classifier: Option<&QueryIntentClassifier>) -> QueryPlan {
+    build_query_plan_with_profile(query, classifier, Profile::Generic)
+}
+
+pub fn build_query_plan_with_profile(
+    query: &str,
+    classifier: Option<&QueryIntentClassifier>,
+    profile: Profile,
+) -> QueryPlan {
     let keyword_query = build_keyword_query(query);
     let subject_entities = extract_subject_entities(query);
     let ordinal_rank = extract_ordinal_rank(query);
     let inferred_intent = classify_query_intent(query, classifier);
-    let slot_key = infer_query_fact_key(query);
-    let expansion_terms =
-        build_query_expansion_terms(query, slot_key.as_deref(), inferred_intent, &subject_entities);
+    let slot_key = infer_query_fact_key_with_profile(query, profile);
+    let expansion_terms = build_query_expansion_terms_with_profile(
+        query,
+        slot_key.as_deref(),
+        inferred_intent,
+        &subject_entities,
+        profile,
+    );
     let cross_entity = {
         let lower = query.to_ascii_lowercase();
         let multi_hop_cue = lower.contains(" both ")

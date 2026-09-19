@@ -49,28 +49,26 @@ mod tests {
 
     #[test]
     fn park_preference_bridges_to_outdoor_evidence_only_when_tuned() {
-        use crate::heuristics::{with_profile, Profile};
+        use crate::heuristics::Profile;
         let question = "Would Robin prefer a national park or a theme park?";
 
         // "national park" and "theme park" are literal phrases taken from a
         // benchmark question, so only the tuned profile bridges them.
-        with_profile(Profile::LegacyTuned, || {
-            let plan = build_query_plan(question, None);
-            assert!(plan.lexical_terms.iter().any(|term| term == "camping"));
-            assert!(plan.lexical_terms.iter().any(|term| term == "hiking"));
-            assert!(plan.lexical_terms.iter().any(|term| term == "amusement"));
-        });
-        with_profile(Profile::Generic, || {
-            let plan = build_query_plan(question, None);
-            assert!(!plan.lexical_terms.iter().any(|term| term == "amusement"));
-        });
+        let plan = build_query_plan_with_profile(question, None, Profile::LegacyTuned);
+        assert!(plan.lexical_terms.iter().any(|term| term == "camping"));
+        assert!(plan.lexical_terms.iter().any(|term| term == "hiking"));
+        assert!(plan.lexical_terms.iter().any(|term| term == "amusement"));
+        let plan = build_query_plan_with_profile(question, None, Profile::Generic);
+        assert!(!plan.lexical_terms.iter().any(|term| term == "amusement"));
 
         // The generic profile still expands a topic-class trigger, which is
         // not about any particular question.
-        with_profile(Profile::Generic, || {
-            let plan = build_query_plan("Where does Robin like to go outdoors?", None);
-            assert!(plan.lexical_terms.iter().any(|term| term == "camping"));
-        });
+        let plan = build_query_plan_with_profile(
+            "Where does Robin like to go outdoors?",
+            None,
+            Profile::Generic,
+        );
+        assert!(plan.lexical_terms.iter().any(|term| term == "camping"));
     }
 
     #[test]

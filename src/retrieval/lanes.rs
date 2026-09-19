@@ -15,7 +15,6 @@
 //! a lane can be switched per query without re-ingesting anything.
 
 use anyhow::{bail, Result};
-use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lane {
@@ -96,21 +95,6 @@ impl Lanes {
     pub fn enabled_names(self) -> Vec<&'static str> {
         Lane::ALL.iter().filter(|l| self.enabled(**l)).map(|l| l.name()).collect()
     }
-}
-
-static LANES: OnceLock<Lanes> = OnceLock::new();
-
-pub fn init(config: Lanes) -> Lanes {
-    *LANES.get_or_init(|| config)
-}
-
-/// Process-wide lane selection; everything is on until `init_from_env` runs.
-pub fn lanes() -> Lanes {
-    *LANES.get_or_init(Lanes::default)
-}
-
-pub fn enabled(lane: Lane) -> bool {
-    lanes().enabled(lane)
 }
 
 #[cfg(test)]

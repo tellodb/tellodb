@@ -17,7 +17,6 @@
 //! was tuned on and on one it was not.
 
 use anyhow::{bail, Result};
-use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Profile {
@@ -42,43 +41,8 @@ impl Profile {
     }
 }
 
-static PROFILE: OnceLock<Profile> = OnceLock::new();
-
-#[cfg(test)]
-thread_local! {
-    /// Per-test override. The process-wide `OnceLock` is set once, so without
-    /// this only one profile would ever be reachable from unit tests, and the
-    /// profile we do not test is the one that ships.
-    static TEST_PROFILE: std::cell::Cell<Option<Profile>> = const { std::cell::Cell::new(None) };
-}
-
-/// Runs `f` with `profile` active on this thread.
-#[cfg(test)]
-pub fn with_profile<T>(profile: Profile, f: impl FnOnce() -> T) -> T {
-    let previous = TEST_PROFILE.with(|slot| slot.replace(Some(profile)));
-    let out = f();
-    TEST_PROFILE.with(|slot| slot.set(previous));
-    out
-}
-
-pub fn init(config: Profile) -> Profile {
-    *PROFILE.get_or_init(|| config)
-}
-
-pub fn profile() -> Profile {
-    #[cfg(test)]
-    if let Some(profile) = TEST_PROFILE.with(|slot| slot.get()) {
-        return profile;
-    }
-    *PROFILE.get_or_init(|| Profile::Generic)
-}
-
-/// True when benchmark-derived rules are allowed to fire.
-///
-/// Guard every rule that keys on a proper noun, a brand, or a phrase lifted
-/// from a benchmark question with this.
-pub fn benchmark_tuned_rules() -> bool {
-    profile() == Profile::LegacyTuned
+pub fn benchmark_tuned_rules(profile: Profile) -> bool {
+    profile == Profile::LegacyTuned
 }
 
 #[cfg(test)]
@@ -100,11 +64,8 @@ mod tests {
 
     #[test]
     fn the_override_scopes_to_one_call() {
-        assert_eq!(profile(), Profile::Generic);
-        with_profile(Profile::LegacyTuned, || {
-            assert!(benchmark_tuned_rules());
-        });
-        assert_eq!(profile(), Profile::Generic, "override leaked past the call");
+        assert!(!benchmark_tuned_rules(Profile::Generic));
+        assert!(benchmark_tuned_rules(Profile::LegacyTuned));
     }
 
     #[test]

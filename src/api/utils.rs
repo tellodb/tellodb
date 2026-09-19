@@ -1,8 +1,8 @@
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use std::collections::{HashMap, HashSet};
-use std::env;
 use std::time::Instant;
 
+use crate::config::RetrievalConfig;
 use crate::storage::MemoryKind;
 
 pub const RESET_CONFIRM_PHRASE: &str = "delete-all-data";
@@ -34,135 +34,15 @@ pub const MIN_PHRASE_LEN: usize = 2;
 pub const DECAY_FLOOR: f32 = 0.35;
 pub const LAST_WEEK_DAY_OFFSET: u32 = 6;
 
-/// Reads an environment-tuned setting once.
-///
-/// These are read on the query path, and re-reading them per query lets a
-/// mutation mid-run change retrieval behaviour between two queries of the
-/// same benchmark, which would show up as irreproducible results rather than
-/// as an error. Reading once also means one lock and one allocation per
-/// process instead of per query.
-macro_rules! env_setting {
-    ($name:ident, $ty:ty, $body:expr) => {
-        fn $name() -> $ty {
-            static CACHED: std::sync::OnceLock<$ty> = std::sync::OnceLock::new();
-            *CACHED.get_or_init(|| $body)
-        }
-    };
+pub fn scoped_semantic_start(config: &RetrievalConfig, max_top: usize) -> usize {
+    config.scoped_semantic_start.min(max_top)
 }
 
-pub fn env_bool(name: &str, default: bool) -> bool {
-    match env::var(name) {
-        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => true,
-            "0" | "false" | "no" | "off" => false,
-            _ => default,
-        },
-        Err(_) => default,
-    }
-}
-
-env_setting!(temporal_recency_scoring_enabled_cached, bool, {
-    env_bool("TEMPORAL_MEMORY_ENABLE_TEMPORAL_RECENCY_SCORING", true)
-});
-
-pub fn temporal_recency_scoring_enabled() -> bool {
-    temporal_recency_scoring_enabled_cached()
-}
-
-env_setting!(scoped_semantic_top_uncached, usize, {
-    env::var("TEMPORAL_MEMORY_SCOPED_SEMANTIC_TOP")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&v| v >= SEMANTIC_TOP_DEFAULT)
-        .unwrap_or(SEMANTIC_TOP_SCOPED_DEFAULT)
-});
-
-pub fn scoped_semantic_top() -> usize {
-    scoped_semantic_top_uncached()
-}
-
-env_setting!(scoped_semantic_start_uncapped, usize, {
-    env::var("TEMPORAL_MEMORY_SCOPED_SEMANTIC_START")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&v| v >= SEMANTIC_TOP_DEFAULT)
-        .unwrap_or(SEMANTIC_TOP_SCOPED_START_DEFAULT)
-});
-
-pub fn scoped_semantic_start(max_top: usize) -> usize {
-    scoped_semantic_start_uncapped().min(max_top)
-}
-
-env_setting!(scoped_semantic_step_uncached, usize, {
-    env::var("TEMPORAL_MEMORY_SCOPED_SEMANTIC_STEP")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&v| v > 0)
-        .unwrap_or(SEMANTIC_TOP_SCOPED_STEP_DEFAULT)
-});
-
-pub fn scoped_semantic_step() -> usize {
-    scoped_semantic_step_uncached()
-}
-
-env_setting!(scoped_semantic_min_hits_override, Option<usize>, {
-    env::var("TEMPORAL_MEMORY_SCOPED_MIN_HITS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&v| v > 0)
-});
-
-pub fn scoped_semantic_min_hits(limit: usize, max_top: usize) -> usize {
-    scoped_semantic_min_hits_override()
+pub fn scoped_semantic_min_hits(config: &RetrievalConfig, limit: usize, max_top: usize) -> usize {
+    config
+        .scoped_min_hits
         .unwrap_or_else(|| limit.saturating_mul(2).max(SEMANTIC_TOP_SCOPED_MIN_HITS_DEFAULT))
         .min(max_top)
-}
-
-env_setting!(scoped_ann_stop_max_attempts_uncached, usize, {
-    env::var("TEMPORAL_MEMORY_SCOPED_STOP_MAX_ATTEMPTS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&v| v > 0)
-        .unwrap_or(SCOPED_ANN_STOP_MAX_ATTEMPTS_DEFAULT)
-});
-
-pub fn scoped_ann_stop_max_attempts() -> usize {
-    scoped_ann_stop_max_attempts_uncached()
-}
-
-env_setting!(scoped_ann_stop_min_similarity_uncached, f32, {
-    env::var("TEMPORAL_MEMORY_SCOPED_STOP_MIN_SIM")
-        .ok()
-        .and_then(|v| v.parse::<f32>().ok())
-        .filter(|v| v.is_finite() && *v >= -1.0 && *v <= 1.0)
-        .unwrap_or(SCOPED_ANN_STOP_MIN_SIMILARITY_DEFAULT)
-});
-
-pub fn scoped_ann_stop_min_similarity() -> f32 {
-    scoped_ann_stop_min_similarity_uncached()
-}
-
-env_setting!(scoped_ann_stop_max_hit_gain_uncached, usize, {
-    env::var("TEMPORAL_MEMORY_SCOPED_STOP_MAX_HIT_GAIN")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(SCOPED_ANN_STOP_MAX_HIT_GAIN_DEFAULT)
-});
-
-pub fn scoped_ann_stop_max_hit_gain() -> usize {
-    scoped_ann_stop_max_hit_gain_uncached()
-}
-
-env_setting!(scoped_ann_stop_min_similarity_gain_uncached, f32, {
-    env::var("TEMPORAL_MEMORY_SCOPED_STOP_MIN_SIM_GAIN")
-        .ok()
-        .and_then(|v| v.parse::<f32>().ok())
-        .filter(|v| v.is_finite() && *v >= 0.0)
-        .unwrap_or(SCOPED_ANN_STOP_MIN_SIMILARITY_GAIN_DEFAULT)
-});
-
-pub fn scoped_ann_stop_min_similarity_gain() -> f32 {
-    scoped_ann_stop_min_similarity_gain_uncached()
 }
 
 pub struct ScopedAnnState {
@@ -176,12 +56,12 @@ pub struct ScopedAnnState {
     pub prev_top_similarity: Option<f32>,
 }
 
-pub fn should_stop_scoped_ann(state: &ScopedAnnState) -> bool {
+pub fn should_stop_scoped_ann(config: &RetrievalConfig, state: &ScopedAnnState) -> bool {
     if state.current_top >= state.max_top {
         return true;
     }
 
-    let max_attempts = scoped_ann_stop_max_attempts();
+    let max_attempts = config.scoped_stop_max_attempts;
     if state.attempt >= max_attempts {
         return true;
     }
@@ -191,7 +71,7 @@ pub fn should_stop_scoped_ann(state: &ScopedAnnState) -> bool {
     }
 
     let strong_enough =
-        state.top_similarity.map(|sim| sim >= scoped_ann_stop_min_similarity()).unwrap_or(false);
+        state.top_similarity.map(|sim| sim >= config.scoped_stop_min_similarity).unwrap_or(false);
     if !strong_enough {
         return false;
     }
@@ -200,11 +80,11 @@ pub fn should_stop_scoped_ann(state: &ScopedAnnState) -> bool {
         return false;
     };
     let hit_gain = state.hit_count.saturating_sub(prev_hits);
-    let low_hit_gain = hit_gain <= scoped_ann_stop_max_hit_gain();
+    let low_hit_gain = hit_gain <= config.scoped_stop_max_hit_gain;
 
     let low_similarity_gain = match (state.top_similarity, state.prev_top_similarity) {
         (Some(current), Some(prev)) => {
-            (current - prev).abs() <= scoped_ann_stop_min_similarity_gain()
+            (current - prev).abs() <= config.scoped_stop_min_similarity_gain
         }
         _ => false,
     };
@@ -899,6 +779,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::config::RetrievalConfig;
     use std::time::Instant;
 
     #[test]
@@ -1533,55 +1414,55 @@ mod tests {
     #[test]
     fn should_stop_scoped_ann_max_top_reached() {
         let s = make_ann_state(0, 100, 100, 0, 1, None, None, None);
-        assert!(should_stop_scoped_ann(&s));
+        assert!(should_stop_scoped_ann(&RetrievalConfig::default(), &s));
     }
 
     #[test]
     fn should_stop_scoped_ann_max_attempts_reached() {
         let s = make_ann_state(10, 50, 100, 50, 10, Some(0.9), Some(40), Some(0.8));
-        assert!(should_stop_scoped_ann(&s));
+        assert!(should_stop_scoped_ann(&RetrievalConfig::default(), &s));
     }
 
     #[test]
     fn should_stop_scoped_ann_not_enough_hits() {
         let s = make_ann_state(0, 50, 100, 5, 10, None, None, None);
-        assert!(!should_stop_scoped_ann(&s));
+        assert!(!should_stop_scoped_ann(&RetrievalConfig::default(), &s));
     }
 
     #[test]
     fn should_stop_scoped_ann_not_strong_enough_similarity() {
         let s = make_ann_state(0, 50, 100, 20, 10, Some(0.6), Some(10), Some(0.5));
-        assert!(!should_stop_scoped_ann(&s));
+        assert!(!should_stop_scoped_ann(&RetrievalConfig::default(), &s));
     }
 
     #[test]
     fn should_stop_scoped_ann_none_similarity_not_strong() {
         let s = make_ann_state(0, 50, 100, 20, 10, None, Some(10), Some(0.5));
-        assert!(!should_stop_scoped_ann(&s));
+        assert!(!should_stop_scoped_ann(&RetrievalConfig::default(), &s));
     }
 
     #[test]
     fn should_stop_scoped_ann_no_prev_hit_count_returns_false() {
         let s = make_ann_state(0, 50, 100, 20, 10, Some(0.8), None, Some(0.79));
-        assert!(!should_stop_scoped_ann(&s));
+        assert!(!should_stop_scoped_ann(&RetrievalConfig::default(), &s));
     }
 
     #[test]
     fn should_stop_scoped_ann_convergence_low_hit_gain() {
         let s = make_ann_state(0, 50, 100, 12, 10, Some(0.8), Some(10), Some(0.7));
-        assert!(should_stop_scoped_ann(&s));
+        assert!(should_stop_scoped_ann(&RetrievalConfig::default(), &s));
     }
 
     #[test]
     fn should_stop_scoped_ann_convergence_low_similarity_gain() {
         let s = make_ann_state(0, 50, 100, 20, 10, Some(0.71), Some(10), Some(0.70));
-        assert!(should_stop_scoped_ann(&s));
+        assert!(should_stop_scoped_ann(&RetrievalConfig::default(), &s));
     }
 
     #[test]
     fn should_stop_scoped_ann_no_convergence() {
         let s = make_ann_state(0, 50, 100, 20, 10, Some(0.8), Some(10), Some(0.7));
-        assert!(!should_stop_scoped_ann(&s));
+        assert!(!should_stop_scoped_ann(&RetrievalConfig::default(), &s));
     }
 
     #[test]

@@ -4,7 +4,6 @@ use axum::http::{
 };
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::env;
 use std::sync::Arc;
 use std::time::Instant;
 use tower_http::cors::CorsLayer;
@@ -108,20 +107,10 @@ pub fn parse_cors_allow_origins(raw: Option<&str>) -> Vec<HeaderValue> {
     origins
 }
 
-pub fn cors_allow_origins() -> Vec<HeaderValue> {
-    let configured = env::var("TEMPORAL_MEMORY_CORS_ALLOW_ORIGINS")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            env::var("TELLODB_CORS_ALLOW_ORIGINS").ok().filter(|value| !value.trim().is_empty())
-        });
-
-    parse_cors_allow_origins(configured.as_deref())
-}
-
-pub fn build_cors_layer() -> CorsLayer {
+pub fn build_cors_layer(origins: &[String]) -> CorsLayer {
+    let configured = (!origins.is_empty()).then(|| origins.join(","));
     CorsLayer::new()
-        .allow_origin(cors_allow_origins())
+        .allow_origin(parse_cors_allow_origins(configured.as_deref()))
         .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
         .allow_headers([AUTHORIZATION, CONTENT_TYPE, HeaderName::from_static("x-api-key")])
         .expose_headers([
@@ -317,19 +306,14 @@ impl Default for RateLimiter {
     }
 }
 
-fn trust_forwarded_for() -> bool {
-    static TRUST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *TRUST.get_or_init(|| {
-        env::var("TELLODB_TRUST_PROXY")
-            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-            .unwrap_or(false)
-    })
-}
-
 /// Client address for rate limiting. `x-forwarded-for` is client-controlled,
 /// so it is only used behind a trusted proxy (`TELLODB_TRUST_PROXY=1`).
-pub fn client_address(headers: &HeaderMap, peer: Option<std::net::SocketAddr>) -> String {
-    if trust_forwarded_for() {
+pub fn client_address(
+    headers: &HeaderMap,
+    peer: Option<std::net::SocketAddr>,
+    trust_proxy: bool,
+) -> String {
+    if trust_proxy {
         if let Some(forwarded) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
             if let Some(first) =
                 forwarded.split(',').next().map(str::trim).filter(|s| !s.is_empty())
@@ -350,7 +334,7 @@ pub fn check_rate_limit(
     if authorize_global_api_key(headers, &state.auth).is_ok() && state.auth.is_required() {
         return Ok(());
     }
-    let addr = client_address(headers, peer);
+    let addr = client_address(headers, peer, state.config.server.trust_proxy);
     let allowed =
         state.rate_limiter.allow_with(&format!("addr:{addr}"), RPS_PER_ADDR, BURST_PER_ADDR)
             && match provided {
@@ -370,15 +354,21 @@ pub fn check_auth_rate_limit(
     headers: &HeaderMap,
     peer: Option<std::net::SocketAddr>,
 ) -> Result<(), StatusCode> {
-    check_auth_rate_limit_with_limiter(&state.rate_limiter, headers, peer)
+    check_auth_rate_limit_with_limiter(
+        &state.rate_limiter,
+        headers,
+        peer,
+        state.config.server.trust_proxy,
+    )
 }
 
 fn check_auth_rate_limit_with_limiter(
     rate_limiter: &RateLimiter,
     headers: &HeaderMap,
     peer: Option<std::net::SocketAddr>,
+    trust_proxy: bool,
 ) -> Result<(), StatusCode> {
-    let addr = client_address(headers, peer);
+    let addr = client_address(headers, peer, trust_proxy);
     if rate_limiter.allow_with(&format!("auth:{addr}"), RPS_PER_AUTH, BURST_PER_AUTH) {
         Ok(())
     } else {
@@ -454,10 +444,13 @@ mod tests {
         let peer = Some("127.0.0.1:8080".parse().unwrap());
 
         for _ in 0..5 {
-            assert_eq!(check_auth_rate_limit_with_limiter(&rate_limiter, &headers, peer), Ok(()));
+            assert_eq!(
+                check_auth_rate_limit_with_limiter(&rate_limiter, &headers, peer, false),
+                Ok(())
+            );
         }
         assert_eq!(
-            check_auth_rate_limit_with_limiter(&rate_limiter, &headers, peer),
+            check_auth_rate_limit_with_limiter(&rate_limiter, &headers, peer, false),
             Err(StatusCode::TOO_MANY_REQUESTS)
         );
     }
@@ -467,7 +460,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-for", HeaderValue::from_static("1.2.3.4"));
         let peer: std::net::SocketAddr = "10.0.0.7:5555".parse().unwrap();
-        assert_eq!(client_address(&headers, Some(peer)), "10.0.0.7");
+        assert_eq!(client_address(&headers, Some(peer), false), "10.0.0.7");
     }
 
     #[test]

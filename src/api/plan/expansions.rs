@@ -8,6 +8,7 @@ use crate::api::utils::{
     is_low_signal_keyword, normalize_alpha_tokens, normalize_fact_text, singularize_token,
 };
 use crate::fts::tokenize_for_similarity;
+use crate::heuristics::{benchmark_tuned_rules, Profile};
 
 pub fn build_keyword_query(query: &str) -> Option<String> {
     let generic_drop = [
@@ -211,6 +212,22 @@ pub fn build_query_expansion_terms(
     intent: QueryIntent,
     subject_entities: &[String],
 ) -> Vec<String> {
+    build_query_expansion_terms_with_profile(
+        query,
+        slot_key,
+        intent,
+        subject_entities,
+        Profile::Generic,
+    )
+}
+
+pub fn build_query_expansion_terms_with_profile(
+    query: &str,
+    slot_key: Option<&str>,
+    intent: QueryIntent,
+    subject_entities: &[String],
+    profile: Profile,
+) -> Vec<String> {
     let lower = query.to_ascii_lowercase();
     let tokens = normalize_alpha_tokens(query)
         .into_iter()
@@ -307,7 +324,7 @@ pub fn build_query_expansion_terms(
     }
 
     if has_any_singular(&["education", "edu", "educaton", "field", "career", "job", "profession"])
-        || (crate::heuristics::benchmark_tuned_rules()
+        || (benchmark_tuned_rules(profile)
             && (lower.contains("career path")
                 || lower.contains("career option")
                 || lower.contains("future job")))
@@ -319,7 +336,7 @@ pub fn build_query_expansion_terms(
     }
 
     if has_any_singular(&["book", "books", "bookshelf", "library", "read", "reading"])
-        || (crate::heuristics::benchmark_tuned_rules()
+        || (benchmark_tuned_rules(profile)
             && (lower.contains("dr. seuss") || lower.contains("dr seuss")))
     {
         push_expansion_terms(
@@ -339,7 +356,7 @@ pub fn build_query_expansion_terms(
         );
     }
 
-    if (crate::heuristics::benchmark_tuned_rules() && lower.contains("national park"))
+    if (benchmark_tuned_rules(profile) && lower.contains("national park"))
         || has_any_singular(&["outdoor", "outdoors", "nature"])
     {
         push_expansion_terms(
@@ -350,7 +367,7 @@ pub fn build_query_expansion_terms(
             ],
         );
     }
-    if crate::heuristics::benchmark_tuned_rules()
+    if benchmark_tuned_rules(profile)
         && (lower.contains("theme park") || lower.contains("amusement park"))
     {
         push_expansion_terms(
@@ -590,6 +607,10 @@ pub fn humanize_slot_key(slot_key: &str) -> String {
 }
 
 pub fn infer_query_fact_key(query: &str) -> Option<String> {
+    infer_query_fact_key_with_profile(query, Profile::Generic)
+}
+
+pub fn infer_query_fact_key_with_profile(query: &str, _profile: Profile) -> Option<String> {
     let lower = query.to_ascii_lowercase();
     let tokens = normalize_alpha_tokens(query);
 
