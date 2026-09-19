@@ -82,7 +82,7 @@ impl Memory {
         let memory_id = self.memory_id.unwrap_or_else(|| {
             let session = session_id
                 .clone()
-                .unwrap_or_else(|| format!("mem-{timestamp}-{:04x}", rand::random::<u16>()));
+                .unwrap_or_else(|| format!("mem-{timestamp}-{:032x}", rand::random::<u128>()));
             format!("{}::{}::{}", self.entity_id, session, self.turn_index.unwrap_or(0))
         });
         IngestPayload {
@@ -394,5 +394,13 @@ mod tests {
         let generated = Memory::new("alice", "hi").at(7).into_payload();
         assert!(generated.memory_id.starts_with("alice::mem-7-"));
         assert_eq!(generated.session_id, None);
+    }
+
+    #[test]
+    fn generated_memory_ids_are_unique_at_same_timestamp() {
+        let ids: std::collections::HashSet<_> = (0..10_000)
+            .map(|_| Memory::new("alice", "hi").at(7).into_payload().memory_id)
+            .collect();
+        assert_eq!(ids.len(), 10_000);
     }
 }
