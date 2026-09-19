@@ -3,6 +3,11 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use crate::config::RetrievalConfig;
+pub use crate::core::calendar::{
+    days_in_month, days_since_epoch, extract_temporal_terms, month_to_ms, parse_temporal_window,
+    FIRST_WEEK_END_DAY, LAST_WEEK_DAY_OFFSET, MAX_DAY_OF_MONTH, MAX_YEAR, MILLIS_PER_DAY, MIN_YEAR,
+    YEAR_DIGITS,
+};
 use crate::storage::MemoryKind;
 
 pub const RESET_CONFIRM_PHRASE: &str = "delete-all-data";
@@ -17,12 +22,6 @@ pub const SCOPED_ANN_STOP_MIN_SIMILARITY_DEFAULT: f32 = 0.70;
 pub const SCOPED_ANN_STOP_MAX_HIT_GAIN_DEFAULT: usize = 2;
 pub const SCOPED_ANN_STOP_MIN_SIMILARITY_GAIN_DEFAULT: f32 = 0.01;
 
-pub const MILLIS_PER_DAY: u64 = 86_400_000;
-pub const MIN_YEAR: i32 = 1990;
-pub const MAX_YEAR: i32 = 2100;
-pub const MAX_DAY_OF_MONTH: u32 = 31;
-pub const FIRST_WEEK_END_DAY: u32 = 7;
-pub const YEAR_DIGITS: usize = 4;
 pub const MIN_TOKENS_FOR_HARD_QUERY: usize = 6;
 pub const SHORT_QUERY_TOKEN_MAX: usize = 2;
 pub const SIMILARITY_CONVERGENCE_STRICT: f32 = 0.05;
@@ -32,7 +31,6 @@ pub const FIFTH_RANK_INDEX: usize = 4;
 pub const MIN_SALIENT_TOKEN_LEN: usize = 3;
 pub const MIN_PHRASE_LEN: usize = 2;
 pub const DECAY_FLOOR: f32 = 0.35;
-pub const LAST_WEEK_DAY_OFFSET: u32 = 6;
 
 pub fn scoped_semantic_start(config: &RetrievalConfig, max_top: usize) -> usize {
     config.scoped_semantic_start.min(max_top)
@@ -216,288 +214,6 @@ pub fn dedupe_preserve_order(values: Vec<String>) -> Vec<String> {
             !key.is_empty() && seen.insert(key)
         })
         .collect()
-}
-
-pub fn extract_temporal_terms(query: &str) -> Vec<String> {
-    let lower = query.to_ascii_lowercase();
-    let mut terms = Vec::with_capacity(4);
-
-    for token in normalize_alpha_tokens(query) {
-        if token.len() == YEAR_DIGITS && token.chars().all(|c| c.is_ascii_digit()) {
-            terms.push(token);
-        }
-    }
-
-    let months = [
-        "january",
-        "february",
-        "march",
-        "april",
-        "may",
-        "june",
-        "july",
-        "august",
-        "september",
-        "october",
-        "november",
-        "december",
-        "spring",
-        "summer",
-        "fall",
-        "autumn",
-        "winter",
-        "weekend",
-        "week",
-        "month",
-        "year",
-        "yesterday",
-        "today",
-        "tomorrow",
-        "recently",
-        "latest",
-        "last",
-        "recent",
-    ];
-    for term in &months {
-        if lower.contains(term) {
-            terms.push(term.to_string());
-        }
-    }
-
-    dedupe_preserve_order(terms)
-}
-
-/// Parse a (start_ms, end_ms) temporal window from natural language query text.
-/// Accepts an optional `reference_time_ms` to anchor relative temporal terms like
-/// "yesterday", "today", "last week", "last month", "past 3 days".
-/// Returns `None` if no specific temporal window can be extracted.
-/// Examples that parse: "October 2023", "May 1 2022", "last week of October 2023",
-/// "March 2023", "summer 2022", "2024/05/12", "yesterday", "last week".
-pub fn parse_temporal_window(query: &str, reference_time_ms: Option<u64>) -> Option<(u64, u64)> {
-    use std::collections::HashMap;
-
-    let month_map: HashMap<&str, u32> = [
-        ("january", 1),
-        ("jan", 1),
-        ("february", 2),
-        ("feb", 2),
-        ("march", 3),
-        ("mar", 3),
-        ("april", 4),
-        ("apr", 4),
-        ("may", 5),
-        ("june", 6),
-        ("jun", 6),
-        ("july", 7),
-        ("jul", 7),
-        ("august", 8),
-        ("aug", 8),
-        ("september", 9),
-        ("sep", 9),
-        ("sept", 9),
-        ("october", 10),
-        ("oct", 10),
-        ("november", 11),
-        ("nov", 11),
-        ("december", 12),
-        ("dec", 12),
-    ]
-    .into_iter()
-    .collect();
-
-    let season_map: HashMap<&str, (u32, u32)> = [
-        ("spring", (3, 5)),
-        ("summer", (6, 8)),
-        ("fall", (9, 11)),
-        ("autumn", (9, 11)),
-        ("winter", (12, 2)),
-    ]
-    .into_iter()
-    .collect();
-
-    let lower = query.to_ascii_lowercase();
-    let tokens: Vec<&str> = lower.split_whitespace().collect();
-
-    // Check for formatted dates YYYY/MM/DD or YYYY-MM-DD
-    for token in &tokens {
-        let clean =
-            token.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '/' && c != '-');
-        let parts: Vec<&str> = clean.split(['/', '-']).collect();
-        if parts.len() == 3 {
-            if let (Ok(y), Ok(m), Ok(d)) =
-                (parts[0].parse::<i32>(), parts[1].parse::<u32>(), parts[2].parse::<u32>())
-            {
-                if (MIN_YEAR..=MAX_YEAR).contains(&y)
-                    && (1..=12).contains(&m)
-                    && (1..=MAX_DAY_OF_MONTH).contains(&d)
-                {
-                    let d = d.min(days_in_month(y, m));
-                    let start_ms = month_to_ms(y, m, d);
-                    return Some((start_ms, start_ms + MILLIS_PER_DAY));
-                }
-            }
-        }
-    }
-
-    // Extract year (4-digit)
-    let year: Option<i32> = tokens.iter().find_map(|t| {
-        let digits: String = t.chars().filter(|c| c.is_ascii_digit()).collect();
-        if digits.len() == 4 {
-            digits.parse().ok().filter(|&y: &i32| (MIN_YEAR..=MAX_YEAR).contains(&y))
-        } else {
-            None
-        }
-    });
-
-    if let Some(year) = year {
-        // Check for season first
-        for (season, (start_month, end_month)) in &season_map {
-            if lower.contains(season) {
-                let start_ms = month_to_ms(year, *start_month, 1);
-                let end_ms = if *end_month < *start_month {
-                    // winter wraps: Dec-Feb
-                    month_to_ms(year + 1, *end_month, days_in_month(year + 1, *end_month))
-                } else {
-                    month_to_ms(year, *end_month, days_in_month(year, *end_month))
-                };
-                return Some((start_ms, end_ms + MILLIS_PER_DAY));
-            }
-        }
-
-        // Look for a month name
-        let mut found_month: Option<u32> = None;
-        for (name, month_num) in &month_map {
-            if lower.contains(name) {
-                found_month = Some(*month_num);
-                break;
-            }
-        }
-
-        if let Some(month) = found_month {
-            // Check for "last week of <month> <year>"
-            let is_last_week = lower.contains("last week");
-            // Check for "first week of <month> <year>"
-            let is_first_week = lower.contains("first week");
-            // Check for a specific day number
-            let day: Option<u32> = tokens.iter().find_map(|t| {
-                let digits: String = t.chars().filter(|c| c.is_ascii_digit()).collect();
-                if digits.len() <= 2 {
-                    digits.parse::<u32>().ok().filter(|&d| (1..=MAX_DAY_OF_MONTH).contains(&d))
-                } else {
-                    None
-                }
-            });
-
-            let dom = days_in_month(year, month);
-
-            let (start_ms, end_ms) = if is_last_week {
-                let last_day = dom;
-                let first_day = last_day.saturating_sub(LAST_WEEK_DAY_OFFSET).max(1);
-                (
-                    month_to_ms(year, month, first_day),
-                    month_to_ms(year, month, last_day) + MILLIS_PER_DAY,
-                )
-            } else if is_first_week {
-                (
-                    month_to_ms(year, month, 1),
-                    month_to_ms(year, month, FIRST_WEEK_END_DAY) + MILLIS_PER_DAY,
-                )
-            } else if let Some(day) = day {
-                let d = day.min(dom);
-                (month_to_ms(year, month, d), month_to_ms(year, month, d) + MILLIS_PER_DAY)
-            } else {
-                // Whole month
-                (month_to_ms(year, month, 1), month_to_ms(year, month, dom) + MILLIS_PER_DAY)
-            };
-
-            return Some((start_ms, end_ms));
-        }
-    }
-
-    // Relative temporal terms anchored to reference_time_ms (or current wall-clock time)
-    let ref_ms = reference_time_ms.unwrap_or_else(|| {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64
-    });
-
-    if lower.contains("yesterday") {
-        let ref_day_start = (ref_ms / MILLIS_PER_DAY) * MILLIS_PER_DAY;
-        return Some((ref_day_start.saturating_sub(MILLIS_PER_DAY), ref_day_start));
-    }
-    if lower.contains("today") {
-        let ref_day_start = (ref_ms / MILLIS_PER_DAY) * MILLIS_PER_DAY;
-        return Some((ref_day_start, ref_day_start + MILLIS_PER_DAY));
-    }
-    if lower.contains("last week") || lower.contains("past week") {
-        return Some((ref_ms.saturating_sub(7 * MILLIS_PER_DAY), ref_ms));
-    }
-    if lower.contains("this week") {
-        let ref_day_start = (ref_ms / MILLIS_PER_DAY) * MILLIS_PER_DAY;
-        return Some((
-            ref_day_start.saturating_sub(6 * MILLIS_PER_DAY),
-            ref_day_start + MILLIS_PER_DAY,
-        ));
-    }
-    if lower.contains("last month") || lower.contains("past month") {
-        return Some((ref_ms.saturating_sub(30 * MILLIS_PER_DAY), ref_ms));
-    }
-    if lower.contains("this month") {
-        return Some((ref_ms.saturating_sub(30 * MILLIS_PER_DAY), ref_ms + MILLIS_PER_DAY));
-    }
-    if lower.contains("last year") || lower.contains("past year") {
-        return Some((ref_ms.saturating_sub(365 * MILLIS_PER_DAY), ref_ms));
-    }
-
-    // Pattern: "(last|past) <N> (days|weeks|months)"
-    for i in 0..tokens.len().saturating_sub(2) {
-        if tokens[i] == "last" || tokens[i] == "past" {
-            if let Ok(n) = tokens[i + 1].parse::<u64>() {
-                let unit = tokens[i + 2].trim_matches(|c: char| !c.is_alphabetic());
-                if unit.starts_with("day") {
-                    return Some((ref_ms.saturating_sub(n * MILLIS_PER_DAY), ref_ms));
-                } else if unit.starts_with("week") {
-                    return Some((ref_ms.saturating_sub(n * 7 * MILLIS_PER_DAY), ref_ms));
-                } else if unit.starts_with("month") {
-                    return Some((ref_ms.saturating_sub(n * 30 * MILLIS_PER_DAY), ref_ms));
-                }
-            }
-        }
-    }
-
-    None
-}
-
-fn month_to_ms(year: i32, month: u32, day: u32) -> u64 {
-    // Days since Unix epoch (1970-01-01)
-    let days = days_since_epoch(year, month, day);
-    days as u64 * MILLIS_PER_DAY
-}
-
-fn days_since_epoch(year: i32, month: u32, day: u32) -> i64 {
-    // Compute Julian Day Number and subtract epoch JDN
-    let a = (14 - month as i64) / 12;
-    let y = year as i64 + 4800 - a;
-    let m = month as i64 + 12 * a - 3;
-    let jdn = day as i64 + (153 * m + 2) / 5 + 365 * y + y / 4 - y / 100 + y / 400 - 32045;
-    const UNIX_EPOCH_JDN: i64 = 2_440_588;
-    jdn - UNIX_EPOCH_JDN
-}
-
-fn days_in_month(year: i32, month: u32) -> u32 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 => {
-            if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 {
-                29
-            } else {
-                28
-            }
-        }
-        _ => 30,
-    }
 }
 
 pub fn clip_profile_to_budget(profile_json: &str, max_fields: usize) -> String {

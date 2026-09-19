@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::core::calendar::MONTHS;
 use crate::storage::MemoryKind;
 
 pub const LIFECYCLE_POLICY_VERSION: &str = "lifecycle-v1-deterministic";
@@ -318,19 +319,7 @@ fn specificity_score(text: &str, lower: &str, reasons: &mut Vec<String>) -> f32 
 }
 
 fn temporal_score(lower: &str, reasons: &mut Vec<String>) -> f32 {
-    let months = [
-        "january",
-        "february",
-        "march",
-        "april",
-        "may",
-        "june",
-        "july",
-        "august",
-        "september",
-        "october",
-        "november",
-        "december",
+    let relative_terms = [
         "yesterday",
         "today",
         "tomorrow",
@@ -343,7 +332,9 @@ fn temporal_score(lower: &str, reasons: &mut Vec<String>) -> f32 {
         "month",
         "week",
     ];
-    if months.iter().any(|needle| lower.contains(needle)) {
+    if MONTHS.iter().any(|month| lower.contains(month))
+        || relative_terms.iter().any(|term| lower.contains(term))
+    {
         reasons.push("temporal_signal".to_string());
         TEMPORAL_SCORE_WITH_SIGNAL
     } else {

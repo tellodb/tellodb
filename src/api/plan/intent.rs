@@ -1,4 +1,5 @@
 use super::types::QueryIntent;
+use crate::core::calendar::MONTHS;
 use crate::ml::QueryIntentClassifier;
 
 pub fn classify_query_intent(
@@ -12,21 +13,7 @@ pub fn classify_query_intent(
     }
 
     let lower = query.to_ascii_lowercase();
-    let months = [
-        "january",
-        "february",
-        "march",
-        "april",
-        "may",
-        "june",
-        "july",
-        "august",
-        "september",
-        "october",
-        "november",
-        "december",
-    ];
-    let has_specific_month = months.iter().any(|m| lower.contains(&format!(" in {m}")));
+    let has_specific_month = MONTHS.iter().any(|month| lower.contains(&format!(" in {month}")));
     let is_numeric = lower.contains("how many")
         || lower.contains("number of")
         || lower.contains("in total")
