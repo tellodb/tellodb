@@ -3,11 +3,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const TEMPORAL_DB_FILE: &str = "temporal.redb";
-const GRAPH_DB_FILE: &str = "graph.redb";
-const FTS_DIR: &str = "fts_tantivy";
 const PLATFORM_DB_FILE: &str = "platform.db";
-const ANALYTICS_DB_FILE: &str = "analytics.db";
 const VECTOR_INDEX_FILE: &str = "vector.hnsw";
 const EMBEDDING_CACHE_FILE: &str = "embedding_cache.sqlite";
 
@@ -15,11 +11,7 @@ const EMBEDDING_CACHE_FILE: &str = "embedding_cache.sqlite";
 pub struct RuntimePaths {
     root: PathBuf,
     explicit_root: bool,
-    temporal_db: PathBuf,
-    graph_db: PathBuf,
-    fts_dir: PathBuf,
     platform_db: PathBuf,
-    analytics_db: PathBuf,
     vector_index: PathBuf,
     embedding_cache: PathBuf,
     hf_home: PathBuf,
@@ -61,11 +53,7 @@ impl RuntimePaths {
             env::var("XDG_CACHE_HOME").map(PathBuf::from).unwrap_or_else(|_| root.join("cache"));
 
         Self {
-            temporal_db: root.join(TEMPORAL_DB_FILE),
-            graph_db: root.join(GRAPH_DB_FILE),
-            fts_dir: root.join(FTS_DIR),
             platform_db: root.join(PLATFORM_DB_FILE),
-            analytics_db: root.join(ANALYTICS_DB_FILE),
             vector_index: root.join(VECTOR_INDEX_FILE),
             embedding_cache: root.join(EMBEDDING_CACHE_FILE),
             root,
@@ -114,24 +102,8 @@ impl RuntimePaths {
         &self.root
     }
 
-    pub fn temporal_db(&self) -> &Path {
-        &self.temporal_db
-    }
-
-    pub fn graph_db(&self) -> &Path {
-        &self.graph_db
-    }
-
-    pub fn fts_dir(&self) -> &Path {
-        &self.fts_dir
-    }
-
     pub fn platform_db(&self) -> &Path {
         &self.platform_db
-    }
-
-    pub fn analytics_db(&self) -> &Path {
-        &self.analytics_db
     }
 
     pub fn vector_index(&self) -> &Path {
@@ -257,48 +229,12 @@ mod tests {
     }
 
     #[test]
-    fn temporal_db_getter_returns_correct_filename() {
-        let paths = {
-            let _lock = lock_env();
-            set_tellodb_dir("/tmp/getter_test")
-        };
-        assert_eq!(paths.temporal_db(), Path::new("/tmp/getter_test/temporal.redb"));
-    }
-
-    #[test]
-    fn graph_db_getter_returns_correct_filename() {
-        let paths = {
-            let _lock = lock_env();
-            set_tellodb_dir("/tmp/graph_test")
-        };
-        assert_eq!(paths.graph_db(), Path::new("/tmp/graph_test/graph.redb"));
-    }
-
-    #[test]
-    fn fts_dir_getter_returns_correct_filename() {
-        let paths = {
-            let _lock = lock_env();
-            set_tellodb_dir("/tmp/fts_test")
-        };
-        assert_eq!(paths.fts_dir(), Path::new("/tmp/fts_test/fts_tantivy"));
-    }
-
-    #[test]
     fn platform_db_getter_returns_correct_filename() {
         let paths = {
             let _lock = lock_env();
             set_tellodb_dir("/tmp/platform_test")
         };
         assert_eq!(paths.platform_db(), Path::new("/tmp/platform_test/platform.db"));
-    }
-
-    #[test]
-    fn analytics_db_getter_returns_correct_filename() {
-        let paths = {
-            let _lock = lock_env();
-            set_tellodb_dir("/tmp/analytics_test")
-        };
-        assert_eq!(paths.analytics_db(), Path::new("/tmp/analytics_test/analytics.db"));
     }
 
     #[test]
@@ -441,11 +377,7 @@ mod tests {
         };
         let debug = format!("{:?}", paths);
         assert!(debug.contains("/tmp/debug_test"));
-        assert!(debug.contains("temporal.redb"));
-        assert!(debug.contains("graph.redb"));
-        assert!(debug.contains("fts_tantivy"));
         assert!(debug.contains("platform.db"));
-        assert!(debug.contains("analytics.db"));
         assert!(debug.contains("vector.hnsw"));
         assert!(debug.contains("embedding_cache.sqlite"));
         assert!(debug.contains("hf-home"));

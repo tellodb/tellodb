@@ -38,6 +38,7 @@ benchmarks/ranking_tuner/*
 # Python bytecode cache (bindings/python)
 __pycache__/
 *.pyc
+.DS_Store
 
 # Benchmark run outputs. Smoke runs are cheap and regenerate locally; dev- and
 # paper-tier records are the evidence behind published numbers and cost GPU

@@ -1,6 +1,5 @@
 pub mod entity_resolver;
 pub mod manager;
-pub mod tables;
 pub mod tenant;
 pub mod types;
 

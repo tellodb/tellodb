@@ -27,13 +27,6 @@ pub fn validate_tenant_id(tenant_id: &str) -> Result<()> {
 
 impl TenantDatabaseManager {
     pub fn new(paths: RuntimePaths, vector_config: VectorConfig) -> Self {
-        let legacy_index = paths.vector_index().join("unified.hnsw");
-        if legacy_index.exists() {
-            warn!(
-                path = %legacy_index.display(),
-                "ignoring legacy vector index files; vectors are loaded from tenant databases"
-            );
-        }
         Self { paths, vector_config, tenants: RwLock::new(HashMap::new()) }
     }
 

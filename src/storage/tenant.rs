@@ -72,10 +72,6 @@ pub struct TenantStore {
     vectors: std::sync::OnceLock<crate::vector_index::VectorIndex>,
 }
 
-/// Stable FTS5 rowid for a document key. FTS tables have no unique key on
-/// `memory_id`, so `INSERT OR REPLACE` only replaces when the rowid matches;
-/// deriving it from the key makes re-ingest replace instead of duplicate and
-/// makes deletes an O(log n) rowid lookup.
 /// The single FTS token standing for an entity.
 ///
 /// Hex-encoded so the result is one `unicode61` token whatever the entity id
@@ -99,6 +95,10 @@ fn fts_quote(term: impl AsRef<str>) -> String {
     format!("\"{}\"", term.as_ref().replace('"', "\"\""))
 }
 
+/// Stable FTS5 rowid for a document key. FTS tables have no unique key on
+/// `memory_id`, so `INSERT OR REPLACE` only replaces when the rowid matches;
+/// deriving it from the key makes re-ingest replace instead of duplicate and
+/// makes deletes an O(log n) rowid lookup.
 pub(crate) fn fts_rowid(key: &str) -> i64 {
     let mut hash = 0xcbf29ce484222325u64;
     for byte in key.as_bytes() {
