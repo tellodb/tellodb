@@ -246,3 +246,26 @@ pub(crate) fn route_phase(s: &mut QueryPipelineState) {
     s.diag.routed_sessions = s.adaptive_profile.route_sessions.len() as u64;
     (s.diag.route_ms, s.diag.route_us) = elapsed_ms_and_us(s.route_start);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inference_edges_get_causal_weight() {
+        assert_eq!(intent_weight_for_edge("caused_by", Some(QueryIntent::Inference)), 1.5);
+        assert_eq!(intent_weight_for_edge("supports", Some(QueryIntent::Inference)), 1.0);
+    }
+
+    #[test]
+    fn peripheral_edges_get_support_weight() {
+        assert_eq!(intent_weight_for_edge("supports", Some(QueryIntent::PeripheralMention)), 1.5);
+        assert_eq!(intent_weight_for_edge("prefers", Some(QueryIntent::PeripheralMention)), 1.0);
+    }
+
+    #[test]
+    fn general_edges_keep_neutral_weight() {
+        assert_eq!(intent_weight_for_edge("caused_by", Some(QueryIntent::General)), 1.0);
+        assert_eq!(intent_weight_for_edge("caused_by", None), 1.0);
+    }
+}

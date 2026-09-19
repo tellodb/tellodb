@@ -14,11 +14,11 @@
 //! wraps it with its own runtime and blocking methods.
 
 use crate::api::handlers::ingest::{process_ingest_batch, spawn_consolidation_tasks};
-use crate::api::handlers::query::execute_query_pipeline;
 use crate::api::types::{IngestPayload, QueryPayload};
 use crate::api::EngineState;
 use crate::core::memory_id::MemoryId;
 use crate::error::{EngineError, EngineResult};
+use crate::query::execute_query_pipeline;
 use crate::runtime_paths::RuntimePaths;
 use crate::storage::TenantStore;
 use anyhow::{Context, Result};

@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 pub use crate::api::plan::*;
 pub use crate::api::types::{
     EvidenceCard, ProofCheck, ProofPacket, ProofTurn, QueryPayload, QueryResult, RankedItem,
@@ -37,6 +35,32 @@ pub(crate) use plan::{attractor_negative_penalty, lifecycle_rank_adjustment};
 pub(crate) use plan::{auto_rerank_enabled, retrieval_profile};
 pub(crate) use route::collect_edge_cluster_scores_for_seeds;
 pub(crate) use score::describe_stale_fact;
+
+pub fn execute_query_pipeline(
+    payload: QueryPayload,
+    state: EngineState,
+    tenant: Arc<TenantStore>,
+    limit: usize,
+    enable_neural_rerank: bool,
+) -> EngineResult<(Vec<QueryResult>, QueryDiagnostics)> {
+    let mut pipeline = QueryPipelineState::new(payload, state, tenant, limit, enable_neural_rerank);
+    plan::plan_phase(&mut pipeline);
+    route::route_phase(&mut pipeline);
+    retrieve::retrieval_phase(&mut pipeline);
+    rerank::rerank_phase(&mut pipeline);
+    fuse::fusion_phase(&mut pipeline);
+
+    let hydrate_start = Instant::now();
+    score::score_hydrate(&mut pipeline)?;
+    (pipeline.diag.hydrate_ms, pipeline.diag.hydrate_us) = elapsed_ms_and_us(hydrate_start);
+
+    let loop_start = Instant::now();
+    let evidence_cards = score::score_loop(&mut pipeline);
+    pipeline.diag.score_loop_us = loop_start.elapsed().as_micros() as u64;
+
+    let results = respond::score_build_response(&mut pipeline, evidence_cards)?;
+    Ok((results, std::mem::take(&mut pipeline.data.diag)))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]

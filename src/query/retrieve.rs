@@ -366,18 +366,3 @@ fn retrieval_cards(s: &mut QueryPipelineState) {
     s.candidates.card_ranked_items = card_ranked_items;
     (s.diag.card_ms, s.diag.card_us) = elapsed_ms_and_us(stage_start);
 }
-
-/// Why the reranker did or did not run; reported as `x-tm-rerank-reason`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[repr(u8)]
-pub(crate) enum RerankDecision {
-    #[default]
-    Disabled = 0,
-    TooFewCandidates = 1,
-    HeuristicApplied = 2,
-    HeuristicSkipped = 3,
-    Always = 4,
-    GateUncertain = 5,
-    GateConfident = 6,
-    Requested = 7,
-}

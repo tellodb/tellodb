@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use super::*;
 
 fn deterministic_subqueries(query: &str) -> Vec<String> {
@@ -168,7 +166,7 @@ pub(crate) fn auto_rerank_enabled(
 
 #[repr(usize)]
 #[derive(Clone, Copy)]
-enum QueryShape {
+pub(crate) enum QueryShape {
     Hard = 0,
     Temporal = 1,
     Numeric = 2,
@@ -352,7 +350,10 @@ const BUDGETS: [[RetrievalBudget; 4]; 3] = [
     ],
 ];
 
-fn retrieval_budget_for_plan(plan: &QueryPlan, profile: RetrievalProfile) -> RetrievalBudget {
+pub(crate) fn retrieval_budget_for_plan(
+    plan: &QueryPlan,
+    profile: RetrievalProfile,
+) -> RetrievalBudget {
     BUDGETS[profile as usize][query_shape(plan) as usize]
 }
 
@@ -525,4 +526,89 @@ pub(crate) fn plan_phase(s: &mut QueryPipelineState) {
         s.diag.route_pivot_ms = start_proc.elapsed().as_millis() as u64;
     }
     (s.diag.planning_ms, s.diag.planning_us) = elapsed_ms_and_us(planning_start);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plan_with_shape(shape: QueryShape) -> QueryPlan {
+        let (intent, needs_decomposition) = match shape {
+            QueryShape::Hard => (QueryIntent::General, true),
+            QueryShape::Temporal => (QueryIntent::TemporalAggregation, false),
+            QueryShape::Numeric => (QueryIntent::NumericAggregation, false),
+            QueryShape::Simple => (QueryIntent::General, false),
+        };
+        QueryPlan {
+            semantic_queries: Vec::new(),
+            fts_queries: Vec::new(),
+            coverage_facets: Vec::new(),
+            requirements: Vec::new(),
+            prefer_distilled: false,
+            prefer_episodic: false,
+            temporal_terms: Vec::new(),
+            lexical_terms: Vec::new(),
+            intent,
+            subject_entities: Vec::new(),
+            cross_entity: false,
+            needs_decomposition,
+            coverage_mode: false,
+            ordinal_rank: None,
+            fact_key: None,
+            prefers_latest: false,
+        }
+    }
+
+    #[test]
+    fn deterministic_subqueries_split_conjunctions() {
+        let parts = deterministic_subqueries("alpha details and beta details");
+        assert_eq!(parts, vec!["alpha details", "beta details"]);
+    }
+
+    #[test]
+    fn deterministic_subqueries_caps_output() {
+        let parts = deterministic_subqueries(
+            "one detail and two detail and three detail and four detail and five detail",
+        );
+        assert!(parts.len() <= 4);
+    }
+
+    #[test]
+    fn promote_variant_moves_existing_query_to_second_position() {
+        let mut queries = vec!["first".to_string(), "second".to_string(), "third".to_string()];
+        promote_query_variant(&mut queries, "third".to_string());
+        assert_eq!(queries, vec!["first", "third", "second"]);
+    }
+
+    #[test]
+    fn promote_variant_adds_new_query_after_primary() {
+        let mut queries = vec!["first".to_string()];
+        promote_query_variant(&mut queries, "second".to_string());
+        assert_eq!(queries, vec!["first", "second"]);
+    }
+
+    #[test]
+    fn query_shape_prioritizes_hard_requirements() {
+        assert!(matches!(query_shape(&plan_with_shape(QueryShape::Hard)), QueryShape::Hard));
+        assert!(matches!(
+            query_shape(&plan_with_shape(QueryShape::Temporal)),
+            QueryShape::Temporal
+        ));
+    }
+
+    #[test]
+    fn stale_cards_are_allowed_for_history_queries() {
+        let plan = plan_with_shape(QueryShape::Hard);
+        assert!(query_allows_stale_cards("show my history", &plan));
+        assert!(!query_allows_stale_cards("what is current", &plan));
+    }
+
+    #[test]
+    fn retrieval_budget_scales_with_profile() {
+        let plan = plan_with_shape(QueryShape::Hard);
+        let fast = retrieval_budget_for_plan(&plan, RetrievalProfile::Fast);
+        let research = retrieval_budget_for_plan(&plan, RetrievalProfile::Research);
+        assert!(research.semantic_top > fast.semantic_top);
+        assert!(research.card_limit > fast.card_limit);
+    }
 }

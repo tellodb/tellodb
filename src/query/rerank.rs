@@ -3,7 +3,7 @@ use super::*;
 const NEURAL_BATCH: usize = 32;
 
 impl RerankDecision {
-    fn applies(self) -> bool {
+    pub(crate) fn applies(self) -> bool {
         matches!(
             self,
             RerankDecision::HeuristicApplied
@@ -145,5 +145,45 @@ pub(crate) fn rerank_phase(s: &mut QueryPipelineState) {
             }
         }
         (s.diag.rerank_ms, s.diag.rerank_us) = elapsed_ms_and_us(stage_start);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_active_rerank_decisions_apply() {
+        assert!(RerankDecision::Always.applies());
+        assert!(RerankDecision::Requested.applies());
+        assert!(!RerankDecision::Disabled.applies());
+        assert!(!RerankDecision::GateConfident.applies());
+    }
+
+    #[test]
+    fn gate_marks_close_candidates_uncertain() {
+        let hits = [(1, 0.20), (2, 0.205), (3, 0.21), (4, 0.215), (5, 0.22)];
+        assert!(rerank_gate_uncertain(&hits, 0.05));
+    }
+
+    #[test]
+    fn gate_accepts_a_clear_winner() {
+        let hits = [(1, 0.10), (2, 0.30), (3, 0.35), (4, 0.38), (5, 0.40)];
+        assert!(!rerank_gate_uncertain(&hits, 0.05));
+    }
+
+    #[test]
+    fn gate_uses_the_last_available_candidate() {
+        let hits = [(1, 0.10), (2, 0.50)];
+        assert!(!rerank_gate_uncertain(&hits, 0.05));
+        assert!(!rerank_gate_uncertain(&[], 0.05));
+    }
+
+    #[test]
+    fn rerank_config_exposes_positive_limits() {
+        let config = crate::config::Config::default();
+        assert!(!rerank_policy_name(&config).is_empty());
+        assert!(rerank_margin(&config) >= 0.0);
+        assert!(rerank_top(&config) > 0);
     }
 }
