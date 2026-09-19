@@ -227,7 +227,7 @@ impl PlatformStore {
                     created_at_ms: row.get(3)?,
                 })
             })
-            .map_err(|_| anyhow!("invalid credentials"))?;
+            .map_err(|_hash_error| anyhow!("invalid credentials"))?;
 
         if !verify_password(&user.password_hash, password) {
             return Err(anyhow!("invalid credentials"));

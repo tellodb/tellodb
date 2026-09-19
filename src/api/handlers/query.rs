@@ -15,6 +15,7 @@ use crate::api::utils::{
 use crate::api::{EngineState, PlatformWriteOp};
 use crate::config::{RerankPolicy, RetrievalProfile};
 use crate::core::memory_id::{MemoryId, Tag};
+use crate::error::{EngineError, EngineResult};
 use crate::features::Feature;
 use crate::metrics;
 use crate::ml::cosine_similarity;
@@ -115,7 +116,7 @@ fn current_core_profile(
     tenant: &dyn QueryRepo,
     entity_id: &str,
     point_in_time_ms: Option<u64>,
-) -> anyhow::Result<Option<String>> {
+) -> EngineResult<Option<String>> {
     let Some(raw) = tenant.get_core_profile(entity_id)? else {
         return Ok(None);
     };
@@ -141,7 +142,7 @@ fn current_core_profile(
         });
         facts.sort_by_key(|f| std::cmp::Reverse(timestamp(f).unwrap_or(0)));
     }
-    Ok(Some(serde_json::to_string(&profile)?))
+    Ok(Some(serde_json::to_string(&profile).map_err(anyhow::Error::from)?))
 }
 
 fn build_entity_observation_block(
@@ -150,19 +151,13 @@ fn build_entity_observation_block(
     query_text: &str,
     results: &[QueryResult],
     point_in_time_ms: Option<u64>,
-) -> Result<String, StatusCode> {
-    let internal = |err: anyhow::Error| {
-        tracing::error!(error = ?err, "observation block read failed");
-        StatusCode::INTERNAL_SERVER_ERROR
-    };
-    let profile = current_core_profile(tenant, entity_id, point_in_time_ms)
-        .map_err(internal)?
+) -> EngineResult<String> {
+    let profile = current_core_profile(tenant, entity_id, point_in_time_ms)?
         .map(|p| clip_profile_to_budget(&p, 8));
 
     let mut scenes = Vec::new();
     for entity in extract_named_phrases(&[query_text.to_string()]) {
-        let lines =
-            tenant.graph_edge_summaries_for_label(entity_id, &entity, 5).map_err(internal)?;
+        let lines = tenant.graph_edge_summaries_for_label(entity_id, &entity, 5)?;
         if !lines.is_empty() {
             scenes.push(lines.join("; "));
         }
@@ -176,12 +171,9 @@ pub async fn query_handler(
     State(state): State<EngineState>,
     Extension(principal): Extension<RequestPrincipal>,
     Json(payload): Json<QueryPayload>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> Result<impl IntoResponse, EngineError> {
     let tenant_id = principal_user_id(&principal).unwrap_or("default");
-    let tenant = state.tenant_store(tenant_id).map_err(|e| {
-        tracing::warn!("Failed to get tenant store: {:?}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let tenant = state.tenant_store(tenant_id)?;
     let profile_query_text = payload.textual_query.clone();
 
     let limit = payload.limit.max(1);
@@ -217,10 +209,10 @@ pub async fn query_handler(
                 )),
                 None => None,
             };
-            Ok::<_, StatusCode>((results, diagnostics, obs_block))
+            Ok::<_, EngineError>((results, diagnostics, obs_block))
         })
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??
+        .map_err(|err| EngineError::internal(format!("query task failed: {err}")))??
     };
 
     if let Some((eid, text)) = obs_block {
@@ -1012,11 +1004,11 @@ fn parse_graph_direction_str(direction: Option<&str>) -> &'static str {
     }
 }
 
-fn scoped_graph_node_id(requested: Option<String>) -> Result<String, StatusCode> {
+fn scoped_graph_node_id(requested: Option<String>) -> EngineResult<String> {
     let node_id = match requested {
         Some(id) if !id.trim().is_empty() => id.trim().to_string(),
-        None => return Err(StatusCode::BAD_REQUEST),
-        _ => return Err(StatusCode::BAD_REQUEST),
+        None => return Err(EngineError::bad_request("graph node is required")),
+        _ => return Err(EngineError::bad_request("graph node is required")),
     };
     Ok(node_id)
 }
@@ -1025,7 +1017,7 @@ pub async fn graph_query_handler(
     State(state): State<EngineState>,
     Extension(principal): Extension<RequestPrincipal>,
     Json(payload): Json<GraphQueryPayload>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> Result<impl IntoResponse, EngineError> {
     // If subject is provided, use it. If not, use the requested user_id.
     let subject = if !payload.subject.trim().is_empty() {
         payload.subject.trim().to_string()
@@ -1034,7 +1026,7 @@ pub async fn graph_query_handler(
     };
 
     let tenant_id = crate::api::auth::principal_user_id(&principal).unwrap_or("default");
-    let tenant = state.tenant_store(tenant_id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let tenant = state.tenant_store(tenant_id)?;
     let tenant_clone = tenant.clone();
     let results = tokio::task::spawn_blocking(move || {
         tenant_clone.graph_query_edges(
@@ -1045,8 +1037,7 @@ pub async fn graph_query_handler(
         )
     })
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    .map_err(|err| EngineError::internal(format!("graph query task failed: {err}")))??;
     record_usage_for_principal(&state, &principal, "query");
     Ok((StatusCode::OK, Json(results)))
 }
@@ -1055,7 +1046,7 @@ pub async fn graph_walk_handler(
     State(state): State<EngineState>,
     Extension(principal): Extension<RequestPrincipal>,
     Json(payload): Json<GraphWalkPayload>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> Result<impl IntoResponse, EngineError> {
     let node = if !payload.node.trim().is_empty() {
         payload.node.trim().to_string()
     } else {
@@ -1063,7 +1054,7 @@ pub async fn graph_walk_handler(
     };
 
     let tenant_id = crate::api::auth::principal_user_id(&principal).unwrap_or("default");
-    let tenant = state.tenant_store(tenant_id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let tenant = state.tenant_store(tenant_id)?;
     let tenant_clone = tenant.clone();
     let results = tokio::task::spawn_blocking(move || {
         // TODO: actually implement depth/breadth walk. For now, pass first edge_type.
@@ -1076,8 +1067,7 @@ pub async fn graph_walk_handler(
         )
     })
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    .map_err(|err| EngineError::internal(format!("graph walk task failed: {err}")))??;
     record_usage_for_principal(&state, &principal, "query");
     Ok((StatusCode::OK, Json(results)))
 }
@@ -1086,7 +1076,7 @@ pub async fn graph_export_handler(
     State(state): State<EngineState>,
     Extension(principal): Extension<RequestPrincipal>,
     Json(payload): Json<GraphExportPayload>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> Result<impl IntoResponse, EngineError> {
     let seed = if !payload.seed.trim().is_empty() {
         payload.seed.trim().to_string()
     } else {
@@ -1094,7 +1084,7 @@ pub async fn graph_export_handler(
     };
 
     let tenant_id = crate::api::auth::principal_user_id(&principal).unwrap_or("default");
-    let tenant = state.tenant_store(tenant_id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let tenant = state.tenant_store(tenant_id)?;
     let tenant_clone = tenant.clone();
     let results = tokio::task::spawn_blocking(move || {
         // TODO: implement export walk using breadth/depth. For now fallback to query edges.
@@ -1107,8 +1097,7 @@ pub async fn graph_export_handler(
         )
     })
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    .map_err(|err| EngineError::internal(format!("graph export task failed: {err}")))??;
     record_usage_for_principal(&state, &principal, "query");
     Ok((StatusCode::OK, Json(results)))
 }
@@ -1117,7 +1106,7 @@ pub async fn analytics_query_handler(
     State(state): State<EngineState>,
     Extension(principal): Extension<RequestPrincipal>,
     Json(payload): Json<AnalyticsQueryPayload>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> Result<impl IntoResponse, EngineError> {
     let user_id = crate::api::auth::principal_user_id(&principal).unwrap_or("default");
     let s = payload.start_timestamp_ms.unwrap_or(0);
     let e = payload.end_timestamp_ms.unwrap_or(u64::MAX);
@@ -1125,7 +1114,7 @@ pub async fn analytics_query_handler(
     let agg = state
         .analytics
         .aggregate_range(user_id, &payload.entity_id, &payload.label, s, e)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|err| EngineError::internal(format!("analytics query failed: {err}")))?;
 
     let buckets = if let Some(bucket_str) = &payload.bucket {
         let bucket = match bucket_str.to_lowercase().as_str() {
@@ -1134,12 +1123,14 @@ pub async fn analytics_query_handler(
             "week" => crate::analytics::TemporalBucket::Week,
             "month" => crate::analytics::TemporalBucket::Month,
             "year" => crate::analytics::TemporalBucket::Year,
-            _ => return Err(StatusCode::BAD_REQUEST),
+            _ => return Err(EngineError::bad_request("unknown analytics bucket")),
         };
         let bucketed = state
             .analytics
             .aggregate_bucketed(user_id, &payload.entity_id, &payload.label, s, e, bucket)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            .map_err(|err| {
+                EngineError::internal(format!("analytics bucket query failed: {err}"))
+            })?;
         Some(
             bucketed
                 .into_iter()
@@ -2365,7 +2356,7 @@ fn fusion_phase(s: &mut QueryPipelineState) {
     s.fused = fused_vec;
 }
 
-fn score_phase(s: &mut QueryPipelineState) -> Result<Vec<QueryResult>, StatusCode> {
+fn score_phase(s: &mut QueryPipelineState) -> EngineResult<Vec<QueryResult>> {
     let hydrate_start = Instant::now();
     score_hydrate(s)?;
     (s.diag.hydrate_ms, s.diag.hydrate_us) = elapsed_ms_and_us(hydrate_start);
@@ -2382,7 +2373,7 @@ fn score_phase(s: &mut QueryPipelineState) -> Result<Vec<QueryResult>, StatusCod
 /// blocking pool; nesting `spawn_blocking` + `block_on` here tied up extra
 /// pool threads). Any read failure fails the query: scoring with missing
 /// observations or stale-fact data would silently return wrong results.
-fn score_hydrate(s: &mut QueryPipelineState) -> Result<(), StatusCode> {
+fn score_hydrate(s: &mut QueryPipelineState) -> EngineResult<()> {
     let observation_keys: Vec<(u64, String)> =
         s.fused.iter().map(|(mid, ts, _)| (*ts, mid.clone())).collect();
     let observation_memory_ids: Vec<String> =
@@ -2406,13 +2397,10 @@ fn score_hydrate(s: &mut QueryPipelineState) -> Result<(), StatusCode> {
                 None => tenant.invalidated_set(&observation_memory_ids),
             })
         });
-        fn join<T>(name: &'static str, r: std::thread::Result<T>) -> Result<T, StatusCode> {
-            r.map_err(|_| {
-                tracing::error!(stage = name, "hydrate thread panicked");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })
+        fn join<T>(name: &'static str, r: std::thread::Result<T>) -> EngineResult<T> {
+            r.map_err(|_panic| EngineError::internal(format!("hydrate stage panicked: {name}")))
         }
-        Ok::<_, StatusCode>((
+        Ok::<_, EngineError>((
             join("observations", obs.join())?,
             join("cards", cards.join())?,
             join("invalidated", invalid.join())?,
@@ -2420,10 +2408,7 @@ fn score_hydrate(s: &mut QueryPipelineState) -> Result<(), StatusCode> {
     })?;
 
     let fail = |name: &'static str| {
-        move |err: anyhow::Error| {
-            tracing::error!(stage = name, error = ?err, "hydrate read failed");
-            StatusCode::INTERNAL_SERVER_ERROR
-        }
+        move |err: anyhow::Error| EngineError::Other(anyhow::anyhow!("{name}: {err}"))
     };
     let us = |d: Duration| (d.as_millis() as u64, d.as_micros() as u64);
     s.observations = obs.0.map_err(fail("observations"))?;
@@ -2682,7 +2667,7 @@ fn describe_stale_fact(
 fn score_build_response(
     s: &mut QueryPipelineState,
     mut evidence_cards: Vec<EvidenceCard>,
-) -> Result<Vec<QueryResult>, StatusCode> {
+) -> EngineResult<Vec<QueryResult>> {
     let stage_start = Instant::now();
 
     // Pre-synthesized Phase 1: direct fact lookup.
@@ -2804,10 +2789,7 @@ fn score_build_response(
     }
     let hydrate_obs_start = Instant::now();
     let read_failed = |stage: &'static str| {
-        move |err: anyhow::Error| {
-            tracing::error!(stage, error = ?err, "response hydration failed");
-            StatusCode::INTERNAL_SERVER_ERROR
-        }
+        move |err: anyhow::Error| EngineError::Other(anyhow::anyhow!("{stage}: {err}"))
     };
     let source_observations =
         s.tenant.get_observations_batch(&source_keys).map_err(read_failed("observations"))?;
@@ -2966,7 +2948,7 @@ pub fn execute_query_pipeline(
     tenant: std::sync::Arc<TenantStore>,
     limit: usize,
     enable_neural_rerank: bool,
-) -> Result<(Vec<QueryResult>, QueryDiagnostics), StatusCode> {
+) -> EngineResult<(Vec<QueryResult>, QueryDiagnostics)> {
     let mut s = QueryPipelineState::new(payload, state, tenant, limit, enable_neural_rerank);
     plan_phase(&mut s);
     route_phase(&mut s);

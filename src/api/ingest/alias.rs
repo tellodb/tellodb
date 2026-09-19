@@ -1,4 +1,4 @@
-use axum::http::StatusCode;
+use crate::error::EngineResult;
 
 pub fn extract_aliases_from_text(text: &str, known_entities: &[String]) -> Vec<(String, String)> {
     let mut aliases = Vec::new();
@@ -110,10 +110,10 @@ pub fn is_semantic_duplicate(
     entity_id: &str,
     embedding: &[f32],
     threshold: f32,
-) -> Result<bool, StatusCode> {
+) -> EngineResult<bool> {
     let candidates = vectors
         .search(Some(entity_id), embedding, 5)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|err| crate::error::EngineError::Other(anyhow::anyhow!(err)))?;
 
     for (_, dist) in candidates {
         let similarity = 1.0 - dist;

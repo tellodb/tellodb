@@ -121,7 +121,7 @@ impl MemoryId {
 
         let entity = decode_component(parts[0])?;
         let session = decode_component(parts[1])?;
-        let turn = parts[2].parse::<u32>().map_err(|_| MemoryIdError::InvalidTurn)?;
+        let turn = parts[2].parse::<u32>().map_err(|_parse_error| MemoryIdError::InvalidTurn)?;
         let mut tags = Vec::with_capacity(parts.len().saturating_sub(3));
         for part in &parts[3..] {
             tags.push(Tag::from_component(&decode_component(part)?));

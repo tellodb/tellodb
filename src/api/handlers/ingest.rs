@@ -13,6 +13,7 @@ use crate::api::types::{BatchIngestPayload, IngestPayload};
 use crate::api::utils::*;
 use crate::api::{EngineState, PlatformWriteOp};
 use crate::core::memory_id::{MemoryId, Tag};
+use crate::error::{EngineError, EngineResult};
 use crate::graph::EdgeType;
 use crate::ml::cosine_similarity;
 use std::sync::Arc;
@@ -237,15 +238,12 @@ pub async fn ingest_handler(
     State(state): State<EngineState>,
     Extension(principal): Extension<RequestPrincipal>,
     Json(payload): Json<IngestPayload>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> Result<impl IntoResponse, EngineError> {
     let profile_text = payload.textual_content.clone();
     let profile_ts = payload.timestamp;
 
     let tenant_id = principal_user_id(&principal).unwrap_or("default");
-    let tenant = state.tenant_store(tenant_id).map_err(|e| {
-        tracing::warn!("Failed to get tenant store: {:?}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let tenant = state.tenant_store(tenant_id)?;
 
     let (tasks, diag) = process_ingest_batch(&state, &tenant, vec![payload]).await?;
 
@@ -292,7 +290,7 @@ pub async fn batch_ingest_handler(
     State(state): State<EngineState>,
     Extension(principal): Extension<RequestPrincipal>,
     Json(payload): Json<BatchIngestPayload>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> Result<impl IntoResponse, EngineError> {
     let profile_items = payload
         .items
         .iter()
@@ -300,10 +298,7 @@ pub async fn batch_ingest_handler(
         .collect::<Vec<_>>();
 
     let tenant_id = principal_user_id(&principal).unwrap_or("default");
-    let tenant = state.tenant_store(tenant_id).map_err(|e| {
-        tracing::warn!("Failed to get tenant store: {:?}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let tenant = state.tenant_store(tenant_id)?;
 
     let (tasks, diag) = process_ingest_batch(&state, &tenant, payload.items).await?;
 
@@ -352,7 +347,7 @@ pub(crate) async fn process_ingest_batch(
     state: &EngineState,
     tenant: &std::sync::Arc<TenantStore>,
     payloads: Vec<IngestPayload>,
-) -> Result<(Vec<ConsolidationTask>, IngestDiagnostics), StatusCode> {
+) -> EngineResult<(Vec<ConsolidationTask>, IngestDiagnostics)> {
     execute_ingest_pipeline(state, tenant, payloads).await
 }
 
@@ -495,7 +490,7 @@ async fn generate_embeddings(
     expanded_payloads: &[IngestPayload],
     enriched_texts: &[String],
     diag: &mut IngestDiagnostics,
-) -> Result<Vec<Vec<f32>>, StatusCode> {
+) -> EngineResult<Vec<Vec<f32>>> {
     let spec_prep_start = Instant::now();
     let semantic_embed_specs: Vec<(EmbeddingMode, String)> = expanded_payloads
         .iter()
@@ -524,7 +519,7 @@ async fn generate_embeddings(
         // would make those memories silently unsearchable.
         let embeddings = state.semantic.embed_texts_async(texts).await.map_err(|err| {
             tracing::error!(error = ?err, "embedding failed; rejecting ingest batch");
-            StatusCode::INTERNAL_SERVER_ERROR
+            EngineError::internal("ingest operation failed")
         })?;
         (diag.embed_ms, diag.embed_us) = elapsed_ms_and_us(stage_start);
         embeddings
@@ -547,7 +542,7 @@ fn build_observations(
     diag: &mut IngestDiagnostics,
     features: Features,
     profile: Profile,
-) -> Result<Vec<PreparedRecord>, StatusCode> {
+) -> EngineResult<Vec<PreparedRecord>> {
     let dedup_build_start = Instant::now();
 
     let mut prepared = Vec::new();
@@ -610,7 +605,7 @@ fn build_observations(
         {
             let vectors = tenant.vectors().map_err(|err| {
                 tracing::error!(error = ?err, "tenant vector index unavailable");
-                StatusCode::INTERNAL_SERVER_ERROR
+                EngineError::internal("ingest operation failed")
             })?;
             let is_dup = is_semantic_duplicate(vectors, &payload.entity_id, &embedding, 0.94)?;
             let in_batch = semantic_seen.iter().any(|(entity_id, prior_embedding)| {
@@ -802,7 +797,7 @@ async fn commit_batches(
     state: &EngineState,
     batches: &mut ArtifactBatches,
     diag: &mut IngestDiagnostics,
-) -> Result<(), StatusCode> {
+) -> EngineResult<()> {
     // Memory cards
     if !batches.memory_card_batch.is_empty() {
         let stage_start = Instant::now();
@@ -813,7 +808,7 @@ async fn commit_batches(
             .and_then(|r| r)
             .map_err(|err| {
                 tracing::error!(error = ?err, "memory card upsert failed");
-                StatusCode::INTERNAL_SERVER_ERROR
+                EngineError::internal("ingest operation failed")
             })?;
         diag.memory_cards_ms = stage_start.elapsed().as_millis() as u64;
     }
@@ -830,11 +825,11 @@ async fn commit_batches(
                 .await
                 .map_err(|e| {
                     tracing::error!("session_router spawn panic: {:?}", e);
-                    StatusCode::INTERNAL_SERVER_ERROR
+                    EngineError::internal("ingest operation failed")
                 })?
                 .map_err(|e| {
                     tracing::error!("session_router merge failed: {:?}", e);
-                    StatusCode::INTERNAL_SERVER_ERROR
+                    EngineError::internal("ingest operation failed")
                 })?
         };
 
@@ -889,7 +884,7 @@ async fn commit_batches(
         |stage: &'static str, res: Result<anyhow::Result<Duration>, tokio::task::JoinError>| {
             res.map_err(anyhow::Error::from).and_then(|r| r).map_err(|err| {
                 tracing::error!(stage, error = ?err, "ingest indexing stage failed");
-                StatusCode::INTERNAL_SERVER_ERROR
+                EngineError::internal("ingest operation failed")
             })
         };
     let res_fts = join_stage("fts", res_fts)?;
@@ -914,11 +909,11 @@ async fn commit_batches(
         .await
         .map_err(|e| {
             tracing::error!("preference spawn panic: {:?}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
+            EngineError::internal("ingest operation failed")
         })?
         .map_err(|e| {
             tracing::error!("preference write failed: {:?}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
+            EngineError::internal("ingest operation failed")
         })?;
         diag.preferences_ms = stage_start.elapsed().as_millis() as u64;
     }
@@ -945,11 +940,11 @@ async fn commit_batches(
             .await
             .map_err(|e| {
                 tracing::error!("memory_links spawn panic: {:?}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
+                EngineError::internal("ingest operation failed")
             })?
             .map_err(|e| {
                 tracing::error!("memory_links write failed: {:?}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
+                EngineError::internal("ingest operation failed")
             })?;
         diag.memory_links_ms = stage_start.elapsed().as_millis() as u64;
     }
@@ -965,7 +960,7 @@ async fn commit_batches(
         let texts: Vec<String> = keys.iter().map(|(_, key)| key.replace('_', " ")).collect();
         let embeddings = state.semantic.embed_texts_async(texts).await.map_err(|err| {
             tracing::error!(error = ?err, "predicate embedding failed");
-            StatusCode::INTERNAL_SERVER_ERROR
+            EngineError::internal("ingest operation failed")
         })?;
         let mut by_entity: std::collections::HashMap<String, Vec<(String, Vec<f32>)>> =
             std::collections::HashMap::new();
@@ -990,7 +985,7 @@ async fn commit_batches(
         .and_then(|r| r)
         .map_err(|err| {
             tracing::error!(error = ?err, "predicate canonicalization failed");
-            StatusCode::INTERNAL_SERVER_ERROR
+            EngineError::internal("ingest operation failed")
         })?;
         let mut regrouped = 0usize;
         for fact in batches.fact_batch.iter_mut() {
@@ -1024,7 +1019,7 @@ async fn commit_batches(
         }
 
         let tenant_fact = tenant.clone();
-        let fact_side_effects: Vec<Result<FactSideEffects, StatusCode>> =
+        let fact_side_effects: Vec<EngineResult<FactSideEffects>> =
             tokio::task::spawn_blocking(move || {
                 by_entity
                     .into_iter()
@@ -1043,9 +1038,10 @@ async fn commit_batches(
                                 )
                             })
                             .collect();
-                        let statuses = tenant_fact
-                            .register_fact_versions_batch(&entity_id, &items)
-                            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                        let statuses =
+                            tenant_fact.register_fact_versions_batch(&entity_id, &items).map_err(
+                                |_write_error| EngineError::internal("ingest operation failed"),
+                            )?;
 
                         let mut graph_status_batch = Vec::new();
 
@@ -1127,7 +1123,9 @@ async fn commit_batches(
                         if !graph_status_batch.is_empty() {
                             tenant_fact
                                 .graph_upsert_fact_status_batch(&entity_id, &graph_status_batch)
-                                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                                .map_err(|_write_error| {
+                                    EngineError::internal("ingest operation failed")
+                                })?;
                         }
 
                         Ok(se)
@@ -1137,7 +1135,7 @@ async fn commit_batches(
             .await
             .map_err(|e| {
                 tracing::error!("fact supersession spawn panic: {:?}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
+                EngineError::internal("ingest operation failed")
             })?;
 
         for result in fact_side_effects {
@@ -1187,7 +1185,7 @@ async fn commit_batches(
         .and_then(|r| r)
         .map_err(|err| {
             tracing::error!(error = ?err, "typed graph edge insert failed");
-            StatusCode::INTERNAL_SERVER_ERROR
+            EngineError::internal("ingest operation failed")
         })?;
         diag.count(Feature::GraphEdges.name(), written);
         (diag.graph_ms, diag.graph_us) = elapsed_ms_and_us(stage_start);
@@ -1202,11 +1200,11 @@ async fn commit_batches(
             .await
             .map_err(|e| {
                 tracing::error!("card_latest spawn panic: {:?}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
+                EngineError::internal("ingest operation failed")
             })?
             .map_err(|e| {
                 tracing::error!("card_latest write failed: {:?}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
+                EngineError::internal("ingest operation failed")
             })?;
         diag.card_latest_ms = stage_start.elapsed().as_millis() as u64;
     }
@@ -1434,7 +1432,7 @@ fn build_retrospective_links(
     state: &EngineState,
     tenant: &dyn RetrospectiveRepo,
     candidates: &[RetrospectiveCandidate],
-) -> Result<Vec<(String, String, String)>, StatusCode> {
+) -> EngineResult<Vec<(String, String, String)>> {
     let mut links = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
@@ -1464,12 +1462,10 @@ fn build_retrospective_links(
             }
         }
 
-        let query_embedding = ok_or_500(state.semantic.generate_query_embedding(reference_query))?;
-        let ann_hits = ok_or_500(
-            tenant.vectors().and_then(|v| v.search(Some(entity_id), &query_embedding, 10)),
-        )?;
+        let query_embedding = state.semantic.generate_query_embedding(reference_query)?;
+        let ann_hits = tenant.vectors()?.search(Some(entity_id), &query_embedding, 10)?;
         let ann_ids: Vec<u64> = ann_hits.iter().map(|(vid, _)| *vid).collect();
-        let ann_lookup = ok_or_500(tenant.lookup_by_vector_ids_batch(&ann_ids))?;
+        let ann_lookup = tenant.lookup_by_vector_ids_batch(&ann_ids)?;
         for (rank, ((_, dist), maybe_lookup)) in
             ann_hits.iter().zip(ann_lookup.into_iter()).enumerate()
         {
@@ -1632,7 +1628,7 @@ async fn execute_ingest_pipeline(
     state: &EngineState,
     tenant: &std::sync::Arc<TenantStore>,
     payloads: Vec<IngestPayload>,
-) -> Result<(Vec<ConsolidationTask>, IngestDiagnostics), StatusCode> {
+) -> EngineResult<(Vec<ConsolidationTask>, IngestDiagnostics)> {
     let mut diag = IngestDiagnostics::default();
     let total_start = Instant::now();
 
@@ -1681,7 +1677,7 @@ async fn execute_ingest_pipeline(
         .and_then(|r| r)
         .map_err(|err| {
             tracing::error!(error = ?err, "building embedding texts failed");
-            StatusCode::INTERNAL_SERVER_ERROR
+            EngineError::internal("ingest operation failed")
         })?;
         enriched_texts = built.texts;
         neighbour_updates = built.neighbour_updates;
@@ -1695,7 +1691,7 @@ async fn execute_ingest_pipeline(
         let ids: Vec<String> = expanded_payloads.iter().map(|p| p.memory_id.clone()).collect();
         let stored = tenant.stored_content_hashes(&ids).map_err(|err| {
             tracing::error!(error = ?err, "content hash lookup failed");
-            StatusCode::INTERNAL_SERVER_ERROR
+            EngineError::internal("ingest operation failed")
         })?;
         let keep: Vec<bool> = expanded_payloads
             .iter()
@@ -1745,7 +1741,7 @@ async fn execute_ingest_pipeline(
     let stage_start = Instant::now();
     let inserted_flags = tenant.insert_observations_batch(&batch_items).map_err(|e| {
         tracing::warn!("Batch Storage Error: {:?}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
+        EngineError::internal("ingest operation failed")
     })?;
     (diag.storage_ms, diag.storage_us) = elapsed_ms_and_us(stage_start);
 
@@ -1762,7 +1758,7 @@ async fn execute_ingest_pipeline(
         diag.embedded_count += texts.len();
         let embeddings = state.semantic.embed_texts_async(texts).await.map_err(|err| {
             tracing::error!(error = ?err, "neighbour re-embedding failed");
-            StatusCode::INTERNAL_SERVER_ERROR
+            EngineError::internal("ingest operation failed")
         })?;
         let tenant = tenant.clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
@@ -1784,7 +1780,7 @@ async fn execute_ingest_pipeline(
         .and_then(|r| r)
         .map_err(|err| {
             tracing::error!(error = ?err, "neighbour vector update failed");
-            StatusCode::INTERNAL_SERVER_ERROR
+            EngineError::internal("ingest operation failed")
         })?;
     }
 
@@ -1804,7 +1800,7 @@ async fn execute_ingest_pipeline(
     .and_then(|r| r)
     .map_err(|err| {
         tracing::error!(error = ?err, "metric extraction failed");
-        StatusCode::INTERNAL_SERVER_ERROR
+        EngineError::internal("ingest operation failed")
     })?;
     (diag.analytics_ms, diag.analytics_us) = elapsed_ms_and_us(stage_start);
 

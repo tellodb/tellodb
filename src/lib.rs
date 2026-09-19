@@ -5,6 +5,7 @@ pub mod core;
 pub mod db;
 pub mod doctor;
 pub mod engine;
+pub mod error;
 pub mod extract;
 pub mod features;
 pub mod fts;

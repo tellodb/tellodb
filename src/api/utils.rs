@@ -1,4 +1,4 @@
-use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
@@ -510,13 +510,6 @@ pub fn clip_profile_to_budget(profile_json: &str, max_fields: usize) -> String {
     let clipped: serde_json::Map<String, serde_json::Value> =
         obj.iter().take(max_fields).map(|(k, v)| (k.clone(), v.clone())).collect();
     serde_json::to_string(&clipped).unwrap_or_else(|_| profile_json.to_string())
-}
-
-pub fn ok_or_500<T, E: std::fmt::Debug>(r: Result<T, E>) -> Result<T, StatusCode> {
-    r.map_err(|e| {
-        tracing::warn!("Internal error: {:?}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })
 }
 
 pub fn should_apply_neural_rerank(

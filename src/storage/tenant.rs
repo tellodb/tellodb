@@ -144,7 +144,9 @@ impl TenantStore {
     }
 
     pub fn attach_vectors(&self, index: crate::vector_index::VectorIndex) -> Result<()> {
-        self.vectors.set(index).map_err(|_| anyhow::anyhow!("vector index already attached"))
+        self.vectors
+            .set(index)
+            .map_err(|_existing_index| anyhow::anyhow!("vector index already attached"))
     }
 
     pub fn vectors(&self) -> Result<&crate::vector_index::VectorIndex> {

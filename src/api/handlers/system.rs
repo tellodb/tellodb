@@ -10,6 +10,11 @@ use crate::api::types::*;
 use crate::api::utils::RESET_CONFIRM_PHRASE;
 use crate::api::EngineState;
 use crate::metrics;
+
+fn internal_error(error: impl std::fmt::Debug) -> StatusCode {
+    tracing::error!(error = ?error, "system handler operation failed");
+    StatusCode::INTERNAL_SERVER_ERROR
+}
 use anyhow::Context;
 
 const CACHE_CAPACITY: usize = 10_000;
@@ -39,7 +44,7 @@ pub async fn status_handler(
     Extension(principal): Extension<RequestPrincipal>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let tenant_id = principal_user_id(&principal).unwrap_or("default");
-    let _tenant = state.tenant_store(tenant_id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let _tenant = state.tenant_store(tenant_id).map_err(internal_error)?;
     let status = EngineStatus {
         device: state.semantic.device_label().to_string(),
         data_root: state.data_root.to_string(),
@@ -186,18 +191,18 @@ pub async fn memory_inspect_handler(
     Json(payload): Json<MemoryInspectPayload>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let tenant_id = principal_user_id(&principal).unwrap_or("default");
-    let tenant = state.tenant_store(tenant_id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let tenant = state.tenant_store(tenant_id).map_err(internal_error)?;
     let response = tokio::task::spawn_blocking(move || {
         let tenant = tenant.clone();
         let timestamp = tenant
             .lookup_by_memory_id(&payload.memory_id)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .map_err(internal_error)?
             .map(|(ts, _)| ts);
 
         let observation = if let Some(ts) = timestamp {
             tenant
                 .get_observations_batch(&[(ts, payload.memory_id.clone())])
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                .map_err(internal_error)?
                 .remove(&payload.memory_id)
                 .map(|obs| MemoryAuditObservation {
                     entity_id: obs.entity_id,
@@ -209,16 +214,14 @@ pub async fn memory_inspect_handler(
             None
         };
 
-        let card = tenant
-            .get_memory_card(&payload.memory_id)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let card = tenant.get_memory_card(&payload.memory_id).map_err(internal_error)?;
         let ledger_turn = tenant
             .get_ledger_turns_batch(std::slice::from_ref(&payload.memory_id))
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .map_err(internal_error)?
             .remove(&payload.memory_id);
         let deletion_tombstones = tenant
             .get_deletion_tombstones_for_target(&payload.memory_id, DELETION_TOMBSTONE_HOURS)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            .map_err(internal_error)?;
 
         let lifecycle = card
             .as_ref()
@@ -234,7 +237,7 @@ pub async fn memory_inspect_handler(
                     .min(TURN_WINDOW_MAX_RADIUS);
                 turn_window = tenant
                     .get_turn_window(&turn.entity_id, &turn.session_id, turn.turn_index, radius)
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                    .map_err(internal_error)?
                     .into_iter()
                     .map(|turn| ProofTurn {
                         turn_id: turn.turn_id,
@@ -259,7 +262,7 @@ pub async fn memory_inspect_handler(
         })
     })
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??;
+    .map_err(internal_error)??;
 
     record_usage_for_principal(&state, &principal, "memory_inspect");
     Ok((StatusCode::OK, Json(response)))
@@ -271,7 +274,7 @@ pub async fn memory_delete_handler(
     Json(payload): Json<MemoryDeletePayload>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let tenant_id = principal_user_id(&principal).unwrap_or("default");
-    let tenant = state.tenant_store(tenant_id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let tenant = state.tenant_store(tenant_id).map_err(internal_error)?;
     let reason = payload
         .reason
         .clone()
@@ -281,12 +284,12 @@ pub async fn memory_delete_handler(
         let tenant = tenant.clone();
         let timestamp = tenant
             .lookup_by_memory_id(&payload.memory_id)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .map_err(internal_error)?
             .map(|(ts, _)| ts);
         let observation = if let Some(ts) = timestamp {
             tenant
                 .get_observations_batch(&[(ts, payload.memory_id.clone())])
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                .map_err(internal_error)?
                 .remove(&payload.memory_id)
         } else {
             None
@@ -304,15 +307,14 @@ pub async fn memory_delete_handler(
             });
         };
 
-        let deleted = tenant
-            .delete_observation(ts, &payload.memory_id, &reason)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let deleted =
+            tenant.delete_observation(ts, &payload.memory_id, &reason).map_err(internal_error)?;
         let fts_removed = observation
             .as_ref()
             .and_then(|_obs| tenant.fts_remove_document(&payload.memory_id).ok().map(|_| 1))
             .unwrap_or(0);
         let graph_edges_removed = tenant.graph_remove_memory(&payload.memory_id).unwrap_or(0);
-        let vectors = tenant.vectors().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let vectors = tenant.vectors().map_err(internal_error)?;
         for vector_id in deleted.vector_id.iter().chain(deleted.chunk_vector_ids.iter()) {
             vectors.remove(&deleted.entity_id, *vector_id).map_err(|err| {
                 tracing::error!(error = ?err, vector_id, "failed to remove deleted vector");
@@ -331,7 +333,7 @@ pub async fn memory_delete_handler(
         })
     })
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??;
+    .map_err(internal_error)??;
 
     record_usage_for_principal(&state, &principal, "memory_delete");
     Ok((StatusCode::OK, Json(response)))

@@ -18,6 +18,7 @@ use crate::api::handlers::query::execute_query_pipeline;
 use crate::api::types::{IngestPayload, QueryPayload};
 use crate::api::EngineState;
 use crate::core::memory_id::MemoryId;
+use crate::error::{EngineError, EngineResult};
 use crate::runtime_paths::RuntimePaths;
 use crate::storage::TenantStore;
 use anyhow::{Context, Result};
@@ -216,12 +217,10 @@ impl Engine {
         &self.tenant
     }
 
-    pub async fn ingest(&self, memories: Vec<Memory>) -> Result<IngestReport> {
+    pub async fn ingest(&self, memories: Vec<Memory>) -> EngineResult<IngestReport> {
         let count = memories.len();
         let payloads: Vec<IngestPayload> = memories.into_iter().map(Memory::into_payload).collect();
-        let (tasks, diag) = process_ingest_batch(&self.state, &self.tenant, payloads)
-            .await
-            .map_err(|status| anyhow::anyhow!("ingest failed ({status})"))?;
+        let (tasks, diag) = process_ingest_batch(&self.state, &self.tenant, payloads).await?;
         spawn_consolidation_tasks(self.tenant.clone(), tasks);
         Ok(IngestReport {
             memories: count,
@@ -231,7 +230,7 @@ impl Engine {
         })
     }
 
-    pub async fn query(&self, query: Query) -> Result<Vec<Hit>> {
+    pub async fn query(&self, query: Query) -> EngineResult<Vec<Hit>> {
         let limit = query.limit.clamp(1, 1_000);
         let payload = QueryPayload {
             textual_query: query.text,
@@ -250,8 +249,7 @@ impl Engine {
             execute_query_pipeline(payload, state, tenant, limit, rerank)
         })
         .await
-        .context("query task panicked")?
-        .map_err(|status| anyhow::anyhow!("query failed ({status})"))?;
+        .map_err(|err| EngineError::internal(format!("query task panicked: {err}")))??;
         Ok(results
             .into_iter()
             .filter(|r| r.origin.is_stored())
@@ -351,11 +349,11 @@ impl Db {
     }
 
     pub fn ingest(&self, memories: Vec<Memory>) -> Result<IngestReport> {
-        self.runtime.block_on(self.engine.ingest(memories))
+        self.runtime.block_on(self.engine.ingest(memories)).map_err(anyhow::Error::from)
     }
 
     pub fn query(&self, query: Query) -> Result<Vec<Hit>> {
-        self.runtime.block_on(self.engine.query(query))
+        self.runtime.block_on(self.engine.query(query)).map_err(anyhow::Error::from)
     }
 
     pub fn current_fact(&self, entity_id: &str, fact_key: &str) -> Result<Option<String>> {

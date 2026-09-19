@@ -611,7 +611,9 @@ impl SemanticInference {
                     .collect();
                 handles
                     .into_iter()
-                    .map(|h| h.join().map_err(|_| anyhow::anyhow!("embedding thread panicked"))?)
+                    .map(|h| {
+                        h.join().map_err(|_panic| anyhow::anyhow!("embedding thread panicked"))?
+                    })
                     .collect::<Result<_>>()
             })?
         };
@@ -744,7 +746,9 @@ impl SemanticInference {
                     .collect();
                 handles
                     .into_iter()
-                    .map(|h| h.join().map_err(|_| anyhow::anyhow!("rerank thread panicked"))?)
+                    .map(|h| {
+                        h.join().map_err(|_panic| anyhow::anyhow!("rerank thread panicked"))?
+                    })
                     .collect::<Result<Vec<_>>>()
             })?
         };
