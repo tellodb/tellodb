@@ -16,6 +16,7 @@
 use crate::api::ingest::fact::{
     infer_fact_key, is_high_signal_atomic_claim, preference_signal_strength, split_atomic_claims,
 };
+use crate::config::ExtractorConfig;
 use anyhow::{bail, Context, Result};
 use std::sync::{Arc, OnceLock};
 
@@ -135,38 +136,37 @@ pub struct EncoderExtractor {
 }
 
 impl EncoderExtractor {
-    /// Loads the model named by `TELLODB_EXTRACTOR_MODEL_DIR`, with labels
-    /// from `TELLODB_EXTRACTOR_LABELS` and the score floor from
-    /// `TELLODB_EXTRACTOR_THRESHOLD` (default 0.5).
-    pub fn from_env() -> Result<Self> {
-        let dir = std::env::var("TELLODB_EXTRACTOR_MODEL_DIR").map_err(|_| {
+    pub fn from_config(config: &ExtractorConfig) -> Result<Self> {
+        let dir = config.model_dir.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "TELLODB_EXTRACTOR=encoder needs TELLODB_EXTRACTOR_MODEL_DIR pointing at a \
                  GLiNER export (gliner_config.json, tokenizer.json, onnx/model*.onnx)"
             )
         })?;
-        let labels: Vec<String> = std::env::var("TELLODB_EXTRACTOR_LABELS")
-            .unwrap_or_else(|_| DEFAULT_LABELS.to_string())
-            .split(',')
-            .map(|label| label.split_whitespace().collect::<Vec<_>>().join(" "))
-            .filter(|label| !label.is_empty())
-            .collect();
+        let labels = if config.labels.is_empty() {
+            DEFAULT_LABELS
+                .split(',')
+                .map(|label| label.split_whitespace().collect::<Vec<_>>().join(" "))
+                .filter(|label| !label.is_empty())
+                .collect()
+        } else {
+            config.labels.clone()
+        };
         if labels.is_empty() {
             bail!("TELLODB_EXTRACTOR_LABELS is empty");
         }
-        let threshold = std::env::var("TELLODB_EXTRACTOR_THRESHOLD")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|v: &f32| v.is_finite() && (0.0..=1.0).contains(v))
-            .unwrap_or(0.5);
 
-        let model = crate::gliner::GlinerModel::load(std::path::Path::new(&dir))
-            .with_context(|| format!("loading extractor model from {dir}"))?;
+        let model = crate::gliner::GlinerModel::load(dir)
+            .with_context(|| format!("loading extractor model from {}", dir.display()))?;
         if labels.len() > model.max_types() {
             bail!("{} labels exceed the model's maximum of {}", labels.len(), model.max_types());
         }
-        tracing::info!(labels = labels.len(), threshold, "encoder extractor ready");
-        Ok(Self { model, labels, threshold })
+        tracing::info!(
+            labels = labels.len(),
+            threshold = config.threshold,
+            "encoder extractor ready"
+        );
+        Ok(Self { model, labels, threshold: config.threshold })
     }
 }
 
@@ -215,16 +215,12 @@ impl Extractor for EncoderExtractor {
 
 static EXTRACTOR: OnceLock<Arc<dyn Extractor>> = OnceLock::new();
 
-/// Builds the extractor named by `TELLODB_EXTRACTOR` (`rules` by default,
-/// or `encoder`). Call once at startup: loading an encoder model is slow and
-/// a bad configuration should fail the process, not every ingest.
-pub fn init_from_env() -> Result<Arc<dyn Extractor>> {
-    let extractor: Arc<dyn Extractor> =
-        match std::env::var("TELLODB_EXTRACTOR").unwrap_or_default().trim() {
-            "" | "rules" => Arc::new(RuleExtractor::default()),
-            "encoder" => Arc::new(EncoderExtractor::from_env()?),
-            other => bail!("unknown TELLODB_EXTRACTOR '{other}' (rules, encoder)"),
-        };
+pub fn init(config: &ExtractorConfig) -> Result<Arc<dyn Extractor>> {
+    let extractor: Arc<dyn Extractor> = match config.kind.trim() {
+        "" | "rules" => Arc::new(RuleExtractor::default()),
+        "encoder" => Arc::new(EncoderExtractor::from_config(config)?),
+        other => bail!("unknown TELLODB_EXTRACTOR '{other}' (rules, encoder)"),
+    };
     Ok(EXTRACTOR.get_or_init(|| extractor).clone())
 }
 

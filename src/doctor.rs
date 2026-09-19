@@ -66,7 +66,8 @@ pub fn report(state: &EngineState, paths: &RuntimePaths) -> Result<Value> {
         }));
     }
 
-    let vector_config = crate::vector_index::VectorConfig::from_env(semantic.embedding_dim())?;
+    let mut vector_config = state.config.vector;
+    vector_config.dimensions = semantic.embedding_dim();
     Ok(json!({
         "version": env!("CARGO_PKG_VERSION"),
         "data_root": paths.root().display().to_string(),

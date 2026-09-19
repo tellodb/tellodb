@@ -145,24 +145,14 @@ impl Features {
 
 static FEATURES: OnceLock<Features> = OnceLock::new();
 
-/// Parses `TELLODB_DISABLE`. Call once at startup to fail fast on typos.
-pub fn init_from_env() -> Result<Features> {
-    let spec = std::env::var("TELLODB_DISABLE").unwrap_or_default();
-    let parsed = Features::parse(&spec)?;
-    Ok(*FEATURES.get_or_init(|| parsed))
+pub fn init(config: Features) -> Features {
+    *FEATURES.get_or_init(|| config)
 }
 
 /// Process-wide switches. Everything is enabled until `init_from_env` runs
 /// (or if `TELLODB_DISABLE` is unset).
 pub fn features() -> Features {
-    *FEATURES.get_or_init(|| {
-        Features::parse(&std::env::var("TELLODB_DISABLE").unwrap_or_default()).unwrap_or_else(
-            |err| {
-                tracing::error!(error = %err, "ignoring invalid TELLODB_DISABLE");
-                Features::default()
-            },
-        )
-    })
+    *FEATURES.get_or_init(Features::default)
 }
 
 pub fn enabled(feature: Feature) -> bool {

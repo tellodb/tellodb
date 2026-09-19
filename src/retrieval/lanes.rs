@@ -100,20 +100,13 @@ impl Lanes {
 
 static LANES: OnceLock<Lanes> = OnceLock::new();
 
-/// Parses `TELLODB_LANES`. Call once at startup to fail fast on typos.
-pub fn init_from_env() -> Result<Lanes> {
-    let parsed = Lanes::parse(&std::env::var("TELLODB_LANES").unwrap_or_default())?;
-    Ok(*LANES.get_or_init(|| parsed))
+pub fn init(config: Lanes) -> Lanes {
+    *LANES.get_or_init(|| config)
 }
 
 /// Process-wide lane selection; everything is on until `init_from_env` runs.
 pub fn lanes() -> Lanes {
-    *LANES.get_or_init(|| {
-        Lanes::parse(&std::env::var("TELLODB_LANES").unwrap_or_default()).unwrap_or_else(|err| {
-            tracing::error!(error = %err, "ignoring invalid TELLODB_LANES");
-            Lanes::default()
-        })
-    })
+    *LANES.get_or_init(Lanes::default)
 }
 
 pub fn enabled(lane: Lane) -> bool {

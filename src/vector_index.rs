@@ -186,22 +186,26 @@ impl VectorConfig {
 
     /// Reads `TELLODB_VECTOR_QUANT`, `TELLODB_FLAT_THRESHOLD`,
     /// `TELLODB_RESCORE_FACTOR` and `TELLODB_HNSW_{CONNECTIVITY,EF_ADD,EF_SEARCH}`.
-    pub fn from_env(dimensions: usize) -> Result<Self> {
-        let num =
-            |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<usize>().ok());
+    pub(crate) fn from_values(
+        dimensions: usize,
+        quantization: Option<&str>,
+        flat_threshold: Option<usize>,
+        rescore_factor: Option<usize>,
+        connectivity: Option<usize>,
+        expansion_add: Option<usize>,
+        expansion_search: Option<usize>,
+    ) -> Result<Self> {
         let defaults = Self::new(dimensions);
         Ok(Self {
             dimensions,
-            quantization: Quantization::parse(
-                &std::env::var("TELLODB_VECTOR_QUANT").unwrap_or_default(),
-            )?,
-            flat_threshold: num("TELLODB_FLAT_THRESHOLD").unwrap_or(defaults.flat_threshold),
-            rescore_factor: num("TELLODB_RESCORE_FACTOR")
-                .filter(|&f| f >= 1)
+            quantization: Quantization::parse(quantization.unwrap_or_default())?,
+            flat_threshold: flat_threshold.unwrap_or(defaults.flat_threshold),
+            rescore_factor: rescore_factor
+                .filter(|&factor| factor >= 1)
                 .unwrap_or(defaults.rescore_factor),
-            connectivity: num("TELLODB_HNSW_CONNECTIVITY").unwrap_or(defaults.connectivity),
-            expansion_add: num("TELLODB_HNSW_EF_ADD").unwrap_or(defaults.expansion_add),
-            expansion_search: num("TELLODB_HNSW_EF_SEARCH").unwrap_or(defaults.expansion_search),
+            connectivity: connectivity.unwrap_or(defaults.connectivity),
+            expansion_add: expansion_add.unwrap_or(defaults.expansion_add),
+            expansion_search: expansion_search.unwrap_or(defaults.expansion_search),
         })
     }
 }

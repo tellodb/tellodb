@@ -7,7 +7,7 @@ use crate::features::Features;
 use crate::heuristics::Profile;
 use crate::retrieval::lanes::Lanes;
 use crate::retrieval::scoring::ScoringWeights;
-use crate::vector_index::{Quantization, VectorConfig};
+use crate::vector_index::VectorConfig;
 
 const DEFAULT_EMBEDDING_MODEL: &str = "BAAI/bge-small-en-v1.5";
 const DEFAULT_RERANK_MODEL: &str = "bge-reranker-base";
@@ -551,31 +551,6 @@ impl TemporalConfig {
             )
             .unwrap_or(defaults.recency_scoring),
         }
-    }
-}
-
-impl VectorConfig {
-    fn from_values(
-        dimensions: usize,
-        quantization: Option<&str>,
-        flat_threshold: Option<usize>,
-        rescore_factor: Option<usize>,
-        connectivity: Option<usize>,
-        expansion_add: Option<usize>,
-        expansion_search: Option<usize>,
-    ) -> Result<Self> {
-        let defaults = Self::new(dimensions);
-        Ok(Self {
-            dimensions,
-            quantization: Quantization::parse(quantization.unwrap_or_default())?,
-            flat_threshold: flat_threshold.unwrap_or(defaults.flat_threshold),
-            rescore_factor: rescore_factor
-                .filter(|value| *value >= 1)
-                .unwrap_or(defaults.rescore_factor),
-            connectivity: connectivity.unwrap_or(defaults.connectivity),
-            expansion_add: expansion_add.unwrap_or(defaults.expansion_add),
-            expansion_search: expansion_search.unwrap_or(defaults.expansion_search),
-        })
     }
 }
 

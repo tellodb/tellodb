@@ -198,7 +198,9 @@ impl Engine {
     }
 
     pub async fn from_paths(paths: &RuntimePaths, tenant_id: &str) -> Result<Self> {
-        let state = crate::engine::build_state(paths, crate::api::AuthConfig::embedded()).await?;
+        let config = crate::config::Config::from_env()?;
+        let state =
+            crate::engine::build_state(paths, crate::api::AuthConfig::embedded(), config).await?;
         let tenant = state.tenant_store(tenant_id)?;
         Ok(Self { state, tenant })
     }

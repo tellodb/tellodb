@@ -12,54 +12,20 @@
 //! Dates and session ids are never part of embedded text.
 
 use crate::api::types::IngestPayload;
+pub use crate::config::{EmbedTextConfig, EmbedTextMode};
 use crate::storage::TenantStore;
 use anyhow::Result;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EmbedTextMode {
-    Legacy,
-    Turn,
-    Context,
-}
-
-impl EmbedTextMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            EmbedTextMode::Legacy => "legacy",
-            EmbedTextMode::Turn => "turn",
-            EmbedTextMode::Context => "context",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct EmbedTextConfig {
-    pub mode: EmbedTextMode,
-    pub window: u32,
-}
+static CONFIG: OnceLock<EmbedTextConfig> = OnceLock::new();
 
 pub fn embed_text_config() -> EmbedTextConfig {
-    static CONFIG: OnceLock<EmbedTextConfig> = OnceLock::new();
-    *CONFIG.get_or_init(|| {
-        let mode = match std::env::var("TELLODB_EMBED_TEXT")
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "legacy" => EmbedTextMode::Legacy,
-            "turn" => EmbedTextMode::Turn,
-            _ => EmbedTextMode::Context,
-        };
-        let window = std::env::var("TELLODB_CONTEXT_WINDOW")
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .map(|w| w.min(4))
-            .unwrap_or(1);
-        EmbedTextConfig { mode, window }
-    })
+    *CONFIG.get_or_init(|| EmbedTextConfig { mode: EmbedTextMode::Context, window: 1 })
+}
+
+pub fn init(config: EmbedTextConfig) -> EmbedTextConfig {
+    *CONFIG.get_or_init(|| config)
 }
 
 /// A source turn is a memory as sent (or the first chunk of one), as opposed

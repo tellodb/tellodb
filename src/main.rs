@@ -188,20 +188,15 @@ fn assign_missing_turn_indices(memories: &mut [Memory], default_session: Option<
 
 async fn serve(paths: &RuntimePaths) -> anyhow::Result<()> {
     info!("Starting tellodb server...");
-    let auth = api::AuthConfig::from_env()?;
-    let state = tellodb::engine::build_state(paths, auth).await?;
+    let config = tellodb::config::Config::from_env()?;
+    let auth = api::AuthConfig::from_config(&config)?;
+    let state = tellodb::engine::build_state(paths, auth, config).await?;
     let tenant_manager = state.tenant_manager.clone();
     info!("API key auth enabled on all routes (TEMPORAL_MEMORY_API_KEY or TELLODB_API_KEY).");
 
     // Local-first default: only reachable from this machine unless a host is
     // configured explicitly (containers set TEMPORAL_MEMORY_HOST=0.0.0.0).
-    let host = env::var("TEMPORAL_MEMORY_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
-    let port = env::var("PORT")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| env::var("TEMPORAL_MEMORY_PORT").ok().filter(|value| !value.trim().is_empty()))
-        .unwrap_or_else(|| "3000".to_string());
-    let bind_address = format!("{}:{}", host, port);
+    let bind_address = format!("{}:{}", state.config.server.host, state.config.server.port);
     let platform = state.platform.clone();
     let app = api::build_api(state);
 

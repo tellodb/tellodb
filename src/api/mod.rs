@@ -14,6 +14,7 @@ pub use auth::{AuthConfig, DEFAULT_TEST_API_KEY};
 pub use handlers::build_api;
 
 use crate::analytics::MetricVault;
+use crate::config::Config;
 use crate::ml::QueryIntentClassifier;
 use crate::platform::PlatformStore;
 use crate::semantic::SemanticInference;
@@ -21,6 +22,7 @@ use crate::storage::{TenantDatabaseManager, TenantStore};
 
 #[derive(Clone)]
 pub struct EngineState {
+    pub config: Arc<Config>,
     pub tenant_manager: Arc<TenantDatabaseManager>,
     pub analytics: Arc<MetricVault>,
     pub semantic: Arc<SemanticInference>,

@@ -61,10 +61,8 @@ pub fn with_profile<T>(profile: Profile, f: impl FnOnce() -> T) -> T {
     out
 }
 
-/// Parses `TELLODB_HEURISTICS`. Call once at startup to fail fast on typos.
-pub fn init_from_env() -> Result<Profile> {
-    let parsed = Profile::parse(&std::env::var("TELLODB_HEURISTICS").unwrap_or_default())?;
-    Ok(*PROFILE.get_or_init(|| parsed))
+pub fn init(config: Profile) -> Profile {
+    *PROFILE.get_or_init(|| config)
 }
 
 pub fn profile() -> Profile {
@@ -72,14 +70,7 @@ pub fn profile() -> Profile {
     if let Some(profile) = TEST_PROFILE.with(|slot| slot.get()) {
         return profile;
     }
-    *PROFILE.get_or_init(|| {
-        Profile::parse(&std::env::var("TELLODB_HEURISTICS").unwrap_or_default()).unwrap_or_else(
-            |err| {
-                tracing::error!(error = %err, "ignoring invalid TELLODB_HEURISTICS");
-                Profile::Generic
-            },
-        )
-    })
+    *PROFILE.get_or_init(|| Profile::Generic)
 }
 
 /// True when benchmark-derived rules are allowed to fire.

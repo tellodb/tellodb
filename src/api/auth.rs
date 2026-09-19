@@ -20,29 +20,25 @@ pub struct AuthConfig {
 }
 
 impl AuthConfig {
-    /// Server auth from `TEMPORAL_MEMORY_API_KEY` / `TELLODB_API_KEY`. Debug
-    /// builds fall back to the test key; release builds require a key.
-    pub fn from_env() -> anyhow::Result<Self> {
-        let api_key = env::var("TEMPORAL_MEMORY_API_KEY")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .or_else(|| env::var("TELLODB_API_KEY").ok().filter(|value| !value.trim().is_empty()));
-
-        let api_key = match api_key {
-            Some(key) => key.trim().to_string(),
+    pub fn from_config(config: &crate::config::Config) -> anyhow::Result<Self> {
+        let api_key = match config.server.api_key.clone() {
+            Some(key) => key,
             None if cfg!(debug_assertions) => {
                 tracing::warn!(
-                    "Using default test API key '{}'. Set TEMPORAL_MEMORY_API_KEY or TELLODB_API_KEY for production.",
+                    "Using default test API key '{}'. Set TELLODB_API_KEY for production.",
                     DEFAULT_TEST_API_KEY
                 );
                 DEFAULT_TEST_API_KEY.to_string()
             }
-            None => anyhow::bail!(
-                "TEMPORAL_MEMORY_API_KEY or TELLODB_API_KEY must be set to serve the HTTP API"
-            ),
+            None => anyhow::bail!("TELLODB_API_KEY must be set to serve the HTTP API"),
         };
-
         Ok(Self { api_key: Some(Arc::<str>::from(api_key)) })
+    }
+
+    /// Server auth from `TEMPORAL_MEMORY_API_KEY` / `TELLODB_API_KEY`. Debug
+    /// builds fall back to the test key; release builds require a key.
+    pub fn from_env() -> anyhow::Result<Self> {
+        Self::from_config(&crate::config::Config::from_env()?)
     }
 
     /// For in-process use (embedded API, CLI, stdio MCP), where no request

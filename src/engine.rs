@@ -2,47 +2,48 @@
 //! server, the embedded [`crate::db`] API and the CLI.
 
 use crate::api::{self, EngineState};
+use crate::config::Config;
 use crate::runtime_paths::RuntimePaths;
-use crate::{analytics, ml, platform, semantic, storage, vector_index};
+use crate::{analytics, ml, platform, semantic, storage};
 use anyhow::Result;
 use std::sync::Arc;
 use tracing::{info, warn};
 
-fn env_var_bool(name: &str) -> bool {
-    std::env::var(name).ok().is_some_and(|v| {
-        matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-    })
-}
-
 /// Builds the engine rooted at `paths`. Must run inside a Tokio runtime
 /// (background writers are spawned on it).
-pub async fn build_state(paths: &RuntimePaths, auth: api::AuthConfig) -> Result<EngineState> {
+pub async fn build_state(
+    paths: &RuntimePaths,
+    auth: api::AuthConfig,
+    mut config: Config,
+) -> Result<EngineState> {
     paths.ensure_dirs()?;
     paths.apply_process_env_defaults();
     info!(root = %paths.root().display(), "Runtime data root");
 
-    let features = crate::features::init_from_env()?;
-    if !features.disabled_names().is_empty() {
-        info!(disabled = ?features.disabled_names(), "Ingest structures disabled");
+    crate::features::init(config.features);
+    if !config.features.disabled_names().is_empty() {
+        info!(disabled = ?config.features.disabled_names(), "Ingest structures disabled");
     }
 
-    let heuristics = crate::heuristics::init_from_env()?;
-    info!(profile = heuristics.name(), "Heuristics profile");
+    crate::heuristics::init(config.heuristics);
+    info!(profile = config.heuristics.name(), "Heuristics profile");
 
-    let lanes = crate::retrieval::lanes::init_from_env()?;
-    if lanes != crate::retrieval::lanes::Lanes::default() {
-        info!(enabled = ?lanes.enabled_names(), "Retrieval lanes restricted");
+    crate::retrieval::lanes::init(config.lanes);
+    if config.lanes != crate::retrieval::lanes::Lanes::default() {
+        info!(enabled = ?config.lanes.enabled_names(), "Retrieval lanes restricted");
     }
 
-    // Loading an encoder model is slow and a bad configuration should fail the
-    // process rather than every ingest.
-    let extractor = crate::extract::init_from_env()?;
+    let extractor = crate::extract::init(&config.extractor)?;
     info!(extractor = extractor.name(), "Fact extractor");
+    crate::api::ingest::embed_text::init(config.embedding.text);
 
-    let cache_path = std::env::var("TELLODB_EMBEDDING_CACHE_PATH")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| paths.embedding_cache().to_path_buf());
+    let cache_path = config
+        .embedding
+        .cache_path
+        .clone()
+        .unwrap_or_else(|| paths.embedding_cache().to_path_buf());
     let semantic = Arc::new(semantic::SemanticInference::with_cache_path(Some(cache_path)).await?);
+    config.embedding.dimension = Some(semantic.embedding_dim());
     info!(
         model_id = %semantic.embedding_model_id(),
         dims = %semantic.embedding_dim(),
@@ -52,7 +53,7 @@ pub async fn build_state(paths: &RuntimePaths, auth: api::AuthConfig) -> Result<
         "Models loaded"
     );
 
-    let intent_classifier = if env_var_bool("TEMPORAL_MEMORY_ML_INTENT") {
+    let intent_classifier = if config.server.ml_intent {
         match ml::QueryIntentClassifier::new(semantic.clone()) {
             Ok(c) => Some(Arc::new(c)),
             Err(e) => {
@@ -64,7 +65,8 @@ pub async fn build_state(paths: &RuntimePaths, auth: api::AuthConfig) -> Result<
         None
     };
 
-    let vector_config = vector_index::VectorConfig::from_env(semantic.embedding_dim())?;
+    let mut vector_config = config.vector;
+    vector_config.dimensions = semantic.embedding_dim();
     info!(
         quantization = vector_config.quantization.name(),
         flat_threshold = vector_config.flat_threshold,
@@ -79,12 +81,11 @@ pub async fn build_state(paths: &RuntimePaths, auth: api::AuthConfig) -> Result<
     let platform_write_tx = api::start_platform_writer(platform.clone());
     let analytics = Arc::new(analytics::MetricVault::new(tenant_manager.clone()));
 
-    let mut ranking_config = api::types::RankingConfig::default();
     if let Ok(config_data) = std::fs::read_to_string(paths.root().join("ranking_config.json")) {
         match serde_json::from_str::<api::types::RankingConfig>(&config_data) {
             Ok(parsed) => {
                 info!("Loaded ranking config from ranking_config.json");
-                ranking_config = parsed;
+                config.ranking = parsed;
             }
             Err(err) => warn!(error = %err, "Failed to parse ranking_config.json; using defaults"),
         }
@@ -98,7 +99,8 @@ pub async fn build_state(paths: &RuntimePaths, auth: api::AuthConfig) -> Result<
         platform,
         platform_write_tx,
         data_root: Arc::<str>::from(paths.root().display().to_string()),
-        ranking_config: Arc::new(ranking_config),
+        config: Arc::new(config.clone()),
+        ranking_config: Arc::new(config.ranking.clone()),
         intent_classifier,
         rate_limiter: Arc::new(api::auth::RateLimiter::new()),
     })
