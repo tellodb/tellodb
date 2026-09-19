@@ -744,10 +744,13 @@ fn is_safe_user_id(user_id: &str) -> bool {
 
 fn random_token(length: usize) -> String {
     const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    const LIMIT: u8 = (256 / CHARS.len() * CHARS.len()) as u8;
     let mut out = String::with_capacity(length);
-    for _ in 0..length {
-        let idx = (rand::random::<u8>() as usize) % CHARS.len();
-        out.push(CHARS[idx] as char);
+    while out.len() < length {
+        let byte = rand::random::<u8>();
+        if byte < LIMIT {
+            out.push(CHARS[(byte % CHARS.len() as u8) as usize] as char);
+        }
     }
     out
 }
@@ -1525,6 +1528,27 @@ mod tests {
     fn random_token_alphanumeric() {
         let token = random_token(100);
         assert!(token.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn random_token_distribution_is_uniform() {
+        const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        const SAMPLE_SIZE: usize = 620_000;
+        const EXPECTED_COUNT: usize = SAMPLE_SIZE / CHARS.len();
+        let token = random_token(SAMPLE_SIZE);
+        let mut counts = [0usize; 62];
+
+        for byte in token.bytes() {
+            let index = CHARS.iter().position(|candidate| *candidate == byte).unwrap();
+            counts[index] += 1;
+        }
+
+        for count in counts {
+            assert!(
+                (9_500..=10_500).contains(&count),
+                "count {count} differs from {EXPECTED_COUNT}"
+            );
+        }
     }
 
     #[test]
