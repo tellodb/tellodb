@@ -5,6 +5,10 @@ SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 TIER="smoke"
+# Which suites to run. Empty means all of them; the tier still picks the
+# sizes. Iterating on one dataset should not cost a full matrix.
+ONLY=""
+RUNS_OVERRIDE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --tier|-t)
@@ -15,13 +19,39 @@ while [[ $# -gt 0 ]]; do
       TIER="${1#*=}"
       shift 1
       ;;
+    --only)
+      ONLY="$2"
+      shift 2
+      ;;
+    --only=*)
+      ONLY="${1#*=}"
+      shift 1
+      ;;
+    --runs)
+      RUNS_OVERRIDE="$2"
+      shift 2
+      ;;
+    --runs=*)
+      RUNS_OVERRIDE="${1#*=}"
+      shift 1
+      ;;
     *)
       echo "Unknown argument: $1" >&2
-      echo "Usage: $0 [--tier <smoke|dev|paper>]" >&2
+      echo "Usage: $0 [--tier <smoke|dev|paper>] [--only <longmemeval,locomo,synth>] [--runs N]" >&2
       exit 1
       ;;
   esac
 done
+
+# `--only a,b` -> a shell function we can ask about each suite.
+want_suite() {
+  [[ -z "$ONLY" ]] && return 0
+  local suite
+  for suite in ${ONLY//,/ }; do
+    [[ "$suite" == "$1" ]] && return 0
+  done
+  return 1
+}
 
 case "$TIER" in
   smoke)
@@ -85,6 +115,10 @@ export TELLODB_EMBEDDING_CACHE_PATH="${TELLODB_EMBEDDING_CACHE_PATH:-$HOME/.cach
 # wallclock (comparable with older runs) or session (real event dates) for
 # LongMemEval/LoCoMo. Synthetic runs always use session dates: their
 # current-value and as-of questions are meaningless without real event times.
+if [[ -n "$RUNS_OVERRIDE" ]]; then
+    RUNS="$RUNS_OVERRIDE"
+fi
+
 TIMESTAMPS="${TIMESTAMPS:-wallclock}"
 # Memory representation (WP2): what the engine embeds (legacy|turn|context),
 # how many neighbouring turns `context` adds, and whether the evaluator also
@@ -160,6 +194,7 @@ fi
 echo "Warming up engine..."
 curl -s -X POST "${ENGINE_URL}/warmup" -H "x-api-key: ${ENGINE_API_KEY}" >/dev/null
 
+if want_suite longmemeval; then
 echo "=== Running LongMemEval-S (dev split, ${RUNS} run(s)) ==="
 for run in $(seq 1 "$RUNS"); do
     echo "--- LongMemEval-S run $run/$RUNS ---"
@@ -177,7 +212,9 @@ for run in $(seq 1 "$RUNS"); do
         --reset-first \
         recall
 done
+fi
 
+if want_suite locomo; then
 echo "=== Running LoCoMo (dev split, ${RUNS} run(s)) ==="
 for run in $(seq 1 "$RUNS"); do
     echo "--- LoCoMo run $run/$RUNS ---"
@@ -195,7 +232,9 @@ for run in $(seq 1 "$RUNS"); do
         --reset-first \
         recall
 done
+fi
 
+if want_suite synth; then
 echo "=== Running Synthetic Recall (1k memories) ==="
 echo "Generating synthetic 1k memories..."
 "$SYNTH_BIN" --entities 50 --memories-per-entity 20 --seed 101 --output "$SYNTH_DIR/synth_1k.json"
@@ -255,6 +294,8 @@ if [[ "$RUN_SYNTH_100K" -eq 1 ]]; then
         --runs-dir "$RUNS_DIR" \
         --reset-first \
         recall
+fi
+
 fi
 
 echo "=== Snapshotting Run Records ==="
