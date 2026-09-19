@@ -126,7 +126,7 @@ fn attractor_negative_penalty(
     penalty.min(0.18)
 }
 
-fn query_allows_stale_cards(query: &str, plan: &QueryPlan) -> bool {
+pub(crate) fn query_allows_stale_cards(query: &str, plan: &QueryPlan) -> bool {
     let lower = query.to_ascii_lowercase();
     matches!(plan.intent, QueryIntent::TemporalAggregation)
         || (matches!(plan.intent, QueryIntent::Inference) && plan.needs_decomposition)
@@ -353,7 +353,7 @@ fn retrieval_budget_for_plan(plan: &QueryPlan, profile: RetrievalProfile) -> Ret
     BUDGETS[profile as usize][query_shape(plan) as usize]
 }
 
-fn plan_phase(s: &mut QueryPipelineState) {
+pub(crate) fn plan_phase(s: &mut QueryPipelineState) {
     s.raw_query_text = s.payload.textual_query.clone();
     s.query_text = rewrite_query_for_retrieval(&s.raw_query_text);
     s.include_evidence =

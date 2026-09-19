@@ -12,6 +12,7 @@ pub use crate::error::{EngineError, EngineResult};
 pub use crate::features::Feature;
 pub use crate::metrics;
 pub use crate::ml::cosine_similarity;
+pub use crate::retrieval::lanes::Lane;
 pub use crate::retrieval::{rrf_fuse, ScoringWeights};
 pub use crate::storage::repo::traits::QueryRepo;
 pub use crate::storage::{
@@ -23,6 +24,10 @@ pub use std::sync::Arc;
 pub use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) mod plan;
+pub(crate) mod retrieve;
+pub(crate) mod route;
+
+pub(crate) use plan::query_allows_stale_cards;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
