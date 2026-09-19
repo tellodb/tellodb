@@ -185,49 +185,33 @@ async fn serve(paths: &RuntimePaths) -> anyhow::Result<()> {
         .or_else(|| env::var("TEMPORAL_MEMORY_PORT").ok().filter(|value| !value.trim().is_empty()))
         .unwrap_or_else(|| "3000".to_string());
     let bind_address = format!("{}:{}", host, port);
-    let tenant_manager_for_checkpoint = tenant_manager.clone();
-
     let app = api::build_api(state);
 
-    // Periodic WAL checkpoint for tenant databases
-    {
-        let ckpt_tenants = tenant_manager_for_checkpoint;
-        tokio::spawn(async move {
-            let mut ticker = interval(Duration::from_secs(300)); // every 5 min
-            loop {
-                ticker.tick().await;
-                let tenants = ckpt_tenants.all_tenants();
-                for tenant in tenants {
-                    if let Err(e) = tenant.checkpoint() {
-                        error!("WAL checkpoint failed: {:?}", e);
-                    }
-                }
-            }
-        });
-    }
-
-    // Periodic memory lifecycle expiration sweep
-    {
-        let sweep_tenants = tenant_manager.clone();
-        tokio::spawn(async move {
-            let mut ticker = interval(Duration::from_secs(300)); // every 5 min
-            loop {
-                ticker.tick().await;
+    let maintenance = tenant_manager.clone();
+    tokio::spawn(async move {
+        let mut ticker = interval(Duration::from_secs(300));
+        loop {
+            ticker.tick().await;
+            let tenants = maintenance.all_tenants();
+            let _ = tokio::task::spawn_blocking(move || {
                 let now_ms = match std::time::SystemTime::now()
                     .duration_since(std::time::SystemTime::UNIX_EPOCH)
                 {
-                    Ok(d) => d.as_millis() as u64,
-                    Err(_) => continue,
+                    Ok(duration) => duration.as_millis() as u64,
+                    Err(_) => return,
                 };
-                let tenants = sweep_tenants.all_tenants();
                 for tenant in tenants {
-                    if let Err(e) = tenant.expire_records(now_ms) {
-                        error!("Lifecycle expiration sweep failed: {:?}", e);
+                    if let Err(error) = tenant.checkpoint() {
+                        error!(error = ?error, "WAL checkpoint failed");
+                    }
+                    if let Err(error) = tenant.expire_records(now_ms) {
+                        error!(error = ?error, "Lifecycle expiration sweep failed");
                     }
                 }
-            }
-        });
-    }
+            })
+            .await;
+        }
+    });
 
     info!(address = %bind_address, "Memory Engine live");
     let listener = TcpListener::bind(&bind_address).await?;
@@ -274,6 +258,5 @@ async fn shutdown_signal() {
         }
     }
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
     info!("Shutting down...");
 }
