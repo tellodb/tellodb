@@ -76,6 +76,29 @@ pub struct TenantStore {
 /// `memory_id`, so `INSERT OR REPLACE` only replaces when the rowid matches;
 /// deriving it from the key makes re-ingest replace instead of duplicate and
 /// makes deletes an O(log n) rowid lookup.
+/// The single FTS token standing for an entity.
+///
+/// Hex-encoded so the result is one `unicode61` token whatever the entity id
+/// contains, and prefixed so it cannot be mistaken for a content word. It
+/// lives in its own indexed column, so `entity_tok:<tok>` restricts the scan
+/// to one entity inside the index instead of filtering after the match.
+pub(crate) fn fts_entity_tok(entity_id: &str) -> String {
+    let mut out = String::with_capacity(1 + entity_id.len() * 2);
+    out.push('e');
+    for byte in entity_id.as_bytes() {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+/// Wraps a term as an FTS5 string, doubling any embedded quote.
+///
+/// An unescaped `"` closes the phrase early and makes the whole MATCH
+/// expression invalid, which the callers turn into an empty lane.
+fn fts_quote(term: impl AsRef<str>) -> String {
+    format!("\"{}\"", term.as_ref().replace('"', "\"\""))
+}
+
 pub(crate) fn fts_rowid(key: &str) -> i64 {
     let mut hash = 0xcbf29ce484222325u64;
     for byte in key.as_bytes() {
@@ -87,7 +110,7 @@ pub(crate) fn fts_rowid(key: &str) -> i64 {
 }
 
 /// Schema version recorded in `PRAGMA user_version`.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 impl TenantStore {
     pub fn new(path: &Path) -> Result<Self> {
@@ -230,6 +253,7 @@ impl TenantStore {
             CREATE VIRTUAL TABLE IF NOT EXISTS fts_memories USING fts5(
                 memory_id UNINDEXED,
                 entity_id UNINDEXED,
+                entity_tok,
                 content,
                 tokenize='porter unicode61'
             );
@@ -534,6 +558,22 @@ impl TenantStore {
                 }
                 conn.execute_batch(&format!("COMMIT; DROP TABLE {tmp};"))?;
             }
+        }
+        if version < 3 {
+            // `entity_tok` (indexed) replaced the post-MATCH filter on the
+            // UNINDEXED `entity_id`. Nothing rebuilds the contents: there is
+            // no data worth preserving yet, and re-ingesting restores it.
+            tracing::warn!("dropping FTS index for the entity-token schema; re-ingest to restore");
+            conn.execute_batch("DROP TABLE IF EXISTS fts_memories;")?;
+            conn.execute_batch(
+                "CREATE VIRTUAL TABLE fts_memories USING fts5(
+                     memory_id UNINDEXED,
+                     entity_id UNINDEXED,
+                     entity_tok,
+                     content,
+                     tokenize='porter unicode61'
+                 );",
+            )?;
         }
         if version < SCHEMA_VERSION {
             conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
@@ -2645,53 +2685,58 @@ impl TenantStore {
             .filter(|t| t.len() > FTS_MIN_TERM_LEN)
             .map(|t| t.to_lowercase())
             .filter(|t| !crate::api::utils::is_low_signal_keyword(t))
-            .map(|t| format!("\"{}\"", t))
+            .map(fts_quote)
             .collect();
 
         if terms.is_empty() {
+            // The cleaned pass dropped everything, so fall back to the raw
+            // words. These have not been stripped of punctuation, so a term
+            // may contain a quote; `fts_quote` doubles it rather than letting
+            // it close the phrase and make the whole expression invalid.
             terms = query
                 .split_whitespace()
                 .filter(|t| t.len() > FTS_MIN_TERM_LEN)
-                .map(|t| format!("\"{}\"", t))
+                .map(fts_quote)
                 .collect();
         }
 
-        let fts_query = terms.join(" OR ");
-
-        if fts_query.is_empty() {
+        if terms.is_empty() {
             return Ok(Vec::new());
         }
 
-        let sql = if entity_id.is_some() {
-            "SELECT memory_id, bm25(fts_memories) as score
-             FROM fts_memories WHERE fts_memories MATCH ?1 AND entity_id = ?2
-             ORDER BY score LIMIT ?3"
-        } else {
-            "SELECT memory_id, bm25(fts_memories) as score
-             FROM fts_memories WHERE fts_memories MATCH ?1
-             ORDER BY score LIMIT ?2"
+        // Terms are matched against `content` only, so an entity token can
+        // never be matched by a content word that happens to look like one.
+        let terms = format!("{{content}}:({})", terms.join(" OR "));
+        let fts_query = match entity_id {
+            Some(eid) => format!("entity_tok:{} AND {}", fts_entity_tok(eid), terms),
+            None => terms,
         };
 
-        let mut stmt = conn.prepare_cached(sql)?;
-        let results = if let Some(eid) = entity_id {
-            stmt.query_map(params![fts_query, eid, limit as i64], |row| {
+        let mut stmt = conn.prepare_cached(
+            "SELECT memory_id, bm25(fts_memories) as score
+             FROM fts_memories WHERE fts_memories MATCH ?1
+             ORDER BY score LIMIT ?2",
+        )?;
+        let results = stmt
+            .query_map(params![fts_query, limit as i64], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)? as f32))
             })?
-            .collect::<Result<Vec<_>, _>>()?
-        } else {
-            stmt.query_map(params![fts_query, limit as i64], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)? as f32))
-            })?
-            .collect::<Result<Vec<_>, _>>()?
-        };
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(results)
     }
 
     pub fn fts_index_text(&self, memory_id: &str, content: &str, entity_id: &str) -> Result<()> {
         let conn = self.get_conn()?;
         conn.execute(
-            "INSERT OR REPLACE INTO fts_memories (rowid, memory_id, entity_id, content) VALUES (?1, ?2, ?3, ?4)",
-            params![fts_rowid(memory_id), memory_id, entity_id, content],
+            "INSERT OR REPLACE INTO fts_memories (rowid, memory_id, entity_id, entity_tok, content) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                fts_rowid(memory_id),
+                memory_id,
+                entity_id,
+                fts_entity_tok(entity_id),
+                content
+            ],
         )?;
         Ok(())
     }
@@ -2701,10 +2746,17 @@ impl TenantStore {
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         {
             let mut stmt = tx.prepare_cached(
-                "INSERT OR REPLACE INTO fts_memories (rowid, memory_id, entity_id, content) VALUES (?1, ?2, ?3, ?4)",
+                "INSERT OR REPLACE INTO fts_memories (rowid, memory_id, entity_id, entity_tok, content) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
             )?;
             for (memory_id, entity_id, content) in batch {
-                stmt.execute(params![fts_rowid(memory_id), memory_id, entity_id, content])?;
+                stmt.execute(params![
+                    fts_rowid(memory_id),
+                    memory_id,
+                    entity_id,
+                    fts_entity_tok(entity_id),
+                    content
+                ])?;
             }
         }
         tx.commit()?;
@@ -4031,5 +4083,75 @@ mod tests {
             .unwrap();
         let scores = store.get_link_cluster_scores("a", 1).unwrap();
         assert!((scores["b"] - 0.6).abs() < 1e-6, "got {:?}", scores);
+    }
+
+    fn fts_store(dir: &tempfile::TempDir) -> TenantStore {
+        let store = TenantStore::new(&dir.path().join("t.db")).unwrap();
+        // Two entities with the same words, so a leaking entity filter shows
+        // up as another entity's rows rather than as a missing result.
+        let batch: Vec<(String, String, String)> = vec![
+            ("alice::s1::0", "alice", "the garden plan for spring"),
+            ("alice::s1::1", "alice", "a recipe for bread"),
+            ("bob::s1::0", "bob", "the garden plan for spring"),
+            ("bob::s1::1", "bob", "a recipe for bread"),
+        ]
+        .into_iter()
+        .map(|(m, e, c)| (m.to_string(), e.to_string(), c.to_string()))
+        .collect();
+        store.fts_index_batch(&batch).unwrap();
+        store
+    }
+
+    #[test]
+    fn fts_search_is_scoped_to_one_entity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = fts_store(&dir);
+        let hits = store.fts_search("garden plan", 10, Some("alice")).unwrap();
+        assert!(!hits.is_empty(), "expected alice's rows");
+        assert!(
+            hits.iter().all(|(id, _)| id.starts_with("alice::")),
+            "entity filter leaked: {hits:?}"
+        );
+        // Unscoped still spans both entities.
+        let all = store.fts_search("garden plan", 10, None).unwrap();
+        assert!(all.iter().any(|(id, _)| id.starts_with("bob::")));
+    }
+
+    #[test]
+    fn entity_token_cannot_be_matched_by_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TenantStore::new(&dir.path().join("t.db")).unwrap();
+        let tok = fts_entity_tok("alice");
+        // A memory whose *text* is another entity's token must not be
+        // returned when searching that entity.
+        store.fts_index_text("bob::s1::0", &tok, "bob").unwrap();
+        store.fts_index_text("alice::s1::0", "unrelated words", "alice").unwrap();
+        let hits = store.fts_search(&tok, 10, Some("alice")).unwrap();
+        assert!(
+            hits.iter().all(|(id, _)| id.starts_with("alice::")),
+            "content matched an entity token: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn quoted_query_does_not_break_the_match_expression() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = fts_store(&dir);
+        // `a"b` cleans to two one-character terms, so both are dropped and
+        // the raw-word fallback runs. That fallback used to wrap the word in
+        // quotes without escaping, leaving an odd number of quotes: FTS5
+        // rejects the expression and the caller's `unwrap_or_default` turns
+        // the error into a silently empty lane.
+        let hits = store.fts_search("a\"b", 10, Some("alice"));
+        assert!(hits.is_ok(), "odd-quote query errored: {:?}", hits.err());
+    }
+
+    #[test]
+    fn entity_tokens_are_single_tokens_and_distinct() {
+        assert_eq!(fts_entity_tok("ab"), "e6162");
+        assert_ne!(fts_entity_tok("alice"), fts_entity_tok("bob"));
+        // Ids that tokenize differently must not collapse to one token.
+        assert_ne!(fts_entity_tok("a b"), fts_entity_tok("ab"));
+        assert!(fts_entity_tok("a b/c-d").chars().all(|c| c.is_ascii_alphanumeric()));
     }
 }
