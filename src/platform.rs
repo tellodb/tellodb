@@ -10,6 +10,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const MIN_USERNAME_LENGTH: usize = 3;
 const MIN_PASSWORD_LENGTH: usize = 8;
+const MAX_USERNAME_LENGTH: usize = 64;
+const MAX_PASSWORD_LENGTH: usize = 4096;
 const USER_ID_RANDOM_LENGTH: usize = 20;
 const TOKEN_RANDOM_LENGTH: usize = 48;
 const API_KEY_PREFIX_LENGTH: usize = 12;
@@ -171,8 +173,14 @@ impl PlatformStore {
 
     pub fn create_user(&self, username: &str, password: &str) -> Result<PublicUser> {
         let username = username.trim().to_ascii_lowercase();
+        if username.len() > MAX_USERNAME_LENGTH {
+            return Err(anyhow!("username must be at most {} bytes", MAX_USERNAME_LENGTH));
+        }
         if username.is_empty() || username.len() < MIN_USERNAME_LENGTH {
             return Err(anyhow!("username must be at least {} characters", MIN_USERNAME_LENGTH));
+        }
+        if password.len() > MAX_PASSWORD_LENGTH {
+            return Err(anyhow!("password must be at most {} bytes", MAX_PASSWORD_LENGTH));
         }
         if password.len() < MIN_PASSWORD_LENGTH {
             return Err(anyhow!("password must be at least {} characters", MIN_PASSWORD_LENGTH));
@@ -201,6 +209,12 @@ impl PlatformStore {
 
     pub fn login(&self, username: &str, password: &str) -> Result<PublicUser> {
         let username = username.trim().to_ascii_lowercase();
+        if username.len() > MAX_USERNAME_LENGTH {
+            return Err(anyhow!("username must be at most {} bytes", MAX_USERNAME_LENGTH));
+        }
+        if password.len() > MAX_PASSWORD_LENGTH {
+            return Err(anyhow!("password must be at most {} bytes", MAX_PASSWORD_LENGTH));
+        }
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare("SELECT user_id, username, password_hash, created_at_ms FROM users WHERE username = ?1")
             .context("failed to prepare login statement")?;
@@ -1001,6 +1015,30 @@ mod tests {
         let (store, _tmp) = make_store();
         let err = store.create_user("alice", "short").unwrap_err();
         assert!(err.to_string().contains("at least 8 characters"));
+    }
+
+    #[test]
+    fn create_user_rejects_oversized_credentials() {
+        let (store, _tmp) = make_store();
+        let long_username = "a".repeat(MAX_USERNAME_LENGTH + 1);
+        let err = store.create_user(&long_username, "password123").unwrap_err();
+        assert!(err.to_string().contains("at most 64 bytes"));
+
+        let long_password = "p".repeat(MAX_PASSWORD_LENGTH + 1);
+        let err = store.create_user("alice", &long_password).unwrap_err();
+        assert!(err.to_string().contains("at most 4096 bytes"));
+    }
+
+    #[test]
+    fn login_rejects_oversized_credentials() {
+        let (store, _tmp) = make_store();
+        let long_username = "a".repeat(MAX_USERNAME_LENGTH + 1);
+        let err = store.login(&long_username, "password123").unwrap_err();
+        assert!(err.to_string().contains("at most 64 bytes"));
+
+        let long_password = "p".repeat(MAX_PASSWORD_LENGTH + 1);
+        let err = store.login("alice", &long_password).unwrap_err();
+        assert!(err.to_string().contains("at most 4096 bytes"));
     }
 
     #[test]

@@ -243,6 +243,8 @@ const RPS_PER_KEY: f64 = 20.0;
 const BURST_PER_KEY: f64 = 80.0;
 const RPS_PER_ADDR: f64 = 50.0;
 const BURST_PER_ADDR: f64 = 200.0;
+const RPS_PER_AUTH: f64 = 0.1;
+const BURST_PER_AUTH: f64 = 5.0;
 /// Prune idle buckets once the map holds this many entries.
 const PRUNE_THRESHOLD: usize = 4096;
 
@@ -367,6 +369,28 @@ pub fn check_rate_limit(
     }
 }
 
+pub fn check_auth_rate_limit(
+    state: &EngineState,
+    headers: &HeaderMap,
+    peer: Option<std::net::SocketAddr>,
+) -> Result<(), StatusCode> {
+    check_auth_rate_limit_with_limiter(&state.rate_limiter, headers, peer)
+}
+
+fn check_auth_rate_limit_with_limiter(
+    rate_limiter: &RateLimiter,
+    headers: &HeaderMap,
+    peer: Option<std::net::SocketAddr>,
+) -> Result<(), StatusCode> {
+    let addr = client_address(headers, peer);
+    if rate_limiter.allow_with(&format!("auth:{addr}"), RPS_PER_AUTH, BURST_PER_AUTH) {
+        Ok(())
+    } else {
+        tracing::warn!(addr = %addr, "authentication rate limit exceeded");
+        Err(StatusCode::TOO_MANY_REQUESTS)
+    }
+}
+
 pub fn record_usage_for_principal(
     state: &EngineState,
     principal: &RequestPrincipal,
@@ -425,6 +449,21 @@ mod tests {
         let limiter = RateLimiter::new();
         let allowed = (0..200).filter(|_| limiter.allow("key:k")).count();
         assert!((80..=82).contains(&allowed), "allowed {allowed}");
+    }
+
+    #[test]
+    fn auth_rate_limit_rejects_sixth_rapid_attempt() {
+        let rate_limiter = RateLimiter::new();
+        let headers = HeaderMap::new();
+        let peer = Some("127.0.0.1:8080".parse().unwrap());
+
+        for _ in 0..5 {
+            assert_eq!(check_auth_rate_limit_with_limiter(&rate_limiter, &headers, peer), Ok(()));
+        }
+        assert_eq!(
+            check_auth_rate_limit_with_limiter(&rate_limiter, &headers, peer),
+            Err(StatusCode::TOO_MANY_REQUESTS)
+        );
     }
 
     #[test]

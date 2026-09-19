@@ -1,11 +1,11 @@
-use axum::http::HeaderMap;
 use axum::{
-    extract::{Json, Path, State},
-    http::StatusCode,
+    extract::{ConnectInfo, Json, Path, State},
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
+    Extension,
 };
 
-use crate::api::auth::session_user_from_headers;
+use crate::api::auth::{self, session_user_from_headers};
 use crate::api::types::*;
 use crate::api::EngineState;
 
@@ -13,15 +13,22 @@ const SESSION_TTL_SECONDS: u64 = 60 * 60 * 24 * 30;
 
 pub async fn platform_signup_handler(
     State(state): State<EngineState>,
+    headers: HeaderMap,
+    peer: Option<Extension<ConnectInfo<std::net::SocketAddr>>>,
     Json(payload): Json<PlatformSignupPayload>,
 ) -> Result<impl IntoResponse, StatusCode> {
+    auth::check_auth_rate_limit(
+        &state,
+        &headers,
+        peer.map(|Extension(ConnectInfo(address))| address),
+    )?;
     let user = state
         .platform
         .create_user(payload.username.as_str(), payload.password.as_str())
         .map_err(|err| {
             let msg = err.to_string();
             tracing::warn!("platform signup failed: {}", msg);
-            if msg.contains("exists") || msg.contains("at least") {
+            if msg.contains("exists") || msg.contains("at least") || msg.contains("at most") {
                 StatusCode::BAD_REQUEST
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -37,13 +44,22 @@ pub async fn platform_signup_handler(
 
 pub async fn platform_login_handler(
     State(state): State<EngineState>,
+    headers: HeaderMap,
+    peer: Option<Extension<ConnectInfo<std::net::SocketAddr>>>,
     Json(payload): Json<PlatformLoginPayload>,
 ) -> Result<impl IntoResponse, StatusCode> {
+    auth::check_auth_rate_limit(
+        &state,
+        &headers,
+        peer.map(|Extension(ConnectInfo(address))| address),
+    )?;
     let user = state.platform.login(payload.username.as_str(), payload.password.as_str()).map_err(
         |err| {
             let msg = err.to_string();
             if msg.contains("invalid credentials") {
                 StatusCode::UNAUTHORIZED
+            } else if msg.contains("at most") {
+                StatusCode::BAD_REQUEST
             } else {
                 tracing::warn!("platform login failed: {}", msg);
                 StatusCode::INTERNAL_SERVER_ERROR
