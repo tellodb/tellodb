@@ -7,7 +7,7 @@ pub struct RankedItem {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 #[non_exhaustive]
 pub struct RankingConfig {
     /// Weight for lexical (FTS/bm25) similarity score in final ranking. Default: 0.05
@@ -20,24 +20,12 @@ pub struct RankingConfig {
     pub card_boost: f32,
     /// Additive boost for results whose source session matches a routed session. Default: 0.05
     pub session_boost: f32,
-    /// Weight for the session-router ANN similarity score. Default: 0.12
-    pub session_ann_weight: f32,
-    /// Weight for temporal event search hit scores. Default: 0.18
-    pub event_weight: f32,
-    /// Weight for shadow question search hit scores. Default: 0.12
-    pub shadow_weight: f32,
-    /// Weight for facet posting match coverage. Default: 0.08
-    pub facet_weight: f32,
-    /// Weight for profile fact match coverage. Default: 0.10
-    pub profile_weight: f32,
-    /// Weight for graph traversal proximity score. Default: 1.0
-    pub graph_weight: f32,
-    /// Weight for evidence density (how many distinct supporting sources). Default: 0.03
-    pub evidence_density_weight: f32,
-    /// Penalty subtracted from score when a card is stale (not latest). Default: -0.08
-    pub stale_penalty: f32,
-    /// Penalty subtracted when a result contradicts an existing fact. Default: -0.10
-    pub contradiction_penalty: f32,
+    /// Multiplier for card weight on decomposed or cross-entity queries. Default: 1.3
+    pub card_boost_strong: f32,
+    /// Multiplier for card weight on temporal aggregation or inference queries. Default: 1.15
+    pub card_boost_medium: f32,
+    /// Multiplier for routed-session boosts contributed by high-coverage cards. Default: 1.5
+    pub session_boost_routed: f32,
     /// Threshold for difference between top two candidates. Default: 0.08
     pub ambiguity_delta_threshold: Option<f32>,
 }
@@ -50,15 +38,9 @@ impl Default for RankingConfig {
             temporal_weight: 0.05,
             card_boost: 1.15,
             session_boost: 0.05,
-            session_ann_weight: 0.12,
-            event_weight: 0.18,
-            shadow_weight: 0.12,
-            facet_weight: 0.08,
-            profile_weight: 0.10,
-            graph_weight: 1.0,
-            evidence_density_weight: 0.03,
-            stale_penalty: -0.08,
-            contradiction_penalty: -0.10,
+            card_boost_strong: 1.3,
+            card_boost_medium: 1.15,
+            session_boost_routed: 1.5,
             ambiguity_delta_threshold: Some(0.08),
         }
     }
@@ -511,4 +493,15 @@ pub struct StorageStatsResponse {
     /// Bytes in pages holding data (excludes the free list left by deletes).
     pub used_bytes: usize,
     pub storage_bytes: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RankingConfig;
+
+    #[test]
+    fn ranking_config_rejects_removed_keys() {
+        let result = serde_json::from_str::<RankingConfig>(r#"{"graph_weight":1.0}"#);
+        assert!(result.is_err());
+    }
 }

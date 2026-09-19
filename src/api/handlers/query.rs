@@ -2029,8 +2029,9 @@ fn retrieval_cards(s: &mut QueryPipelineState) {
             if !hit.source_session_id.is_empty()
                 && hit.lexical_hits + hit.temporal_hits + hit.entity_hits >= 2
             {
-                *s.session_route_scores.entry(hit.source_session_id).or_insert(0.0) +=
-                    hit.score * s.state.ranking_config.session_boost * 1.5;
+                *s.session_route_scores.entry(hit.source_session_id).or_insert(0.0) += hit.score
+                    * s.state.ranking_config.session_boost
+                    * s.state.ranking_config.session_boost_routed;
             }
         }
     }
@@ -2243,10 +2244,10 @@ fn fusion_phase(s: &mut QueryPipelineState) {
     ranked_sources.extend(s.fts_ranked_lists.clone());
     if !s.card_ranked_items.is_empty() {
         let card_weight = if s.plan.needs_decomposition || s.plan.cross_entity {
-            s.state.ranking_config.card_boost * 1.3
+            s.state.ranking_config.card_boost * s.state.ranking_config.card_boost_strong
         } else if matches!(s.plan.intent, QueryIntent::TemporalAggregation | QueryIntent::Inference)
         {
-            s.state.ranking_config.card_boost * 1.15
+            s.state.ranking_config.card_boost * s.state.ranking_config.card_boost_medium
         } else {
             s.state.ranking_config.card_boost
         };

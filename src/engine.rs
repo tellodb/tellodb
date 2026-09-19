@@ -81,7 +81,7 @@ pub async fn build_state(paths: &RuntimePaths, auth: api::AuthConfig) -> Result<
 
     let mut ranking_config = api::types::RankingConfig::default();
     if let Ok(config_data) = std::fs::read_to_string(paths.root().join("ranking_config.json")) {
-        match serde_json::from_str(&config_data) {
+        match serde_json::from_str::<api::types::RankingConfig>(&config_data) {
             Ok(parsed) => {
                 info!("Loaded ranking config from ranking_config.json");
                 ranking_config = parsed;
