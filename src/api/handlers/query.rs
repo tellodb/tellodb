@@ -2,7 +2,7 @@ use crate::api::auth::{
     authorize_request, principal_namespace_prefix, principal_user_id, record_usage_for_principal,
     scope_entity_id,
 };
-use crate::api::planner::*;
+use crate::api::plan::*;
 use crate::api::types::RankedItem;
 use crate::api::types::{
     AnalyticsQueryPayload, AnalyticsQueryResult, BucketedResult, EvidenceCard, GraphExportPayload,

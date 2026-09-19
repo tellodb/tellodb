@@ -178,3 +178,261 @@ pub fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
     let m = mp + if mp < 10 { 3 } else { -9 };
     ((y + if m <= 2 { 1 } else { 0 }) as i32, m as u32, d as u32)
 }
+#[cfg(test)]
+mod moved_tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_date_to_epoch_ms_iso_date() {
+        let ms = parse_date_to_epoch_ms("2024-01-15", 0).unwrap();
+        let (y, m, d) = civil_from_epoch_ms(ms);
+        assert_eq!(y, 2024);
+        assert_eq!(m, 1);
+        assert_eq!(d, 15);
+    }
+
+    #[test]
+    fn test_parse_date_to_epoch_ms_month_day_year() {
+        let ms = parse_date_to_epoch_ms("January 15 2024", 0).unwrap();
+        let (y, m, d) = civil_from_epoch_ms(ms);
+        assert_eq!(y, 2024);
+        assert_eq!(m, 1);
+        assert_eq!(d, 15);
+    }
+
+    #[test]
+    fn test_parse_date_to_epoch_ms_year_only() {
+        let ref_ms = epoch_ms_from_ymd(2024, 6, 15).unwrap();
+        let ms = parse_date_to_epoch_ms("2025", ref_ms).unwrap();
+        let (y, m, d) = civil_from_epoch_ms(ms);
+        assert_eq!(y, 2025);
+        assert_eq!(m, 1);
+        assert_eq!(d, 1);
+    }
+
+    #[test]
+    fn test_parse_date_to_epoch_ms_may_disambiguation() {
+        let ref_ms = epoch_ms_from_ymd(2024, 1, 1).unwrap();
+        let ms = parse_date_to_epoch_ms("May 2024", ref_ms);
+        assert!(ms.is_some(), "May with year should succeed");
+        let (y, m, d) = civil_from_epoch_ms(ms.unwrap());
+        assert_eq!((y, m, d), (2024, 5, 1));
+    }
+
+    #[test]
+    fn test_parse_date_to_epoch_ms_may_with_day() {
+        let ref_ms = epoch_ms_from_ymd(2024, 1, 1).unwrap();
+        let ms = parse_date_to_epoch_ms("May 15 2024", ref_ms).unwrap();
+        let (y, m, d) = civil_from_epoch_ms(ms);
+        assert_eq!(y, 2024);
+        assert_eq!(m, 5);
+        assert_eq!(d, 15);
+    }
+
+    #[test]
+    fn test_parse_date_to_epoch_ms_day_before_month() {
+        let ref_ms = epoch_ms_from_ymd(2024, 1, 1).unwrap();
+        let ms = parse_date_to_epoch_ms("15 January 2024", ref_ms).unwrap();
+        let (y, m, d) = civil_from_epoch_ms(ms);
+        assert_eq!(y, 2024);
+        assert_eq!(m, 1);
+        assert_eq!(d, 15);
+    }
+
+    #[test]
+    fn test_parse_date_to_epoch_ms_invalid_text() {
+        assert_eq!(parse_date_to_epoch_ms("not a date", 0), None);
+    }
+
+    #[test]
+    fn test_parse_date_to_epoch_ms_iso_with_punctuation() {
+        let ms = parse_date_to_epoch_ms("date: 2024-03-15!", 0).unwrap();
+        let (y, m, d) = civil_from_epoch_ms(ms);
+        assert_eq!(y, 2024);
+        assert_eq!(m, 3);
+        assert_eq!(d, 15);
+    }
+
+    #[test]
+    fn test_parse_date_to_epoch_ms_short_month() {
+        let ref_ms = epoch_ms_from_ymd(2024, 1, 1).unwrap();
+        let ms = parse_date_to_epoch_ms("Jan 15 2024", ref_ms).unwrap();
+        let (_y, m, d) = civil_from_epoch_ms(ms);
+        assert_eq!(m, 1);
+        assert_eq!(d, 15);
+    }
+
+    #[test]
+    fn test_parse_date_to_epoch_ms_year_out_of_range() {
+        assert_eq!(parse_date_to_epoch_ms("1899-01-01", 0), None);
+        assert_eq!(parse_date_to_epoch_ms("2201-01-01", 0), None);
+    }
+
+    #[test]
+    fn test_extract_event_time_ms_tomorrow() {
+        let doc_ms = epoch_ms_from_ymd(2024, 1, 1).unwrap();
+        let ms = extract_event_time_ms("see you tomorrow", doc_ms).unwrap();
+        let (y, m, d) = civil_from_epoch_ms(ms);
+        assert_eq!((y, m, d), (2024, 1, 2));
+    }
+
+    #[test]
+    fn test_extract_event_time_ms_yesterday() {
+        let doc_ms = epoch_ms_from_ymd(2024, 1, 15).unwrap();
+        let ms = extract_event_time_ms("it happened yesterday", doc_ms).unwrap();
+        let (y, m, d) = civil_from_epoch_ms(ms);
+        assert_eq!((y, m, d), (2024, 1, 14));
+    }
+
+    #[test]
+    fn test_extract_event_time_ms_next_week() {
+        let doc_ms = epoch_ms_from_ymd(2024, 1, 1).unwrap();
+        let ms = extract_event_time_ms("next week", doc_ms).unwrap();
+        let (y, m, d) = civil_from_epoch_ms(ms);
+        assert_eq!((y, m, d), (2024, 1, 8));
+    }
+
+    #[test]
+    fn test_extract_event_time_ms_last_week() {
+        let doc_ms = epoch_ms_from_ymd(2024, 1, 15).unwrap();
+        let ms = extract_event_time_ms("last week", doc_ms).unwrap();
+        let (y, m, d) = civil_from_epoch_ms(ms);
+        assert_eq!((y, m, d), (2024, 1, 8));
+    }
+
+    #[test]
+    fn test_extract_event_time_ms_today() {
+        let doc_ms = epoch_ms_from_ymd(2024, 6, 15).unwrap();
+        let ms = extract_event_time_ms("today", doc_ms).unwrap();
+        assert_eq!(ms, doc_ms);
+    }
+
+    #[test]
+    fn test_extract_event_time_ms_next_month() {
+        let doc_ms = epoch_ms_from_ymd(2024, 1, 1).unwrap();
+        let ms = extract_event_time_ms("next month", doc_ms).unwrap();
+        let (y, m, d) = civil_from_epoch_ms(ms);
+        assert_eq!((y, m, d), (2024, 1, 31));
+    }
+
+    #[test]
+    fn test_extract_event_time_ms_absolute_date_overrides_relative() {
+        let doc_ms = epoch_ms_from_ymd(2024, 1, 1).unwrap();
+        let ms = extract_event_time_ms("meeting on 2024-06-15", doc_ms).unwrap();
+        let (y, m, d) = civil_from_epoch_ms(ms);
+        assert_eq!((y, m, d), (2024, 6, 15));
+    }
+
+    #[test]
+    fn test_extract_event_time_ms_no_match() {
+        assert_eq!(extract_event_time_ms("no temporal info", 0), None);
+    }
+
+    #[test]
+    fn test_extract_event_time_ms_past_week() {
+        let doc_ms = epoch_ms_from_ymd(2024, 3, 15).unwrap();
+        let ms = extract_event_time_ms("past week", doc_ms).unwrap();
+        let (y, m, d) = civil_from_epoch_ms(ms);
+        assert_eq!((y, m, d), (2024, 3, 8));
+    }
+
+    #[test]
+    fn test_extract_event_time_ms_past_month() {
+        let doc_ms = epoch_ms_from_ymd(2024, 3, 15).unwrap();
+        let ms = extract_event_time_ms("past month", doc_ms).unwrap();
+        let (y, m, d) = civil_from_epoch_ms(ms);
+        assert_eq!((y, m, d), (2024, 2, 14));
+    }
+
+    #[test]
+    fn test_extract_document_time_ms_from_header() {
+        let text = "[Session Date: 2024-06-15]\ncontent";
+        let ms = extract_document_time_ms(text, 0);
+        let (y, m, d) = civil_from_epoch_ms(ms);
+        assert_eq!((y, m, d), (2024, 6, 15));
+    }
+
+    #[test]
+    fn test_extract_document_time_ms_fallback() {
+        let text = "no header here";
+        let ms = extract_document_time_ms(text, 5000000);
+        assert_eq!(ms, 5000000);
+    }
+
+    #[test]
+    fn test_epoch_ms_roundtrip() {
+        let ms = epoch_ms_from_ymd(2024, 6, 15).unwrap();
+        let (y, m, d) = civil_from_epoch_ms(ms);
+        assert_eq!((y, m, d), (2024, 6, 15));
+    }
+
+    #[test]
+    fn test_epoch_ms_from_ymd_invalid_month() {
+        assert_eq!(epoch_ms_from_ymd(2024, 0, 1), None);
+        assert_eq!(epoch_ms_from_ymd(2024, 13, 1), None);
+    }
+
+    #[test]
+    fn test_epoch_ms_from_ymd_invalid_day() {
+        assert_eq!(epoch_ms_from_ymd(2024, 1, 0), None);
+        assert_eq!(epoch_ms_from_ymd(2024, 1, 32), None);
+    }
+
+    #[test]
+    fn test_parse_iso_date_valid() {
+        assert_eq!(parse_iso_date("2024-01-15"), Some((2024, 1, 15)));
+    }
+
+    #[test]
+    fn test_parse_iso_date_invalid_format() {
+        assert_eq!(parse_iso_date("2024/01/15"), None);
+    }
+
+    #[test]
+    fn test_parse_iso_date_out_of_range() {
+        assert_eq!(parse_iso_date("1800-01-01"), None);
+    }
+
+    #[test]
+    fn test_parse_iso_date_not_enough_parts() {
+        assert_eq!(parse_iso_date("2024-01"), None);
+    }
+
+    #[test]
+    fn test_month_number_full_names() {
+        assert_eq!(month_number("january"), Some(1));
+        assert_eq!(month_number("february"), Some(2));
+        assert_eq!(month_number("december"), Some(12));
+    }
+
+    #[test]
+    fn test_month_number_abbreviations() {
+        assert_eq!(month_number("jan"), Some(1));
+        assert_eq!(month_number("feb"), Some(2));
+        assert_eq!(month_number("dec"), Some(12));
+    }
+
+    #[test]
+    fn test_month_number_sept_variant() {
+        assert_eq!(month_number("sept"), Some(9));
+        assert_eq!(month_number("sep"), Some(9));
+    }
+
+    #[test]
+    fn test_month_number_invalid() {
+        assert_eq!(month_number("xyz"), None);
+    }
+
+    #[test]
+    fn test_civil_date_roundtrip() {
+        let days = days_from_civil(2024, 6, 15);
+        let (y, m, d) = civil_from_days(days);
+        assert_eq!((y, m, d), (2024, 6, 15));
+    }
+
+    #[test]
+    fn test_civil_date_epoch() {
+        let days = days_from_civil(1970, 1, 1);
+        assert_eq!(days, 0);
+    }
+}

@@ -125,6 +125,72 @@ pub fn is_semantic_duplicate(
 }
 
 #[cfg(test)]
+mod moved_tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_aliases_from_text_short_name_prefix() {
+        let entities = vec!["Melanie".to_string()];
+        let text = "I saw Mel at the store";
+        let aliases = extract_aliases_from_text(text, &entities);
+        assert!(aliases.iter().any(|(a, c)| a == "mel" && c == "Melanie"));
+    }
+
+    #[test]
+    fn test_extract_aliases_from_text_explicit_nickname() {
+        let entities = vec!["Alice".to_string()];
+        let text = "people call me Ali and Alice is my friend";
+        let aliases = extract_aliases_from_text(text, &entities);
+        assert!(aliases.iter().any(|(a, c)| a == "ali" && c == "Alice"));
+    }
+
+    #[test]
+    fn test_extract_aliases_from_text_no_match() {
+        let entities = vec!["Bob".to_string()];
+        let text = "I went to the store";
+        let aliases = extract_aliases_from_text(text, &entities);
+        assert!(aliases.is_empty());
+    }
+
+    #[test]
+    fn test_extract_aliases_from_text_no_entities() {
+        let entities: Vec<String> = vec![];
+        let text = "call me Nick";
+        let aliases = extract_aliases_from_text(text, &entities);
+        assert!(aliases.is_empty());
+    }
+
+    #[test]
+    fn test_extract_aliases_from_text_short_entity_less_than_five() {
+        let entities = vec!["Bob".to_string()];
+        let text = "Bob is here";
+        let aliases = extract_aliases_from_text(text, &entities);
+        assert!(aliases.is_empty(), "entity length < 5 -> no prefix extraction");
+    }
+
+    #[test]
+    fn test_extract_aliases_from_text_relationship_label() {
+        let entities = vec!["Bob".to_string()];
+        let text = "hubby Bob is great";
+        let aliases = extract_aliases_from_text(text, &entities);
+        assert!(aliases.iter().any(|(a, _)| a == "hubby"));
+    }
+
+    #[test]
+    fn test_extract_aliases_from_text_too_many_prefix_collisions() {
+        let entities = vec![
+            "Melanie".to_string(),
+            "Melissa".to_string(),
+            "Melody".to_string(),
+            "Melvin".to_string(),
+        ];
+        let text = "Mel went to the store";
+        let aliases = extract_aliases_from_text(text, &entities);
+        assert!(aliases.is_empty(), "too many collisions should suppress");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

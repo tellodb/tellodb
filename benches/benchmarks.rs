@@ -6,7 +6,7 @@ use std::time::Duration;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use tempfile::tempdir;
 
-use tellodb::api::ingest_utils::{infer_fact_key, split_atomic_claims};
+use tellodb::api::ingest::fact::{infer_fact_key, split_atomic_claims};
 use tellodb::retrieval::rrf_fuse;
 use tellodb::storage::TenantStore;
 use tellodb::vector_index::{Quantization, VectorConfig, VectorIndex};

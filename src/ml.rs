@@ -1,4 +1,4 @@
-use crate::api::planner::QueryIntent;
+use crate::api::plan::QueryIntent;
 use crate::semantic::SemanticInference;
 use anyhow::Result;
 use std::sync::Arc;

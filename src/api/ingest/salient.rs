@@ -148,3 +148,67 @@ pub fn truncate_for_companion(text: &str, max_chars: usize) -> String {
         normalized.chars().take(max_chars).collect::<String>().trim().to_string()
     }
 }
+#[cfg(test)]
+mod moved_tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_named_phrases_basic() {
+        let lines = vec!["Alice went to New York".to_string()];
+        let phrases = extract_named_phrases(&lines);
+        assert!(phrases.contains(&"Alice".to_string()));
+        assert!(phrases.contains(&"New York".to_string()));
+    }
+
+    #[test]
+    fn test_extract_named_phrases_skips_lowercase() {
+        let lines = vec!["the cat sat on the mat".to_string()];
+        let phrases = extract_named_phrases(&lines);
+        assert!(phrases.is_empty());
+    }
+
+    #[test]
+    fn test_extract_named_phrases_empty_input() {
+        assert!(extract_named_phrases(&[]).is_empty());
+    }
+
+    #[test]
+    fn test_extract_salient_terms_returns_top_terms() {
+        let text = "Alice likes cooking. Alice loves baking. Alice enjoys hiking.";
+        let terms = extract_salient_terms(text, 3);
+        assert!(!terms.is_empty());
+        assert!(terms.len() <= 3);
+    }
+
+    #[test]
+    fn test_extract_salient_terms_empty_text() {
+        let terms = extract_salient_terms("", 5);
+        assert!(terms.is_empty());
+    }
+
+    #[test]
+    fn test_extract_salient_terms_filters_short() {
+        let text = "a an the";
+        let terms = extract_salient_terms(text, 5);
+        assert!(terms.is_empty());
+    }
+
+    #[test]
+    fn test_truncate_for_companion_under_limit() {
+        let result = truncate_for_companion("short text", 100);
+        assert_eq!(result, "short text");
+    }
+
+    #[test]
+    fn test_truncate_for_companion_over_limit() {
+        let long = "A".repeat(300);
+        let result = truncate_for_companion(&long, 100);
+        assert_eq!(result.len(), 100);
+    }
+
+    #[test]
+    fn test_truncate_for_companion_empty() {
+        let result = truncate_for_companion("", 100);
+        assert_eq!(result, "");
+    }
+}

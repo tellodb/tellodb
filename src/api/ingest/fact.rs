@@ -474,3 +474,381 @@ pub fn extract_retrospective_reference_query(text: &str) -> Option<String> {
 
     None
 }
+#[cfg(test)]
+mod moved_tests {
+    use super::*;
+
+    #[test]
+    fn test_infer_fact_key_marriage() {
+        assert_eq!(infer_fact_key("I am married"), Some("relationship_status".to_string()));
+    }
+
+    #[test]
+    fn test_infer_fact_key_children() {
+        assert_eq!(infer_fact_key("I have two children"), Some("children_count".to_string()));
+    }
+
+    #[test]
+    fn test_infer_fact_key_nickname() {
+        assert_eq!(infer_fact_key("my nickname is Bob"), Some("nickname".to_string()));
+    }
+
+    #[test]
+    fn test_infer_fact_key_hobbies() {
+        assert_eq!(infer_fact_key("my hobbies include reading"), Some("hobbies".to_string()));
+    }
+
+    #[test]
+    fn test_infer_fact_key_purchase() {
+        assert_eq!(infer_fact_key("I bought a car"), Some("purchase".to_string()));
+    }
+
+    #[test]
+    fn test_infer_fact_key_recipe() {
+        assert_eq!(infer_fact_key("I found a great recipe"), Some("recipe".to_string()));
+    }
+
+    #[test]
+    fn test_infer_fact_key_research() {
+        assert_eq!(infer_fact_key("I research AI"), Some("research_topic".to_string()));
+    }
+
+    #[test]
+    fn test_infer_fact_key_certificate() {
+        assert_eq!(infer_fact_key("I got a certificate"), Some("certificate".to_string()));
+    }
+
+    #[test]
+    fn test_infer_fact_key_favorite_team() {
+        assert_eq!(
+            infer_fact_key("my favorite team is the Lakers"),
+            Some("favorite_team".to_string())
+        );
+    }
+
+    #[test]
+    fn test_infer_fact_key_degree() {
+        assert_eq!(infer_fact_key("graduated with a degree"), Some("degree".to_string()));
+    }
+
+    #[test]
+    fn test_infer_fact_key_previous_last_name() {
+        use crate::heuristics::{with_profile, Profile};
+        // Keyed on a benchmark question, so it fires only under the tuned
+        // profile and the generic profile must fall through to a generic key
+        // or to none at all.
+        with_profile(Profile::LegacyTuned, || {
+            assert_eq!(
+                infer_fact_key("my old name is Smith"),
+                Some("previous_last_name".to_string())
+            );
+        });
+        with_profile(Profile::Generic, || {
+            assert_ne!(
+                infer_fact_key("my old name is Smith"),
+                Some("previous_last_name".to_string())
+            );
+        });
+    }
+
+    #[test]
+    fn test_infer_fact_key_previous_occupation() {
+        assert_eq!(
+            infer_fact_key("previous occupation was teacher"),
+            Some("previous_occupation".to_string())
+        );
+    }
+
+    #[test]
+    fn test_infer_fact_key_commute_duration() {
+        use crate::heuristics::{with_profile, Profile};
+        // Keyed on a benchmark question, so it fires only under the tuned
+        // profile and the generic profile must fall through to a generic key
+        // or to none at all.
+        with_profile(Profile::LegacyTuned, || {
+            assert_eq!(
+                infer_fact_key("my commute takes 30 minutes"),
+                Some("commute_duration".to_string())
+            );
+        });
+        with_profile(Profile::Generic, || {
+            assert_ne!(
+                infer_fact_key("my commute takes 30 minutes"),
+                Some("commute_duration".to_string())
+            );
+        });
+    }
+
+    #[test]
+    fn test_infer_fact_key_internet_plan() {
+        use crate::heuristics::{with_profile, Profile};
+        // Keyed on a benchmark question, so it fires only under the tuned
+        // profile and the generic profile must fall through to a generic key
+        // or to none at all.
+        with_profile(Profile::LegacyTuned, || {
+            assert_eq!(
+                infer_fact_key("I upgraded my internet plan to 500 mbps"),
+                Some("internet_plan_speed".to_string())
+            );
+        });
+        with_profile(Profile::Generic, || {
+            assert_ne!(
+                infer_fact_key("I upgraded my internet plan to 500 mbps"),
+                Some("internet_plan_speed".to_string())
+            );
+        });
+    }
+
+    #[test]
+    fn test_infer_fact_key_spotify_playlist() {
+        use crate::heuristics::{with_profile, Profile};
+        // Keyed on a benchmark question, so it fires only under the tuned
+        // profile and the generic profile must fall through to a generic key
+        // or to none at all.
+        with_profile(Profile::LegacyTuned, || {
+            assert_eq!(
+                infer_fact_key("I created a spotify playlist named vibes"),
+                Some("spotify_playlist_name".to_string())
+            );
+        });
+        with_profile(Profile::Generic, || {
+            assert_ne!(
+                infer_fact_key("I created a spotify playlist named vibes"),
+                Some("spotify_playlist_name".to_string())
+            );
+        });
+    }
+
+    #[test]
+    fn test_infer_fact_key_called_triggers_nickname() {
+        assert_eq!(infer_fact_key("people called me Bob"), Some("nickname".to_string()));
+    }
+
+    #[test]
+    fn test_infer_fact_key_martial_arts() {
+        assert_eq!(infer_fact_key("I practice karate"), Some("martial_arts".to_string()));
+    }
+
+    #[test]
+    fn test_infer_fact_key_martial_arts_phrase() {
+        assert_eq!(infer_fact_key("I study martial arts"), Some("martial_arts".to_string()));
+    }
+
+    #[test]
+    fn test_infer_fact_key_spend_price() {
+        let result = infer_fact_key("I spent $50 on books").unwrap();
+        assert!(result.ends_with("_price"));
+    }
+
+    #[test]
+    fn test_infer_fact_key_identity_residence() {
+        assert_eq!(infer_fact_key("I live in New York"), Some("residence".to_string()));
+    }
+
+    #[test]
+    fn test_infer_fact_key_identity_employer() {
+        assert_eq!(infer_fact_key("I work at Google"), Some("employer".to_string()));
+    }
+
+    #[test]
+    fn test_infer_fact_key_identity_occupation() {
+        assert_eq!(infer_fact_key("I am a doctor"), Some("occupation".to_string()));
+    }
+
+    #[test]
+    fn test_infer_fact_key_identity_school() {
+        assert_eq!(infer_fact_key("I study at MIT"), Some("school".to_string()));
+    }
+
+    #[test]
+    fn test_infer_fact_key_prefixed_user_fact_stripped() {
+        assert_eq!(
+            infer_fact_key("User fact: I am married"),
+            Some("relationship_status".to_string())
+        );
+    }
+
+    #[test]
+    fn test_infer_fact_key_irrelevant_returns_none() {
+        assert_eq!(infer_fact_key("The sky is blue"), None);
+    }
+
+    #[test]
+    fn test_infer_fact_key_empty_none() {
+        assert_eq!(infer_fact_key(""), None);
+    }
+
+    #[test]
+    fn test_infer_fact_key_has_new_and_got_returns_purchase() {
+        assert_eq!(infer_fact_key("I got a new phone"), Some("purchase".to_string()));
+    }
+
+    #[test]
+    fn test_infer_fact_key_child_count_no_have_verb() {
+        assert_eq!(infer_fact_key("the children are playing"), None);
+    }
+
+    #[test]
+    fn test_is_high_signal_atomic_claim_temporal_and_relation() {
+        assert!(is_high_signal_atomic_claim("I visited New York last year"));
+    }
+
+    #[test]
+    fn test_is_high_signal_atomic_claim_named_and_relation() {
+        assert!(is_high_signal_atomic_claim("Alice works at Google"));
+    }
+
+    #[test]
+    fn test_is_high_signal_atomic_claim_personal_signal() {
+        assert!(is_high_signal_atomic_claim("I work at Google"));
+    }
+
+    #[test]
+    fn test_is_high_signal_atomic_claim_no_relation_word() {
+        assert!(!is_high_signal_atomic_claim("I am fine"));
+    }
+
+    #[test]
+    fn test_is_high_signal_atomic_claim_empty() {
+        assert!(!is_high_signal_atomic_claim(""));
+    }
+
+    #[test]
+    fn test_is_high_signal_atomic_claim_he_she_personal() {
+        assert!(is_high_signal_atomic_claim("He works at Microsoft"));
+    }
+
+    #[test]
+    fn test_is_high_signal_atomic_claim_missing_relation() {
+        assert!(!is_high_signal_atomic_claim("I the ball"));
+    }
+
+    #[test]
+    fn test_sanitize_key_parts_basic() {
+        assert_eq!(
+            sanitize_key_parts(&["my", "favorite", "color"]),
+            Some("favorite_color".to_string())
+        );
+    }
+
+    #[test]
+    fn test_sanitize_key_parts_filters_stop_words() {
+        assert_eq!(sanitize_key_parts(&["the", "a", "an", "of"]), None);
+    }
+
+    #[test]
+    fn test_sanitize_key_parts_filters_numbers() {
+        assert_eq!(sanitize_key_parts(&["hello", "123", "world"]), Some("hello_world".to_string()));
+    }
+
+    #[test]
+    fn test_sanitize_key_parts_filters_punctuation() {
+        assert_eq!(sanitize_key_parts(&["hello!", "world?"]), Some("hello_world".to_string()));
+    }
+
+    #[test]
+    fn test_sanitize_key_parts_all_filtered_returns_none() {
+        assert_eq!(sanitize_key_parts(&["the", "a", "123", "!@#"]), None);
+    }
+
+    #[test]
+    fn test_sanitize_key_parts_empty_input() {
+        assert_eq!(sanitize_key_parts(&[]), None);
+    }
+
+    #[test]
+    fn test_sanitize_key_parts_owned() {
+        let parts = vec!["my".to_string(), "test".to_string()];
+        assert_eq!(sanitize_key_parts_owned(&parts), Some("test".to_string()));
+    }
+
+    #[test]
+    fn test_is_numericish_digits() {
+        assert!(is_numericish("123"));
+    }
+
+    #[test]
+    fn test_is_numericish_with_dollar() {
+        assert!(is_numericish("$50"));
+    }
+
+    #[test]
+    fn test_is_numericish_with_decimal() {
+        assert!(is_numericish("3.14"));
+    }
+
+    #[test]
+    fn test_is_numericish_with_comma() {
+        assert!(is_numericish("1,000"));
+    }
+
+    #[test]
+    fn test_is_numericish_with_percent() {
+        assert!(is_numericish("99%"));
+    }
+
+    #[test]
+    fn test_is_numericish_text_false() {
+        assert!(!is_numericish("hello"));
+    }
+
+    #[test]
+    fn test_is_numericish_empty_false() {
+        assert!(!is_numericish(""));
+    }
+
+    #[test]
+    fn test_split_atomic_claims_basic() {
+        let claims = split_atomic_claims("I like pizza. I have a dog.");
+        assert_eq!(claims.len(), 2);
+    }
+
+    #[test]
+    fn test_split_atomic_claims_filters_short() {
+        let claims = split_atomic_claims("Hi. I like pizza. Ok.");
+        assert_eq!(claims.len(), 1);
+        assert!(claims[0].contains("I like pizza"));
+    }
+
+    #[test]
+    fn test_split_atomic_claims_strips_bracketed() {
+        let claims = split_atomic_claims("[meta] I like pizza.");
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0], "I like pizza");
+    }
+
+    #[test]
+    fn test_split_atomic_claims_semicolons() {
+        let claims = split_atomic_claims("I like pizza; I have a dog");
+        assert_eq!(claims.len(), 2);
+    }
+
+    #[test]
+    fn test_build_contextual_key_basic() {
+        let base = vec!["coffee".to_string()];
+        let key = build_contextual_key(&[], &base, None);
+        assert_eq!(key, Some("coffee".to_string()));
+    }
+
+    #[test]
+    fn test_build_contextual_key_with_suffix() {
+        let base = vec!["coffee".to_string()];
+        let key = build_contextual_key(&[], &base, Some("price"));
+        assert_eq!(key, Some("coffee_price".to_string()));
+    }
+
+    #[test]
+    fn test_build_contextual_key_with_context() {
+        let ctx = vec!["morning".to_string()];
+        let base = vec!["coffee".to_string()];
+        let key = build_contextual_key(&ctx, &base, None);
+        assert_eq!(key, Some("morning_coffee".to_string()));
+    }
+
+    #[test]
+    fn test_build_contextual_key_removes_stop_words() {
+        let base = vec!["the".to_string(), "coffee".to_string()];
+        let key = build_contextual_key(&[], &base, None);
+        assert_eq!(key, Some("coffee".to_string()));
+    }
+}

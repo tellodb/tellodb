@@ -10,7 +10,8 @@ use crate::api::auth::{
     authorize_request, principal_namespace_prefix, principal_user_id, record_usage_for_principal,
     scope_entity_id,
 };
-use crate::api::ingest_utils::*;
+use crate::api::ingest::salient::{extract_named_phrases, extract_salient_terms};
+use crate::api::ingest::{alias::*, chunking::*, companion::*, datetime::*, dialogue::*, fact::*};
 use crate::api::types::{BatchIngestPayload, IngestPayload};
 use crate::api::utils::*;
 use crate::api::{EngineState, PlatformWriteOp};

@@ -192,6 +192,337 @@ pub fn expand_payload_for_content_type(payload: &IngestPayload) -> Vec<IngestPay
 }
 
 #[cfg(test)]
+mod moved_tests {
+    use super::*;
+
+    fn make_payload(text: &str) -> IngestPayload {
+        IngestPayload {
+            entity_id: "user".to_string(),
+            memory_id: "user::session1::0".to_string(),
+            timestamp: 1000000,
+            textual_content: text.to_string(),
+            relations: vec![],
+            kind: None,
+            fact_key: None,
+            source_memory_id: None,
+            index_semantic: None,
+            enable_semantic_dedup: None,
+            enable_consolidation: None,
+            content_type: None,
+            fact_operation: None,
+            fact_confidence: None,
+            fact_subject: None,
+            fact_predicate: None,
+            fact_object: None,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_chunk_markdown_splits_on_headers() {
+        let text = "# Title\ncontent\n## Subtitle\nmore\n# Another\nlast";
+        let chunks = chunk_markdown(text);
+        assert_eq!(chunks.len(), 3);
+        assert!(chunks[0].contains("# Title"));
+        assert!(chunks[0].contains("content"));
+        assert!(chunks[1].contains("## Subtitle"));
+        assert!(chunks[1].contains("more"));
+        assert!(chunks[2].contains("# Another"));
+        assert!(chunks[2].contains("last"));
+    }
+
+    #[test]
+    fn test_chunk_markdown_no_headers_returns_full() {
+        let text = "just plain text\nwith multiple lines\nbut no markdown headers";
+        let chunks = chunk_markdown(text);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], text);
+    }
+
+    #[test]
+    fn test_chunk_markdown_empty_input() {
+        let chunks = chunk_markdown("");
+        assert_eq!(chunks, vec![""]);
+    }
+
+    #[test]
+    fn test_chunk_markdown_respects_char_limit() {
+        let long_line = "A".repeat(600);
+        let text = format!("# H1\n{content}\n# H2\n{content}", content = long_line);
+        let chunks = chunk_markdown(&text);
+        assert!(chunks.len() >= 2);
+        assert!(chunks.iter().all(|c| c.len() <= 1100));
+    }
+
+    #[test]
+    fn test_chunk_code_splits_on_function_boundaries() {
+        let text = "fn foo() {}\nfn bar() {}\nimpl Baz {}\nfn baz() {}";
+        let chunks = chunk_code(text);
+        assert_eq!(chunks.len(), 4);
+        assert!(chunks[0].contains("fn foo()"));
+        assert!(chunks[1].contains("fn bar()"));
+        assert!(chunks[2].contains("impl Baz"));
+        assert!(chunks[3].contains("fn baz()"));
+    }
+
+    #[test]
+    fn test_chunk_code_pub_fn_boundary() {
+        let text = "pub fn foo() {}\npub fn bar() {}";
+        let chunks = chunk_code(text);
+        assert_eq!(chunks.len(), 2);
+    }
+
+    #[test]
+    fn test_chunk_code_no_boundaries_returns_full() {
+        let text = "let x = 1;\nlet y = 2;";
+        let chunks = chunk_code(text);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], text);
+    }
+
+    #[test]
+    fn test_chunk_code_respects_char_limit() {
+        let long_line = "x".repeat(700);
+        let text = format!("fn a() {{ {long_line} }}\nfn b() {{ {long_line} }}");
+        let chunks = chunk_code(&text);
+        assert!(chunks.len() >= 2);
+        assert!(chunks.iter().all(|c| c.len() <= 1200));
+    }
+
+    #[test]
+    fn test_chunk_code_empty_input() {
+        assert_eq!(chunk_code(""), vec![""]);
+    }
+
+    #[test]
+    fn test_chunk_email_splits_on_from_subject_to_date() {
+        let text = "From: alice\nSubject: Hello\n\nBody here";
+        let chunks = chunk_email(text);
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks[0].contains("From: alice"));
+        assert!(chunks[1].contains("Subject: Hello"));
+    }
+
+    #[test]
+    fn test_chunk_email_case_insensitive() {
+        let text = "FROM: alice\nSUBJECT: hi\n\nbody\nfrom: bob\nsubject: re\n\nreply";
+        let chunks = chunk_email(text);
+        assert_eq!(chunks.len(), 4);
+    }
+
+    #[test]
+    fn test_chunk_email_no_headers_returns_full() {
+        let text = "just a plain message body without headers";
+        let chunks = chunk_email(text);
+        assert_eq!(chunks, vec![text]);
+    }
+
+    #[test]
+    fn test_chunk_email_empty_input() {
+        assert_eq!(chunk_email(""), vec![""]);
+    }
+
+    #[test]
+    fn test_chunk_table_like_small_table_no_split() {
+        let lines: Vec<String> = (0..20).map(|i| format!("row {i}")).collect();
+        let text = lines.join("\n");
+        let chunks = chunk_table_like(&text);
+        assert_eq!(chunks, vec![text]);
+    }
+
+    #[test]
+    fn test_chunk_table_like_large_table_splits() {
+        let line = "A".repeat(100);
+        let lines: Vec<String> = (0..50).map(|i| format!("{line}{i}")).collect();
+        let text = lines.join("\n");
+        let chunks = chunk_table_like(&text);
+        assert!(chunks.len() >= 2);
+    }
+
+    #[test]
+    fn test_chunk_table_like_respects_char_limit() {
+        let long_line = "A".repeat(100);
+        let lines: Vec<String> = (0..30).map(|i| format!("{long_line} {i}")).collect();
+        let text = lines.join("\n");
+        let chunks = chunk_table_like(&text);
+        assert!(chunks.iter().all(|c| c.len() <= 1400));
+    }
+
+    #[test]
+    fn test_chunk_plain_or_chat_splits_on_punctuation() {
+        let text = "First sentence. Second sentence! Third? Fourth.";
+        let chunks = chunk_plain_or_chat(text);
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].contains("First sentence"));
+        assert!(chunks[0].contains("Second sentence"));
+    }
+
+    #[test]
+    fn test_chunk_plain_or_chat_respects_char_limit() {
+        let text = format!("{}. {}.", "A".repeat(500), "B".repeat(500));
+        let chunks = chunk_plain_or_chat(&text);
+        assert!(chunks.len() >= 2);
+    }
+
+    #[test]
+    fn test_chunk_plain_or_chat_empty_input() {
+        let chunks = chunk_plain_or_chat("");
+        assert_eq!(chunks, vec![""]);
+    }
+
+    #[test]
+    fn test_chunk_plain_or_chat_single_sentence() {
+        let chunks = chunk_plain_or_chat("Hello world.");
+        assert_eq!(chunks.len(), 1);
+    }
+
+    #[test]
+    fn test_chunk_plain_or_chat_newline_as_sentence_boundary() {
+        let text = "line one\nline two\nline three";
+        let chunks = chunk_plain_or_chat(text);
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].contains("line one"));
+        assert!(chunks[0].contains("line two"));
+    }
+
+    #[test]
+    fn test_chunk_plain_or_chat_trailing_punctuation_handling() {
+        let text = "Hello. World. Test.";
+        let chunks = chunk_plain_or_chat(text);
+        assert_eq!(chunks.len(), 1);
+    }
+
+    #[test]
+    fn test_split_by_char_limit_basic() {
+        let lines: Vec<String> = vec!["hello".into(), "world".into()];
+        let chunks = split_by_char_limit(&lines, 20);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], "hello\nworld");
+    }
+
+    #[test]
+    fn test_split_by_char_limit_exceeds_max() {
+        let lines: Vec<String> = vec!["A".repeat(100), "B".repeat(100), "C".repeat(100)];
+        let chunks = split_by_char_limit(&lines, 150);
+        assert!(chunks.len() >= 2);
+        assert!(chunks.iter().all(|c| c.len() <= 150));
+    }
+
+    #[test]
+    fn test_split_by_char_limit_empty_input() {
+        let chunks = split_by_char_limit(&[], 100);
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn test_split_by_char_limit_single_line_under() {
+        let lines = vec!["short".to_string()];
+        let chunks = split_by_char_limit(&lines, 100);
+        assert_eq!(chunks, vec!["short"]);
+    }
+
+    #[test]
+    fn test_split_by_char_limit_exact_fit() {
+        let lines = vec!["exact".to_string()];
+        let chunks = split_by_char_limit(&lines, 5);
+        assert_eq!(chunks, vec!["exact"]);
+    }
+
+    #[test]
+    fn test_infer_content_type_code_triple_backtick() {
+        let p = make_payload("```rust\nfn main() {}\n```");
+        assert_eq!(infer_content_type(&p), "code");
+    }
+
+    #[test]
+    fn test_infer_content_type_code_fn_keyword() {
+        let p = make_payload("fn main() {\n  println!();\n}");
+        assert_eq!(infer_content_type(&p), "code");
+    }
+
+    #[test]
+    fn test_infer_content_type_code_class_keyword() {
+        let p = make_payload("class Foo {\n  bar() {}\n}");
+        assert_eq!(infer_content_type(&p), "code");
+    }
+
+    #[test]
+    fn test_infer_content_type_markdown() {
+        let p = make_payload("# Title\n\nSome content.");
+        assert_eq!(infer_content_type(&p), "markdown");
+    }
+
+    #[test]
+    fn test_infer_content_type_email() {
+        let p = make_payload("From: alice\nSubject: hello\n\nBody text.");
+        assert_eq!(infer_content_type(&p), "email");
+    }
+
+    #[test]
+    fn test_infer_content_type_table_pipe() {
+        let p = make_payload("| A | B |\n| 1 | 2 |");
+        assert_eq!(infer_content_type(&p), "table");
+    }
+
+    #[test]
+    fn test_infer_content_type_table_comma() {
+        let p = make_payload("A,B,C\n1,2,3");
+        assert_eq!(infer_content_type(&p), "table");
+    }
+
+    #[test]
+    fn test_infer_content_type_chat() {
+        let p = make_payload("User: hello\nAssistant: hi there");
+        assert_eq!(infer_content_type(&p), "chat");
+    }
+
+    #[test]
+    fn test_infer_content_type_plain() {
+        let p = make_payload("Just a regular plain text.");
+        assert_eq!(infer_content_type(&p), "plain");
+    }
+
+    #[test]
+    fn test_infer_content_type_explicit_override() {
+        let mut p = make_payload("# Markdown looking text");
+        p.content_type = Some("plain".to_string());
+        assert_eq!(infer_content_type(&p), "plain");
+    }
+
+    #[test]
+    fn test_infer_content_type_code_takes_precedence_over_hash() {
+        let p = make_payload("# comment\nfn main() {}");
+        assert_eq!(infer_content_type(&p), "code");
+    }
+
+    #[test]
+    fn test_build_chunk_memory_id_with_split() {
+        let p = make_payload("");
+        let id = build_chunk_memory_id(&p, 0);
+        assert_eq!(id, format!("{}::c0", p.memory_id));
+        assert_eq!(
+            crate::api::utils::turn_index_from_memory_id(&id),
+            crate::api::utils::turn_index_from_memory_id(&p.memory_id)
+        );
+    }
+
+    #[test]
+    fn test_build_chunk_memory_id_increments() {
+        let p = make_payload("");
+        let id = build_chunk_memory_id(&p, 3);
+        assert_eq!(id, format!("{}::c3", p.memory_id));
+    }
+
+    #[test]
+    fn test_build_chunk_memory_id_fallback() {
+        let mut p = make_payload("");
+        p.memory_id = "invalid".to_string();
+        let id = build_chunk_memory_id(&p, 0);
+        assert_eq!(id, "invalid::c0");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
