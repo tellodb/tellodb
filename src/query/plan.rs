@@ -37,7 +37,7 @@ fn promote_query_variant(queries: &mut Vec<String>, candidate: String) {
     }
 }
 
-fn lifecycle_rank_adjustment(
+pub(crate) fn lifecycle_rank_adjustment(
     lifecycle: &crate::lifecycle::LifecycleMetadata,
     kind: MemoryKind,
     now_ms: u64,
@@ -80,7 +80,7 @@ fn lifecycle_rank_adjustment(
     Some(adjustment.clamp(-0.08, 0.10))
 }
 
-fn attractor_negative_penalty(
+pub(crate) fn attractor_negative_penalty(
     scorable: &ScorableObservation<'_>,
     plan: &QueryPlan,
     query_text: &str,

@@ -3,6 +3,7 @@
 pub use crate::api::plan::*;
 pub use crate::api::types::{
     EvidenceCard, ProofCheck, ProofPacket, ProofTurn, QueryPayload, QueryResult, RankedItem,
+    ResultOrigin,
 };
 pub use crate::api::utils::*;
 pub use crate::api::EngineState;
@@ -26,12 +27,16 @@ pub use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub(crate) mod fuse;
 pub(crate) mod plan;
 pub(crate) mod rerank;
+pub(crate) mod respond;
 pub(crate) mod retrieve;
 pub(crate) mod route;
+pub(crate) mod score;
 
 pub(crate) use plan::query_allows_stale_cards;
+pub(crate) use plan::{attractor_negative_penalty, lifecycle_rank_adjustment};
 pub(crate) use plan::{auto_rerank_enabled, retrieval_profile};
 pub(crate) use route::collect_edge_cluster_scores_for_seeds;
+pub(crate) use score::describe_stale_fact;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
