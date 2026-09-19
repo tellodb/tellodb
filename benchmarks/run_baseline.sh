@@ -126,7 +126,12 @@ TELLODB_HEURISTICS="${TELLODB_HEURISTICS:-generic}"
 # `off` makes the run measure encoder inference instead of a cache lookup.
 TELLODB_EMBED_CACHE="${TELLODB_EMBED_CACHE:-on}"
 
-TIMESTAMPS="${TIMESTAMPS:-wallclock}"
+# Real event times, not ingest time. `wallclock` stamps every memory at
+# roughly now, which makes temporal decay and recency scoring inert and
+# flatters the engine by ~2 recall points; it is not a setting any result
+# should be reported under. run_matrix.sh already defaulted to `session`, and
+# the mismatch made runs from the two scripts silently incomparable.
+TIMESTAMPS="${TIMESTAMPS:-session}"
 # Memory representation (WP2): what the engine embeds (legacy|turn|context),
 # how many neighbouring turns `context` adds, and whether the evaluator also
 # prepends its own header/window to each turn (window|off).

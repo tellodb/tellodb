@@ -423,8 +423,10 @@ pub fn report(paths: &[String]) -> Result<String> {
     // measures the lookup. The heuristics profile and lane set decide what the
     // quality columns above even mean.
     out.push_str("\n### Configuration\n\n");
-    out.push_str("| run | heuristics | lanes | rerank | embed cache hit % | device |\n");
-    out.push_str("|---|---|---|---|---|---|\n");
+    out.push_str(
+        "| run | timestamps | heuristics | lanes | rerank | embed cache hit % | device |\n",
+    );
+    out.push_str("|---|---|---|---|---|---|---|\n");
     for path in paths {
         let data = fs::read_to_string(path).with_context(|| format!("Failed to read {path}"))?;
         let r: Value = serde_json::from_str(&data).with_context(|| format!("Bad record {path}"))?;
@@ -440,8 +442,9 @@ pub fn report(paths: &[String]) -> Result<String> {
             .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join("+"))
             .unwrap_or_else(|| "–".to_string());
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} |\n",
             Path::new(path).file_stem().map(|s| s.to_string_lossy()).unwrap_or_default(),
+            r["config"]["timestamps"].as_str().unwrap_or("–"),
             e["heuristics"].as_str().unwrap_or("–"),
             if lanes.is_empty() { "–".to_string() } else { lanes },
             e["rerank"].as_str().unwrap_or("–"),
