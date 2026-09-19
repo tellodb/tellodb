@@ -78,7 +78,7 @@ fn default_max_types() -> usize {
 impl GlinerModel {
     /// Loads a GLiNER export: `gliner_config.json`, `tokenizer.json` and an
     /// ONNX file (`onnx/model_int8.onnx`, else `onnx/model.onnx`, else
-    /// `model.onnx`). Runs on the device `TEMPORAL_MEMORY_DEVICE` selects.
+    /// `model.onnx`). Runs on the device selected by the server configuration.
     pub fn load(dir: &Path) -> Result<Self> {
         let config_path = dir.join("gliner_config.json");
         let config: GlinerConfig = serde_json::from_slice(

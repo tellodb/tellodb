@@ -3,6 +3,8 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::config::value;
+
 const PLATFORM_DB_FILE: &str = "platform.db";
 const VECTOR_INDEX_FILE: &str = "vector.hnsw";
 const EMBEDDING_CACHE_FILE: &str = "embedding_cache.sqlite";
@@ -21,10 +23,7 @@ pub struct RuntimePaths {
 
 impl RuntimePaths {
     pub fn from_env() -> Result<Self> {
-        let configured_root = env::var("TEMPORAL_MEMORY_DATA_DIR")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .or_else(|| env::var("TELLODB_DATA_DIR").ok().filter(|value| !value.trim().is_empty()));
+        let configured_root = value("TELLODB_DATA_DIR", Some("TEMPORAL_MEMORY_DATA_DIR"));
 
         let (root, explicit_root) = match configured_root {
             Some(root) => (PathBuf::from(root), true),
@@ -210,13 +209,13 @@ mod tests {
     }
 
     #[test]
-    fn temporal_memory_data_dir_takes_precedence_over_tellodb_data_dir() {
+    fn tellodb_data_dir_takes_precedence_over_legacy_data_dir() {
         let _lock = lock_env();
         clear_all_env_vars();
         env::set_var("TEMPORAL_MEMORY_DATA_DIR", "/tmp/precedence_temporal");
         env::set_var("TELLODB_DATA_DIR", "/tmp/precedence_tellodb");
         let paths = RuntimePaths::from_env().unwrap();
-        assert_eq!(paths.root(), Path::new("/tmp/precedence_temporal"));
+        assert_eq!(paths.root(), Path::new("/tmp/precedence_tellodb"));
     }
 
     #[test]

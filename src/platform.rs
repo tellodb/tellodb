@@ -98,7 +98,7 @@ pub struct ApiKeyAuth {
     pub key_id: String,
     /// Present when the key belongs to a fractional (shared) cluster.
     /// Handlers MUST use this as a mandatory entity_id prefix to enforce
-    /// per-tenant data isolation on the shared Aletheia engine.
+    /// per-tenant data isolation on the shared tellodb engine.
     pub cluster_id: Option<String>,
 }
 

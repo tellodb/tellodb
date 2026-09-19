@@ -34,7 +34,7 @@ impl AuthConfig {
         Ok(Self { api_key: Some(Arc::<str>::from(api_key)) })
     }
 
-    /// Server auth from `TEMPORAL_MEMORY_API_KEY` / `TELLODB_API_KEY`. Debug
+    /// Server auth from `TELLODB_API_KEY`, with the legacy name accepted during migration. Debug
     /// builds fall back to the test key; release builds require a key.
     pub fn from_env() -> anyhow::Result<Self> {
         Self::from_config(&crate::config::Config::from_env()?)

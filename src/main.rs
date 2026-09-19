@@ -192,10 +192,10 @@ async fn serve(paths: &RuntimePaths) -> anyhow::Result<()> {
     let auth = api::AuthConfig::from_config(&config)?;
     let state = tellodb::engine::build_state(paths, auth, config).await?;
     let tenant_manager = state.tenant_manager.clone();
-    info!("API key auth enabled on all routes (TEMPORAL_MEMORY_API_KEY or TELLODB_API_KEY).");
+    info!("API key auth enabled on all routes (TELLODB_API_KEY).");
 
     // Local-first default: only reachable from this machine unless a host is
-    // configured explicitly (containers set TEMPORAL_MEMORY_HOST=0.0.0.0).
+    // configured explicitly (containers set TELLODB_HOST=0.0.0.0).
     let bind_address = format!("{}:{}", state.config.server.host, state.config.server.port);
     let platform = state.platform.clone();
     let app = api::build_api(state);

@@ -757,7 +757,7 @@ mod tests {
 
         let obs1 = AgentObservation {
             entity_id: "user-123".to_string(),
-            textual_content: "Sharjeel is developing AletheiaDB".to_string(),
+            textual_content: "Ada is building a database".to_string(),
             embedding: vec![1.0, 2.0, 3.0],
             kind: MemoryKind::Fact,
             content_hash: String::new(),
@@ -773,7 +773,7 @@ mod tests {
         // Ingest update to the same memory_id
         let obs2 = AgentObservation {
             entity_id: "user-123".to_string(),
-            textual_content: "Sharjeel is developing AletheiaDB in Rust".to_string(),
+            textual_content: "Ada is building a database in Rust".to_string(),
             embedding: vec![4.0, 5.0, 6.0],
             kind: MemoryKind::Fact,
             content_hash: String::new(),
@@ -798,7 +798,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(content, "Sharjeel is developing AletheiaDB in Rust");
+        assert_eq!(content, "Ada is building a database in Rust");
         assert_eq!(created_at, 2000);
 
         // Verify vector_lookup is updated

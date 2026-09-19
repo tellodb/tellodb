@@ -2,7 +2,7 @@
 //! they can be reasoned about, benchmarked, and versioned independently of
 //! business logic.
 
-/// Scoring weights and thresholds for the Aletheia retrieval pipeline.
+/// Scoring weights and thresholds for the tellodb retrieval pipeline.
 ///
 /// These defaults are the result of empirical tuning on the LoCoMo benchmark.
 /// Values between ±10% produce similar results; changes beyond that should be

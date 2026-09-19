@@ -17,6 +17,7 @@ const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_CONTEXT_WINDOW: u32 = 1;
 const DEFAULT_PREDICATE_CANON_TAU: f32 = 0.86;
 const DEFAULT_EXTRACTOR_THRESHOLD: f32 = 0.5;
+pub(crate) const LEGACY_ENV_REMOVAL_DATE: &str = "2027-01-01";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -555,15 +556,25 @@ impl TemporalConfig {
     }
 }
 
-fn value(name: &str, legacy: Option<&str>) -> Option<String> {
-    match env::var(name).ok().filter(|value| !value.trim().is_empty()) {
+pub(crate) fn value(name: &str, legacy: Option<&str>) -> Option<String> {
+    select_value(name, legacy, env::var(name).ok(), legacy.and_then(|name| env::var(name).ok()))
+}
+
+fn select_value(
+    name: &str,
+    legacy: Option<&str>,
+    canonical_value: Option<String>,
+    legacy_value: Option<String>,
+) -> Option<String> {
+    match canonical_value.filter(|value| !value.trim().is_empty()) {
         Some(value) => Some(value),
         None => legacy.and_then(|legacy_name| {
-            env::var(legacy_name).ok().filter(|value| !value.trim().is_empty()).inspect(|_| {
+            legacy_value.filter(|value| !value.trim().is_empty()).inspect(|_| {
                 tracing::warn!(
                     canonical = name,
                     legacy = legacy_name,
-                    "using legacy configuration variable"
+                    removal_date = LEGACY_ENV_REMOVAL_DATE,
+                    "using deprecated configuration variable; migrate to the canonical variable"
                 )
             })
         }),
@@ -593,6 +604,45 @@ fn path_value(name: &str, legacy: Option<&str>) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_environment_value_wins_over_legacy_value() {
+        assert_eq!(
+            select_value(
+                "TELLODB_PORT",
+                Some("TEMPORAL_MEMORY_PORT"),
+                Some("3000".to_string()),
+                Some("4000".to_string()),
+            ),
+            Some("3000".to_string())
+        );
+    }
+
+    #[test]
+    fn legacy_environment_value_is_used_when_canonical_is_absent() {
+        assert_eq!(
+            select_value(
+                "TELLODB_PORT",
+                Some("TEMPORAL_MEMORY_PORT"),
+                None,
+                Some("4000".to_string()),
+            ),
+            Some("4000".to_string())
+        );
+    }
+
+    #[test]
+    fn blank_environment_values_are_ignored() {
+        assert_eq!(
+            select_value(
+                "TELLODB_PORT",
+                Some("TEMPORAL_MEMORY_PORT"),
+                Some("  ".to_string()),
+                Some("4000".to_string()),
+            ),
+            Some("4000".to_string())
+        );
+    }
 
     #[test]
     fn default_config_has_documented_runtime_defaults() {
