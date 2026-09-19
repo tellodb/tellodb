@@ -24,10 +24,12 @@ pub use std::sync::Arc;
 pub use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) mod plan;
+pub(crate) mod rerank;
 pub(crate) mod retrieve;
 pub(crate) mod route;
 
 pub(crate) use plan::query_allows_stale_cards;
+pub(crate) use plan::{auto_rerank_enabled, retrieval_profile};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]

@@ -155,11 +155,14 @@ pub(crate) struct RetrievalBudget {
     pub(crate) card_limit: usize,
 }
 
-fn retrieval_profile(config: &crate::config::Config) -> RetrievalProfile {
+pub(crate) fn retrieval_profile(config: &crate::config::Config) -> RetrievalProfile {
     config.retrieval.profile
 }
 
-fn auto_rerank_enabled(config: &crate::config::Config, profile: RetrievalProfile) -> bool {
+pub(crate) fn auto_rerank_enabled(
+    config: &crate::config::Config,
+    profile: RetrievalProfile,
+) -> bool {
     config.retrieval.auto_rerank.unwrap_or(matches!(profile, RetrievalProfile::Research))
 }
 
