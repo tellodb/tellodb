@@ -119,6 +119,13 @@ if [[ -n "$RUNS_OVERRIDE" ]]; then
     RUNS="$RUNS_OVERRIDE"
 fi
 
+# Retrieval lanes and heuristics profile. Both are recorded in the run record
+# via /version, so a baseline cannot be mislabelled.
+TELLODB_LANES="${TELLODB_LANES:-all}"
+TELLODB_HEURISTICS="${TELLODB_HEURISTICS:-generic}"
+# `off` makes the run measure encoder inference instead of a cache lookup.
+TELLODB_EMBED_CACHE="${TELLODB_EMBED_CACHE:-on}"
+
 TIMESTAMPS="${TIMESTAMPS:-wallclock}"
 # Memory representation (WP2): what the engine embeds (legacy|turn|context),
 # how many neighbouring turns `context` adds, and whether the evaluator also
@@ -167,6 +174,9 @@ TELLODB_THREADS="$TELLODB_THREADS" \
 TELLODB_RERANK="$TELLODB_RERANK" \
 TELLODB_EMBED_MAX_TOKENS="$TELLODB_EMBED_MAX_TOKENS" \
 TELLODB_EMBED_TEXT="$TELLODB_EMBED_TEXT" \
+TELLODB_LANES="$TELLODB_LANES" \
+TELLODB_HEURISTICS="$TELLODB_HEURISTICS" \
+TELLODB_EMBED_CACHE="$TELLODB_EMBED_CACHE" \
 TELLODB_CONTEXT_WINDOW="$TELLODB_CONTEXT_WINDOW" \
 HF_HOME="$HF_HOME" \
 HUGGINGFACE_HUB_CACHE="$HUGGINGFACE_HUB_CACHE" \
