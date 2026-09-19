@@ -34,6 +34,7 @@ case "$TIER" in
     TELLODB_THREADS="${TELLODB_THREADS:-6}"
     TELLODB_RERANK="${TELLODB_RERANK:-off}"
     TELLODB_EMBED_MAX_TOKENS="${TELLODB_EMBED_MAX_TOKENS:-256}"
+    TELLODB_EMBED_BATCH="${TELLODB_EMBED_BATCH:-8}"
     ;;
   dev)
     PROFILE=fastrelease
@@ -42,7 +43,12 @@ case "$TIER" in
     CONCURRENCY=2
     TELLODB_THREADS="${TELLODB_THREADS:-8}"
     TELLODB_RERANK="${TELLODB_RERANK:-auto}"
+    # Attention memory scales with batch x seq^2, and each embed executor
+    # holds its own CUDA arena alongside the reranker. 32 x 512 tokens asks
+    # for ~354 MB per buffer, which OOMs an 8 GB card once the embedding
+    # cache is cold and inference actually runs.
     TELLODB_EMBED_MAX_TOKENS="${TELLODB_EMBED_MAX_TOKENS:-512}"
+    TELLODB_EMBED_BATCH="${TELLODB_EMBED_BATCH:-8}"
     ;;
   *) echo "Unsupported tier: $TIER (smoke|dev)" >&2; exit 1 ;;
 esac
@@ -111,6 +117,7 @@ start_engine() {
         TELLODB_THREADS="$TELLODB_THREADS" \
         TELLODB_RERANK="$TELLODB_RERANK" \
         TELLODB_EMBED_MAX_TOKENS="$TELLODB_EMBED_MAX_TOKENS" \
+        TELLODB_EMBED_BATCH="$TELLODB_EMBED_BATCH" \
         TELLODB_EMBED_TEXT="$TELLODB_EMBED_TEXT" \
         TELLODB_CONTEXT_WINDOW="$TELLODB_CONTEXT_WINDOW" \
         "$@" \

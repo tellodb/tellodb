@@ -66,6 +66,7 @@ case "$TIER" in
     # Smoke checks that the pipeline works, not quality: shorter texts keep a
     # laptop run to minutes (attention cost grows with text length).
     TELLODB_EMBED_MAX_TOKENS="${TELLODB_EMBED_MAX_TOKENS:-256}"
+    TELLODB_EMBED_BATCH="${TELLODB_EMBED_BATCH:-8}"
     RUN_SYNTH_10K=0
     RUN_SYNTH_100K=0
     ;;
@@ -77,7 +78,12 @@ case "$TIER" in
     CONCURRENCY=2
     TELLODB_THREADS="${TELLODB_THREADS:-8}"
     TELLODB_RERANK="${TELLODB_RERANK:-auto}"
+    # Attention memory scales with batch x seq^2, and each embed executor
+    # holds its own CUDA arena alongside the reranker. 32 x 512 tokens asks
+    # for ~354 MB per buffer, which OOMs an 8 GB card once the embedding
+    # cache is cold and inference actually runs.
     TELLODB_EMBED_MAX_TOKENS="${TELLODB_EMBED_MAX_TOKENS:-512}"
+    TELLODB_EMBED_BATCH="${TELLODB_EMBED_BATCH:-8}"
     RUN_SYNTH_10K=1
     RUN_SYNTH_100K=0
     ;;
@@ -89,7 +95,12 @@ case "$TIER" in
     CONCURRENCY=4
     TELLODB_THREADS="${TELLODB_THREADS:-8}"
     TELLODB_RERANK="${TELLODB_RERANK:-auto}"
+    # Attention memory scales with batch x seq^2, and each embed executor
+    # holds its own CUDA arena alongside the reranker. 32 x 512 tokens asks
+    # for ~354 MB per buffer, which OOMs an 8 GB card once the embedding
+    # cache is cold and inference actually runs.
     TELLODB_EMBED_MAX_TOKENS="${TELLODB_EMBED_MAX_TOKENS:-512}"
+    TELLODB_EMBED_BATCH="${TELLODB_EMBED_BATCH:-8}"
     RUN_SYNTH_10K=1
     RUN_SYNTH_100K=1
     ;;
@@ -183,6 +194,7 @@ TEMPORAL_MEMORY_API_KEY="$ENGINE_API_KEY" \
 TELLODB_THREADS="$TELLODB_THREADS" \
 TELLODB_RERANK="$TELLODB_RERANK" \
 TELLODB_EMBED_MAX_TOKENS="$TELLODB_EMBED_MAX_TOKENS" \
+        TELLODB_EMBED_BATCH="$TELLODB_EMBED_BATCH" \
 TELLODB_EMBED_TEXT="$TELLODB_EMBED_TEXT" \
 TELLODB_LANES="$TELLODB_LANES" \
 TELLODB_HEURISTICS="$TELLODB_HEURISTICS" \
