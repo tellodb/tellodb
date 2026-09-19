@@ -452,7 +452,13 @@ impl TenantStore {
         }
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_memories_session_turn
-                 ON memories(entity_id, session_id, turn_index);",
+                 ON memories(entity_id, session_id, turn_index);
+             -- Derived records are looked up by their parent turn (evidence
+             -- packets, fact versions). Without this the `OR parent_memory_id
+             -- IN (...)` lookups degrade to a full scan of `memories`, which
+             -- cost ~1.9 s per query on the LongMemEval dev split.
+             CREATE INDEX IF NOT EXISTS idx_memories_parent
+                 ON memories(parent_memory_id);",
         )?;
         if !Self::has_column(conn, "vector_lookup", "embedding")? {
             conn.execute_batch("ALTER TABLE vector_lookup ADD COLUMN embedding BLOB;")?;
@@ -3568,6 +3574,33 @@ mod tests {
             .canonicalize_predicates("bob", &[("job_title".to_string(), job_variant)], 0.86)
             .unwrap();
         assert_eq!(other["job_title"], "job_title");
+    }
+
+    #[test]
+    fn parent_lookups_do_not_scan_the_memories_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TenantStore::new(&dir.path().join("t.db")).unwrap();
+        let conn = store.get_conn().unwrap();
+        // `get_ledger_turns_batch` reaches derived records through their
+        // parent; a full scan here is a latency cliff at real corpus sizes.
+        let plan: Vec<String> = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT memory_id FROM memories
+                 WHERE memory_id IN (?1)
+                    OR (parent_memory_id IN (?1)
+                        AND memory_id GLOB parent_memory_id || '::c[0-9]*')",
+            )
+            .unwrap()
+            .query_map(rusqlite::params!["x"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let plan = plan.join(" | ");
+        assert!(
+            plan.contains("idx_memories_parent"),
+            "parent lookup must use the index, got: {plan}"
+        );
+        assert!(!plan.contains("SCAN memories"), "plan still scans: {plan}");
     }
 
     #[test]
