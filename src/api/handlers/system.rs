@@ -12,11 +12,12 @@ use crate::api::types::{
     MemoryInspectResponse, ProbeResponse, ProofTurn, ResetPayload, VersionResponse, WarmupResponse,
 };
 use crate::api::EngineState;
+use crate::error::{EngineError, EngineResult};
 use crate::metrics;
 
-fn internal_error(error: impl std::fmt::Debug) -> StatusCode {
+fn internal_error(error: impl std::fmt::Debug) -> EngineError {
     tracing::error!(error = ?error, "system handler operation failed");
-    StatusCode::INTERNAL_SERVER_ERROR
+    EngineError::internal(format!("{error:?}"))
 }
 use anyhow::Context;
 
@@ -31,11 +32,11 @@ const API_DELETE_REASON: &str = "api_delete";
 const GRAPH_EDGE_LIMIT: usize = 1000;
 const RESET_CONFIRM_PHRASE: &str = "delete-all-data";
 
-fn require_global_principal(principal: &RequestPrincipal) -> Result<(), StatusCode> {
+fn require_global_principal(principal: &RequestPrincipal) -> EngineResult<()> {
     if matches!(principal, RequestPrincipal::GlobalApiKey) {
         Ok(())
     } else {
-        Err(StatusCode::UNAUTHORIZED)
+        Err(EngineError::Unauthorized)
     }
 }
 
@@ -46,7 +47,7 @@ pub async fn metrics_handler() -> impl IntoResponse {
 pub async fn status_handler(
     State(state): State<EngineState>,
     Extension(principal): Extension<RequestPrincipal>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> EngineResult<impl IntoResponse> {
     let tenant_id = principal_user_id(&principal).unwrap_or("default");
     let _tenant = state.tenant_store(tenant_id).map_err(internal_error)?;
     let status = EngineStatus {
@@ -61,7 +62,7 @@ pub async fn status_handler(
 pub async fn health_handler(
     State(state): State<EngineState>,
     Extension(principal): Extension<RequestPrincipal>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> EngineResult<impl IntoResponse> {
     let device = crate::semantic::SemanticInference::device_label_static();
     let response = (
         StatusCode::OK,
@@ -83,7 +84,7 @@ pub async fn healthz_handler() -> impl IntoResponse {
 pub async fn version_handler(
     State(state): State<EngineState>,
     Extension(principal): Extension<RequestPrincipal>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> EngineResult<impl IntoResponse> {
     let response = (
         StatusCode::OK,
         Json(VersionResponse {
@@ -117,7 +118,7 @@ pub async fn version_handler(
 pub async fn warmup_handler(
     State(state): State<EngineState>,
     Extension(principal): Extension<RequestPrincipal>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> EngineResult<impl IntoResponse> {
     let semantic = state.semantic.clone();
     let started = Instant::now();
 
@@ -128,14 +129,8 @@ pub async fn warmup_handler(
         Ok::<(), anyhow::Error>(())
     })
     .await
-    .map_err(|err| {
-        tracing::warn!("Warmup spawn blocking error: {:?}", err);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?
-    .map_err(|err| {
-        tracing::warn!("Warmup failed: {:?}", err);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    .map_err(internal_error)?
+    .map_err(internal_error)?;
 
     record_usage_for_principal(&state, &principal, "warmup");
     Ok((
@@ -152,34 +147,18 @@ pub async fn reset_handler(
     State(state): State<EngineState>,
     Extension(principal): Extension<RequestPrincipal>,
     Json(payload): Json<ResetPayload>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> EngineResult<impl IntoResponse> {
     let tenant_id = principal_user_id(&principal).unwrap_or("default");
-    let tenant = state.tenant_store(tenant_id).map_err(|e| {
-        tracing::error!("tenant_store lookup failed for tenant_id={}: {:?}", tenant_id, e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let tenant = state.tenant_store(tenant_id).map_err(internal_error)?;
     let confirm = payload.confirm.as_deref();
     if confirm != Some(RESET_CONFIRM_PHRASE) && confirm != Some("RESET_DATA_DANGEROUS") {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(EngineError::bad_request("reset confirmation is required"));
     }
 
-    tenant.clear_all().map_err(|e| {
-        tracing::error!(error = ?e, "clear_all failed");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    tenant.fts_clear().map_err(|e| {
-        tracing::error!(error = ?e, "fts_clear failed");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    tenant.graph_clear().map_err(|e| {
-        tracing::error!(error = ?e, "graph_clear failed");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    // Only this tenant's vectors: each tenant owns its own index.
-    tenant.vectors().and_then(|v| v.clear(None)).map_err(|e| {
-        tracing::error!(error = ?e, "vector index clear failed");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    tenant.clear_all().map_err(internal_error)?;
+    tenant.fts_clear().map_err(internal_error)?;
+    tenant.graph_clear().map_err(internal_error)?;
+    tenant.vectors().and_then(|v| v.clear(None)).map_err(internal_error)?;
 
     if payload.clear_embedding_cache.unwrap_or(false) {
         state.semantic.clear_embedding_cache();
@@ -193,7 +172,7 @@ pub async fn memory_inspect_handler(
     State(state): State<EngineState>,
     Extension(principal): Extension<RequestPrincipal>,
     Json(payload): Json<MemoryInspectPayload>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> EngineResult<impl IntoResponse> {
     let tenant_id = principal_user_id(&principal).unwrap_or("default");
     let tenant = state.tenant_store(tenant_id).map_err(internal_error)?;
     let response = tokio::task::spawn_blocking(move || {
@@ -210,7 +189,7 @@ pub async fn memory_inspect_handler(
                 .remove(&payload.memory_id)
                 .map(|obs| MemoryAuditObservation {
                     entity_id: obs.entity_id,
-                    kind: format!("{:?}", obs.kind),
+                    kind: obs.kind.as_str().to_string(),
                     created_at_ms: obs.created_at_ms,
                     textual_content: obs.textual_content,
                 })
@@ -254,7 +233,7 @@ pub async fn memory_inspect_handler(
             }
         }
 
-        Ok::<MemoryInspectResponse, StatusCode>(MemoryInspectResponse {
+        Ok::<MemoryInspectResponse, EngineError>(MemoryInspectResponse {
             memory_id: payload.memory_id,
             timestamp,
             observation,
@@ -276,7 +255,7 @@ pub async fn memory_delete_handler(
     State(state): State<EngineState>,
     Extension(principal): Extension<RequestPrincipal>,
     Json(payload): Json<MemoryDeletePayload>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> EngineResult<impl IntoResponse> {
     let tenant_id = principal_user_id(&principal).unwrap_or("default");
     let tenant = state.tenant_store(tenant_id).map_err(internal_error)?;
     let reason = payload
@@ -300,7 +279,7 @@ pub async fn memory_delete_handler(
         };
 
         let Some(ts) = timestamp else {
-            return Ok::<MemoryDeleteResponse, StatusCode>(MemoryDeleteResponse {
+            return Ok::<MemoryDeleteResponse, EngineError>(MemoryDeleteResponse {
                 deleted: false,
                 memory_id: payload.memory_id,
                 timestamp: None,
@@ -313,20 +292,19 @@ pub async fn memory_delete_handler(
 
         let deleted =
             tenant.delete_observation(ts, &payload.memory_id, &reason).map_err(internal_error)?;
-        let fts_removed = observation
-            .as_ref()
-            .and_then(|_obs| tenant.fts_remove_document(&payload.memory_id).ok().map(|()| 1))
-            .unwrap_or(0);
-        let graph_edges_removed = tenant.graph_remove_memory(&payload.memory_id).unwrap_or(0);
+        let fts_removed = if observation.is_some() {
+            tenant.fts_remove_document(&payload.memory_id).map(|()| 1).map_err(internal_error)?
+        } else {
+            0
+        };
+        let graph_edges_removed =
+            tenant.graph_remove_memory(&payload.memory_id).map_err(internal_error)?;
         let vectors = tenant.vectors().map_err(internal_error)?;
         for vector_id in deleted.vector_id.iter().chain(deleted.chunk_vector_ids.iter()) {
-            vectors.remove(&deleted.entity_id, *vector_id).map_err(|err| {
-                tracing::error!(error = ?err, vector_id, "failed to remove deleted vector");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+            vectors.remove(&deleted.entity_id, *vector_id).map_err(internal_error)?;
         }
 
-        Ok::<MemoryDeleteResponse, StatusCode>(MemoryDeleteResponse {
+        Ok::<MemoryDeleteResponse, EngineError>(MemoryDeleteResponse {
             deleted: true,
             memory_id: payload.memory_id,
             timestamp: Some(ts),
@@ -416,7 +394,7 @@ fn get_gpu_metrics() -> Option<(f32, u64, u64)> {
 pub async fn hardware_stats_handler(
     State(state): State<EngineState>,
     Extension(principal): Extension<RequestPrincipal>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> EngineResult<impl IntoResponse> {
     let (cpu_usage_percent, ram_total_mb, ram_used_mb) = get_system_metrics();
     let (storage_total_gb, storage_used_gb) = get_disk_metrics(&state.data_root);
 
@@ -444,17 +422,17 @@ pub async fn cluster_stats_handler(
     State(state): State<EngineState>,
     Extension(principal): Extension<RequestPrincipal>,
     axum::extract::Path(cluster_id): axum::extract::Path<String>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> EngineResult<impl IntoResponse> {
     require_global_principal(&principal)?;
 
     let tenant = state.tenant_store(&cluster_id).map_err(|err| {
         tracing::warn!(cluster_id = %cluster_id, error = ?err, "unknown or invalid cluster id");
-        StatusCode::NOT_FOUND
+        EngineError::NotFound(format!("cluster {cluster_id}: {err}"))
     })?;
 
     let mut cluster_stats = tenant.db_stats().map_err(|err| {
         tracing::warn!("Failed to query db stats for cluster {}: {:?}", cluster_id, err);
-        StatusCode::INTERNAL_SERVER_ERROR
+        EngineError::Other(err)
     })?;
 
     if let Ok(usage) = state.platform.total_usage_stats() {
@@ -470,15 +448,15 @@ pub async fn storage_stats_handler(
     State(state): State<EngineState>,
     Extension(principal): Extension<RequestPrincipal>,
     axum::extract::Path(cluster_id): axum::extract::Path<String>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> EngineResult<impl IntoResponse> {
     require_global_principal(&principal)?;
     let tenant = state.tenant_store(&cluster_id).map_err(|err| {
         tracing::warn!(cluster_id = %cluster_id, error = ?err, "unknown or invalid cluster id");
-        StatusCode::NOT_FOUND
+        EngineError::NotFound(format!("cluster {cluster_id}: {err}"))
     })?;
     let storage_stats = tenant.detailed_db_stats().map_err(|err| {
         tracing::warn!("Failed to query storage stats for cluster {}: {:?}", cluster_id, err);
-        StatusCode::INTERNAL_SERVER_ERROR
+        EngineError::Other(err)
     })?;
     Ok((StatusCode::OK, Json(storage_stats)))
 }
@@ -487,15 +465,15 @@ pub async fn cluster_graph_handler(
     State(state): State<EngineState>,
     Extension(principal): Extension<RequestPrincipal>,
     axum::extract::Path(cluster_id): axum::extract::Path<String>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> EngineResult<impl IntoResponse> {
     require_global_principal(&principal)?;
     let tenant = state.tenant_store(&cluster_id).map_err(|err| {
         tracing::warn!(cluster_id = %cluster_id, error = ?err, "unknown or invalid cluster id");
-        StatusCode::NOT_FOUND
+        EngineError::NotFound(format!("cluster {cluster_id}: {err}"))
     })?;
     let edges = tenant.get_all_edges(GRAPH_EDGE_LIMIT).map_err(|err| {
         tracing::warn!("Failed to query graph edges for cluster {}: {:?}", cluster_id, err);
-        StatusCode::INTERNAL_SERVER_ERROR
+        EngineError::Other(err)
     })?;
     Ok((StatusCode::OK, Json(edges)))
 }
@@ -504,7 +482,7 @@ pub async fn admin_inject_api_key_handler(
     State(state): State<EngineState>,
     Extension(principal): Extension<RequestPrincipal>,
     Json(payload): Json<AdminInjectApiKeyPayload>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> EngineResult<impl IntoResponse> {
     require_global_principal(&principal)?;
 
     state
@@ -518,7 +496,7 @@ pub async fn admin_inject_api_key_handler(
         )
         .map_err(|err| {
             tracing::warn!("Failed to inject API key: {:?}", err);
-            StatusCode::INTERNAL_SERVER_ERROR
+            EngineError::Other(err)
         })?;
 
     Ok(StatusCode::CREATED)
@@ -528,12 +506,12 @@ pub async fn admin_revoke_api_key_handler(
     State(state): State<EngineState>,
     Extension(principal): Extension<RequestPrincipal>,
     axum::extract::Path(key_id): axum::extract::Path<String>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> EngineResult<impl IntoResponse> {
     require_global_principal(&principal)?;
 
     state.platform.admin_revoke_api_key(&key_id).map_err(|err| {
         tracing::warn!("Failed to admin revoke API key: {:?}", err);
-        StatusCode::INTERNAL_SERVER_ERROR
+        EngineError::Other(err)
     })?;
 
     Ok(StatusCode::NO_CONTENT)
@@ -543,16 +521,20 @@ pub async fn admin_revoke_api_key_handler(
 mod tests {
     use super::*;
     use crate::api::auth::RequestPrincipal;
+    use crate::error::EngineError;
 
     #[test]
     fn admin_handlers_accept_only_global_principal() {
-        assert_eq!(require_global_principal(&RequestPrincipal::GlobalApiKey), Ok(()));
+        assert!(require_global_principal(&RequestPrincipal::GlobalApiKey).is_ok());
 
         let user_principal = RequestPrincipal::UserApiKey(crate::platform::ApiKeyAuth {
             user_id: "usr_test".to_string(),
             key_id: "key_test".to_string(),
             cluster_id: Some("default".to_string()),
         });
-        assert_eq!(require_global_principal(&user_principal), Err(StatusCode::UNAUTHORIZED));
+        assert!(matches!(
+            require_global_principal(&user_principal),
+            Err(EngineError::Unauthorized)
+        ));
     }
 }

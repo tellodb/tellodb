@@ -3,6 +3,7 @@
 
 use crate::api::auth::{principal_user_id, record_usage_for_principal, RequestPrincipal};
 use crate::api::EngineState;
+use crate::error::{EngineError, EngineResult};
 use axum::extract::{Extension, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -25,16 +26,16 @@ fn scope(
     state: &EngineState,
     principal: &RequestPrincipal,
     requested: Option<&str>,
-) -> Result<(std::sync::Arc<crate::storage::TenantStore>, String), StatusCode> {
+) -> EngineResult<(std::sync::Arc<crate::storage::TenantStore>, String)> {
     let tenant_id = principal_user_id(principal).unwrap_or("default");
     let tenant = state.tenant_store(tenant_id).map_err(|err| {
         tracing::error!(error = ?err, tenant_id, "fact lookup tenant open failed");
-        StatusCode::INTERNAL_SERVER_ERROR
+        EngineError::Other(err)
     })?;
     let entity_id = requested
         .filter(|e| !e.trim().is_empty())
         .map(str::to_string)
-        .ok_or(StatusCode::BAD_REQUEST)?;
+        .ok_or_else(|| EngineError::bad_request("entity_id is required"))?;
     Ok((tenant, entity_id))
 }
 
@@ -42,11 +43,11 @@ pub async fn current_fact_handler(
     State(state): State<EngineState>,
     Extension(principal): Extension<RequestPrincipal>,
     Query(params): Query<FactParams>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> EngineResult<impl IntoResponse> {
     let (tenant, entity_id) = scope(&state, &principal, params.entity_id.as_deref())?;
     let history = tenant.fact_history(&entity_id, &params.fact_key).map_err(|err| {
         tracing::error!(error = ?err, "fact history read failed");
-        StatusCode::INTERNAL_SERVER_ERROR
+        EngineError::Other(err)
     })?;
     // As-of: the version whose validity interval covers that instant.
     let version = match params.as_of_ms {
@@ -73,11 +74,11 @@ pub async fn fact_history_handler(
     State(state): State<EngineState>,
     Extension(principal): Extension<RequestPrincipal>,
     Query(params): Query<FactParams>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> EngineResult<impl IntoResponse> {
     let (tenant, entity_id) = scope(&state, &principal, params.entity_id.as_deref())?;
     let history = tenant.fact_history(&entity_id, &params.fact_key).map_err(|err| {
         tracing::error!(error = ?err, "fact history read failed");
-        StatusCode::INTERNAL_SERVER_ERROR
+        EngineError::Other(err)
     })?;
     record_usage_for_principal(&state, &principal, "facts_history");
     Ok((

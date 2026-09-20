@@ -6,6 +6,33 @@ use super::{
 use crate::graph::Direction;
 use rayon::prelude::*;
 
+fn merge_fused_items(
+    fused: impl IntoIterator<Item = (String, u64, f32)>,
+) -> HashMap<String, (u64, f32)> {
+    let mut fused_map: HashMap<String, (u64, f32)> = HashMap::new();
+    for (mid, ts, score) in fused {
+        let entry = fused_map.entry(mid).or_insert((ts, 0.0));
+        entry.0 = ts;
+        entry.1 = entry.1.max(score);
+    }
+    fused_map
+}
+
+fn normalize_graph_scores(scores: &mut HashMap<String, f32>) {
+    let max_graph = scores.values().copied().fold(0.0f32, f32::max);
+    if max_graph > 0.0 {
+        for score in scores.values_mut() {
+            *score /= max_graph;
+        }
+    }
+}
+
+fn sort_fused_items(items: &mut [(String, u64, f32)]) {
+    items.sort_by(|a, b| {
+        b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(&b.0))
+    });
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) fn fusion_phase(s: &mut QueryPipelineState) {
     let stage_start = Instant::now();
@@ -44,12 +71,7 @@ pub(crate) fn fusion_phase(s: &mut QueryPipelineState) {
         s.now_ms =
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
     }
-    let mut fused_map: HashMap<String, (u64, f32)> = HashMap::new();
-    for (mid, ts, score) in fused {
-        let entry = fused_map.entry(mid).or_insert((ts, 0.0));
-        entry.0 = ts;
-        entry.1 = entry.1.max(score);
-    }
+    let mut fused_map = merge_fused_items(fused);
 
     for (mid, boost) in &s.route.memory_scores {
         if let Some((ts, _)) = s.tenant.lookup_by_memory_id(mid).unwrap_or(None) {
@@ -234,19 +256,64 @@ pub(crate) fn fusion_phase(s: &mut QueryPipelineState) {
     // derived records reached values in the hundreds and outranked
     // semantically relevant results regardless of the query. Scale to [0, 1]
     // so graph evidence is one bounded signal among the others.
-    let max_graph = graph_scores.values().copied().fold(0.0f32, f32::max);
-    if max_graph > 0.0 {
-        for score in graph_scores.values_mut() {
-            *score /= max_graph;
-        }
-    }
+    normalize_graph_scores(&mut graph_scores);
     s.scoring.graph_scores = graph_scores;
     (s.diag.graph_ms, s.diag.graph_us) = elapsed_ms_and_us(stage_start);
 
     let mut fused_vec: Vec<(String, u64, f32)> =
         fused_map.into_iter().map(|(mid, (ts, score))| (mid, ts, score)).collect();
-    fused_vec.sort_by(|a, b| {
-        b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(&b.0))
-    });
+    sort_fused_items(&mut fused_vec);
     s.fused.items = fused_vec;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fused_items_keep_the_best_score_and_latest_timestamp() {
+        let merged = merge_fused_items(vec![
+            ("memory-a".to_string(), 10, 0.25),
+            ("memory-a".to_string(), 20, 0.75),
+            ("memory-b".to_string(), 30, 0.50),
+        ]);
+
+        assert_eq!(merged.get("memory-a"), Some(&(20, 0.75)));
+        assert_eq!(merged.get("memory-b"), Some(&(30, 0.50)));
+    }
+
+    #[test]
+    fn fused_items_sort_by_score_then_memory_id() {
+        let mut items = vec![
+            ("memory-b".to_string(), 20, 0.5),
+            ("memory-c".to_string(), 30, 0.8),
+            ("memory-a".to_string(), 10, 0.5),
+        ];
+
+        sort_fused_items(&mut items);
+
+        assert_eq!(
+            items,
+            vec![
+                ("memory-c".to_string(), 30, 0.8),
+                ("memory-a".to_string(), 10, 0.5),
+                ("memory-b".to_string(), 20, 0.5),
+            ]
+        );
+    }
+
+    #[test]
+    fn graph_scores_are_normalized_to_the_unit_interval() {
+        let mut scores = HashMap::from([
+            ("memory-a".to_string(), 2.0),
+            ("memory-b".to_string(), 1.0),
+            ("memory-c".to_string(), 0.0),
+        ]);
+
+        normalize_graph_scores(&mut scores);
+
+        assert!((scores["memory-a"] - 1.0).abs() < f32::EPSILON);
+        assert!((scores["memory-b"] - 0.5).abs() < f32::EPSILON);
+        assert!(scores["memory-c"].abs() < f32::EPSILON);
+    }
 }

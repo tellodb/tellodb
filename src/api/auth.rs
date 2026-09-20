@@ -10,6 +10,7 @@ use std::time::Instant;
 use tower_http::cors::CorsLayer;
 
 use crate::api::{EngineState, PlatformWriteOp};
+use crate::error::{EngineError, EngineResult};
 use crate::platform::{ApiKeyAuth, PublicUser};
 
 pub const DEFAULT_TEST_API_KEY: &str = "XXX1111AAA";
@@ -340,13 +341,14 @@ pub fn check_auth_rate_limit(
     state: &EngineState,
     headers: &HeaderMap,
     peer: Option<std::net::SocketAddr>,
-) -> Result<(), StatusCode> {
+) -> EngineResult<()> {
     check_auth_rate_limit_with_limiter(
         &state.rate_limiter,
         headers,
         peer,
         state.config.server.trust_proxy,
     )
+    .map_err(|status| EngineError::from_http_status(status.as_u16()))
 }
 
 fn check_auth_rate_limit_with_limiter(
@@ -388,14 +390,14 @@ pub fn record_usage_for_principal(
 pub fn session_user_from_headers(
     state: &EngineState,
     headers: &HeaderMap,
-) -> Result<PublicUser, StatusCode> {
-    let token = request_bearer_token(headers).ok_or(StatusCode::UNAUTHORIZED)?;
+) -> EngineResult<PublicUser> {
+    let token = request_bearer_token(headers).ok_or(EngineError::Unauthorized)?;
     match state.platform.resolve_session(token) {
         Ok(Some(user)) => Ok(user),
-        Ok(None) => Err(StatusCode::UNAUTHORIZED),
+        Ok(None) => Err(EngineError::Unauthorized),
         Err(err) => {
             tracing::warn!("session auth lookup failed: {:?}", err);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err(EngineError::Other(err))
         }
     }
 }

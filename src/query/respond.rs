@@ -449,3 +449,109 @@ pub(crate) fn score_build_response(
 
     Ok(queries)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn card(source_memory_id: &str, source_session_id: &str) -> EvidenceCard {
+        EvidenceCard {
+            claim_text: "The source claim".to_string(),
+            source_memory_id: source_memory_id.to_string(),
+            source_session_id: source_session_id.to_string(),
+            card_id: Some("card-1".to_string()),
+            semantic_rank: None,
+            semantic_score: 0.8,
+            bm25_rank: None,
+            bm25_score: 0.0,
+            session_router_rank: None,
+            session_router_score: 0.0,
+            card_score: 0.0,
+            reranker_score: 0.8,
+            entity_hits: 1,
+            lexical_hits: 0,
+            temporal_hits: 0,
+            facet_mask: 0,
+            graph_score: 0.0,
+            child_score: 0.0,
+            is_latest: true,
+            card_type: MemoryKind::Fact.as_str().to_string(),
+            final_score: 0.8,
+            inference_notes: None,
+            internal_kind: MemoryKind::Fact,
+            created_at_ms: 100,
+            entity_id: "entity".to_string(),
+            source_turn_index: 0,
+        }
+    }
+
+    fn tenant() -> (tempfile::TempDir, TenantStore) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = TenantStore::new(&directory.path().join("tenant.db")).unwrap();
+        (directory, store)
+    }
+
+    #[test]
+    fn proof_packet_falls_back_to_the_claim_when_no_ledger_turn_exists() {
+        let (_directory, tenant) = tenant();
+        let packet = build_proof_packet(
+            &tenant,
+            "source",
+            &QueryPlan::default(),
+            &card("memory-1", "session-1"),
+            "light",
+            false,
+            0,
+        );
+
+        assert_eq!(packet.source_turns.len(), 1);
+        assert_eq!(packet.source_turns[0].text, "The source claim");
+        assert!(packet.verified);
+    }
+
+    #[test]
+    fn proof_packet_requires_a_session_for_verified_evidence() {
+        let (_directory, tenant) = tenant();
+        let packet = build_proof_packet(
+            &tenant,
+            "source",
+            &QueryPlan::default(),
+            &card("memory-1", ""),
+            "full",
+            true,
+            0,
+        );
+
+        assert!(!packet.verified);
+        assert!((packet.confidence - 0.1).abs() < 1e-6);
+        assert!(packet
+            .checks
+            .iter()
+            .any(|check| { check.name == "source_backed" && !check.passed }));
+    }
+
+    #[test]
+    fn proof_packet_reports_missing_required_facets() {
+        let (_directory, tenant) = tenant();
+        let mut plan = QueryPlan::default();
+        plan.coverage_mode = true;
+        plan.coverage_facets = vec![crate::api::plan::CoverageFacet {
+            text: "deadline".to_string(),
+            lexical_terms: Vec::new(),
+            temporal_terms: Vec::new(),
+            entities: Vec::new(),
+        }];
+        let packet = build_proof_packet(
+            &tenant,
+            "source",
+            &plan,
+            &card("memory-1", "session-1"),
+            "full",
+            true,
+            0,
+        );
+
+        assert_eq!(packet.missing_facets, vec!["deadline"]);
+        assert!(!packet.verified);
+    }
+}

@@ -12,6 +12,7 @@ use crate::api::types::{
     PlatformSignupPayload, PlatformStatsResponse,
 };
 use crate::api::EngineState;
+use crate::error::{EngineError, EngineResult};
 
 const SESSION_TTL_SECONDS: u64 = 60 * 60 * 24 * 30;
 
@@ -20,7 +21,7 @@ pub async fn platform_signup_handler(
     headers: HeaderMap,
     peer: Option<Extension<ConnectInfo<std::net::SocketAddr>>>,
     Json(payload): Json<PlatformSignupPayload>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> EngineResult<impl IntoResponse> {
     auth::check_auth_rate_limit(
         &state,
         &headers,
@@ -33,15 +34,15 @@ pub async fn platform_signup_handler(
             let msg = err.to_string();
             tracing::warn!("platform signup failed: {}", msg);
             if msg.contains("exists") || msg.contains("at least") || msg.contains("at most") {
-                StatusCode::BAD_REQUEST
+                EngineError::bad_request(msg)
             } else {
-                StatusCode::INTERNAL_SERVER_ERROR
+                EngineError::Other(err)
             }
         })?;
     let token =
         state.platform.create_session(&user.user_id, SESSION_TTL_SECONDS).map_err(|err| {
             tracing::warn!("platform signup session create failed: {:?}", err);
-            StatusCode::INTERNAL_SERVER_ERROR
+            EngineError::Other(err)
         })?;
     Ok((StatusCode::CREATED, Json(PlatformAuthResponse { token, user })))
 }
@@ -51,7 +52,7 @@ pub async fn platform_login_handler(
     headers: HeaderMap,
     peer: Option<Extension<ConnectInfo<std::net::SocketAddr>>>,
     Json(payload): Json<PlatformLoginPayload>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> EngineResult<impl IntoResponse> {
     auth::check_auth_rate_limit(
         &state,
         &headers,
@@ -61,19 +62,19 @@ pub async fn platform_login_handler(
         |err| {
             let msg = err.to_string();
             if msg.contains("invalid credentials") {
-                StatusCode::UNAUTHORIZED
+                EngineError::Unauthorized
             } else if msg.contains("at most") {
-                StatusCode::BAD_REQUEST
+                EngineError::bad_request(msg)
             } else {
                 tracing::warn!("platform login failed: {}", msg);
-                StatusCode::INTERNAL_SERVER_ERROR
+                EngineError::Other(err)
             }
         },
     )?;
     let token =
         state.platform.create_session(&user.user_id, SESSION_TTL_SECONDS).map_err(|err| {
             tracing::warn!("platform login session create failed: {:?}", err);
-            StatusCode::INTERNAL_SERVER_ERROR
+            EngineError::Other(err)
         })?;
     Ok((StatusCode::OK, Json(PlatformAuthResponse { token, user })))
 }
@@ -81,11 +82,11 @@ pub async fn platform_login_handler(
 pub async fn platform_logout_handler(
     State(state): State<EngineState>,
     headers: HeaderMap,
-) -> Result<impl IntoResponse, StatusCode> {
-    let token = auth::request_bearer_token(&headers).ok_or(StatusCode::UNAUTHORIZED)?;
+) -> EngineResult<impl IntoResponse> {
+    let token = auth::request_bearer_token(&headers).ok_or(EngineError::Unauthorized)?;
     state.platform.delete_session(token).map_err(|error| {
         tracing::warn!(error = ?error, "platform logout failed");
-        StatusCode::INTERNAL_SERVER_ERROR
+        EngineError::Other(error)
     })?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -93,7 +94,7 @@ pub async fn platform_logout_handler(
 pub async fn platform_me_handler(
     State(state): State<EngineState>,
     headers: HeaderMap,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> EngineResult<impl IntoResponse> {
     let user = session_user_from_headers(&state, &headers)?;
     Ok((StatusCode::OK, Json(user)))
 }
@@ -102,12 +103,12 @@ pub async fn platform_create_api_key_handler(
     State(state): State<EngineState>,
     headers: HeaderMap,
     Json(payload): Json<PlatformCreateApiKeyPayload>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> EngineResult<impl IntoResponse> {
     let user = session_user_from_headers(&state, &headers)?;
     let (api_key, key) =
         state.platform.create_api_key(&user.user_id, payload.name.as_str()).map_err(|err| {
             tracing::warn!("platform create api key failed: {:?}", err);
-            StatusCode::INTERNAL_SERVER_ERROR
+            EngineError::Other(err)
         })?;
     Ok((StatusCode::CREATED, Json(PlatformApiKeyCreateResponse { api_key, key })))
 }
@@ -115,11 +116,11 @@ pub async fn platform_create_api_key_handler(
 pub async fn platform_list_api_keys_handler(
     State(state): State<EngineState>,
     headers: HeaderMap,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> EngineResult<impl IntoResponse> {
     let user = session_user_from_headers(&state, &headers)?;
     let api_keys = state.platform.list_api_keys(&user.user_id).map_err(|err| {
         tracing::warn!("platform list api keys failed: {:?}", err);
-        StatusCode::INTERNAL_SERVER_ERROR
+        EngineError::Other(err)
     })?;
     Ok((StatusCode::OK, Json(PlatformApiKeyListResponse { api_keys })))
 }
@@ -128,15 +129,15 @@ pub async fn platform_revoke_api_key_handler(
     State(state): State<EngineState>,
     headers: HeaderMap,
     Path(key_id): Path<String>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> EngineResult<impl IntoResponse> {
     let user = session_user_from_headers(&state, &headers)?;
     state.platform.revoke_api_key(&user.user_id, key_id.as_str()).map_err(|err| {
         let msg = err.to_string();
         if msg.contains("not found") {
-            StatusCode::NOT_FOUND
+            EngineError::NotFound(msg)
         } else {
             tracing::warn!("platform revoke api key failed: {:?}", err);
-            StatusCode::INTERNAL_SERVER_ERROR
+            EngineError::Other(err)
         }
     })?;
     Ok(StatusCode::NO_CONTENT)
@@ -145,11 +146,11 @@ pub async fn platform_revoke_api_key_handler(
 pub async fn platform_stats_handler(
     State(state): State<EngineState>,
     headers: HeaderMap,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> EngineResult<impl IntoResponse> {
     let user = session_user_from_headers(&state, &headers)?;
     let usage = state.platform.usage_stats(&user.user_id).map_err(|err| {
         tracing::warn!("platform usage stats failed: {:?}", err);
-        StatusCode::INTERNAL_SERVER_ERROR
+        EngineError::Other(err)
     })?;
     Ok((StatusCode::OK, Json(PlatformStatsResponse { usage })))
 }
@@ -157,11 +158,11 @@ pub async fn platform_stats_handler(
 pub async fn platform_profile_handler(
     State(state): State<EngineState>,
     headers: HeaderMap,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> EngineResult<impl IntoResponse> {
     let user = session_user_from_headers(&state, &headers)?;
     let profile = state.platform.user_profile(&user.user_id).map_err(|err| {
         tracing::warn!("platform profile failed: {:?}", err);
-        StatusCode::INTERNAL_SERVER_ERROR
+        EngineError::Other(err)
     })?;
     Ok((StatusCode::OK, Json(PlatformProfileResponse { profile })))
 }

@@ -248,7 +248,7 @@ pub(crate) fn score_loop(s: &mut QueryPipelineState) -> Vec<EvidenceCard> {
             graph_score,
             child_score: 0.0,
             is_latest: false,
-            card_type: format!("{:?}", obs.kind),
+            card_type: obs.kind.as_str().to_string(),
             final_score: fs,
             inference_notes: None,
             internal_kind: obs.kind,
@@ -311,4 +311,69 @@ pub(crate) fn describe_stale_fact(
         valid_to_ms: version.valid_to_ms,
         evidence: version.evidence.clone(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn card(memory_id: &str, created_at_ms: u64, final_score: f32) -> EvidenceCard {
+        EvidenceCard {
+            claim_text: memory_id.to_string(),
+            source_memory_id: memory_id.to_string(),
+            source_session_id: "session".to_string(),
+            card_id: None,
+            semantic_rank: None,
+            semantic_score: final_score,
+            bm25_rank: None,
+            bm25_score: 0.0,
+            session_router_rank: None,
+            session_router_score: 0.0,
+            card_score: 0.0,
+            reranker_score: final_score,
+            entity_hits: 0,
+            lexical_hits: 0,
+            temporal_hits: 0,
+            facet_mask: 0,
+            graph_score: 0.0,
+            child_score: 0.0,
+            is_latest: false,
+            card_type: MemoryKind::Fact.as_str().to_string(),
+            final_score,
+            inference_notes: None,
+            internal_kind: MemoryKind::Fact,
+            created_at_ms,
+            entity_id: "entity".to_string(),
+            source_turn_index: 0,
+        }
+    }
+
+    #[test]
+    fn latest_preference_leaves_empty_input_unchanged() {
+        let mut cards = Vec::new();
+
+        apply_latest_preference(&mut cards, 0.35);
+
+        assert!(cards.is_empty());
+    }
+
+    #[test]
+    fn latest_preference_leaves_equal_timestamps_unchanged() {
+        let mut cards = vec![card("old", 100, 0.4), card("new", 100, 0.8)];
+        let before: Vec<f32> = cards.iter().map(|candidate| candidate.final_score).collect();
+
+        apply_latest_preference(&mut cards, 0.35);
+
+        let after: Vec<f32> = cards.iter().map(|candidate| candidate.final_score).collect();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn latest_preference_rewards_a_recent_relevant_candidate() {
+        let mut cards = vec![card("old", 100, 0.7), card("new", 200, 0.8)];
+
+        apply_latest_preference(&mut cards, 0.35);
+
+        assert!(cards[1].final_score - cards[0].final_score > 0.1);
+    }
 }
