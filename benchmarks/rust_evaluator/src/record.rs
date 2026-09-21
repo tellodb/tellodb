@@ -22,6 +22,7 @@ const BOOTSTRAP_SEED: u64 = 0x5eed_7e11_0db0;
 pub struct QuestionRecord {
     pub question_id: String,
     pub question_type: String,
+    pub cluster_id: String,
     /// At least one gold session in the top-k sessions (LongMemEval recall_any).
     pub hit_any: bool,
     /// Every gold session in the top-k sessions (LongMemEval recall_all).
@@ -78,6 +79,7 @@ pub struct RunContext<'a> {
     pub split: &'a str,
     pub tier: &'a str,
     pub top_k: usize,
+    pub seed: u64,
     pub config: Value,
     pub engine_url: &'a str,
     pub engine_api_key: Option<&'a str>,
@@ -160,29 +162,77 @@ pub fn mean_with_ci(values: &[f64]) -> Value {
     json!({ "mean": mean, "ci95": [lo, hi], "n": n })
 }
 
-fn bools(rows: &[&QuestionRecord], f: impl Fn(&QuestionRecord) -> Option<bool>) -> Vec<f64> {
-    rows.iter().filter_map(|r| f(r)).map(|b| if b { 1.0 } else { 0.0 }).collect()
+pub fn mean_with_clustered_ci(values: &[(String, f64)]) -> Value {
+    if values.is_empty() {
+        return json!({ "mean": null, "ci95": null, "n": 0 });
+    }
+    let mut clusters: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
+    for (cluster, value) in values {
+        clusters.entry(cluster).or_default().push(*value);
+    }
+    let clusters: Vec<Vec<f64>> = clusters.into_values().collect();
+    let n = clusters.len();
+    let mean = values.iter().map(|(_, value)| value).sum::<f64>() / values.len() as f64;
+    let mut rng = SplitMix(BOOTSTRAP_SEED);
+    let mut means = Vec::with_capacity(BOOTSTRAP_RESAMPLES);
+    for _ in 0..BOOTSTRAP_RESAMPLES {
+        let mut sum = 0.0;
+        let mut observations = 0usize;
+        for _ in 0..n {
+            let cluster = &clusters[(rng.next() % n as u64) as usize];
+            sum += cluster.iter().sum::<f64>();
+            observations += cluster.len();
+        }
+        means.push(sum / observations as f64);
+    }
+    means.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let lo = means[(BOOTSTRAP_RESAMPLES as f64 * 0.025) as usize];
+    let hi = means[((BOOTSTRAP_RESAMPLES as f64 * 0.975) as usize).min(BOOTSTRAP_RESAMPLES - 1)];
+    json!({ "mean": mean, "ci95": [lo, hi], "n": n })
 }
 
-fn quality_block(rows: &[&QuestionRecord]) -> Value {
+fn metric_with_ci(
+    rows: &[&QuestionRecord],
+    clustered: bool,
+    f: impl Fn(&QuestionRecord) -> Option<f64>,
+) -> Value {
+    let values = rows
+        .iter()
+        .filter_map(|row| f(row).map(|value| (row.cluster_id.clone(), value)))
+        .collect::<Vec<_>>();
+    if clustered {
+        mean_with_clustered_ci(&values)
+    } else {
+        mean_with_ci(&values.into_iter().map(|(_, value)| value).collect::<Vec<_>>())
+    }
+}
+
+fn quality_block(rows: &[&QuestionRecord], clustered: bool) -> Value {
+    let cluster_count = rows
+        .iter()
+        .map(|row| row.cluster_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
     json!({
-        "n": rows.len(),
+        "n": if clustered { cluster_count } else { rows.len() },
+        "questions": rows.len(),
+        "bootstrap_unit": if clustered { "conversation" } else { "question" },
         "errored": rows.iter().filter(|r| r.errored).count(),
         // Errored questions count as failures everywhere: dropping them would
         // silently inflate every metric.
         "unanswerable": rows.iter().filter(|r| !r.answerable).count(),
-        "recall_any": mean_with_ci(&bools(rows, |r| r.answerable.then_some(r.hit_any && !r.errored))),
-        "recall_all": mean_with_ci(&bools(rows, |r| r.answerable.then_some(r.hit_all && !r.errored))),
-        "ndcg": mean_with_ci(
-            &rows
-                .iter()
-                .filter(|r| r.answerable)
-                .map(|r| if r.errored { 0.0 } else { r.ndcg })
-                .collect::<Vec<_>>(),
-        ),
-        "accuracy": mean_with_ci(&bools(rows, |r| {
-            if r.errored { Some(false) } else { r.answer_correct }
-        })),
+        "recall_any": metric_with_ci(rows, clustered, |r| {
+            r.answerable.then_some(f64::from(u8::from(r.hit_any && !r.errored)))
+        }),
+        "recall_all": metric_with_ci(rows, clustered, |r| {
+            r.answerable.then_some(f64::from(u8::from(r.hit_all && !r.errored)))
+        }),
+        "ndcg": metric_with_ci(rows, clustered, |r| {
+            r.answerable.then_some(if r.errored { 0.0 } else { r.ndcg })
+        }),
+        "accuracy": metric_with_ci(rows, clustered, |r| {
+            if r.errored { Some(0.0) } else { r.answer_correct.map(|value| f64::from(u8::from(value))) }
+        }),
     })
 }
 
@@ -294,13 +344,14 @@ pub async fn write_run_record(
     ingest: &IngestStats,
     out_dir: &Path,
 ) -> Result<PathBuf> {
+    let clustered = ctx.dataset_kind == "locomo";
     let all: Vec<&QuestionRecord> = rows.iter().collect();
     let mut by_type: BTreeMap<&str, Vec<&QuestionRecord>> = BTreeMap::new();
     for row in rows {
         by_type.entry(row.question_type.as_str()).or_default().push(row);
     }
     let per_type: BTreeMap<&str, Value> =
-        by_type.iter().map(|(k, v)| (*k, quality_block(v))).collect();
+        by_type.iter().map(|(k, v)| (*k, quality_block(v, clustered))).collect();
 
     let ok: Vec<&QuestionRecord> = rows.iter().filter(|r| !r.errored).collect();
     let query_ms: Vec<u64> = ok.iter().map(|r| r.query_ms).collect();
@@ -308,7 +359,7 @@ pub async fn write_run_record(
     let finished_ms = now_ms();
 
     let record = json!({
-        "schema": 1,
+        "schema": 2,
         "mode": ctx.mode,
         "tier": ctx.tier,
         "started_ms": ctx.started_ms,
@@ -325,11 +376,12 @@ pub async fn write_run_record(
             "split": ctx.split,
         },
         "top_k": ctx.top_k,
+        "seed": ctx.seed,
         "config": ctx.config,
         "engine": engine_info(client, ctx.engine_url, ctx.engine_api_key).await,
         "host": host_info(ctx.tier),
         "metrics": {
-            "overall": quality_block(&all),
+            "overall": quality_block(&all, clustered),
             "per_type": per_type,
             "latency_ms": {
                 "query_client": latency_summary(&query_ms),
@@ -370,11 +422,19 @@ pub async fn write_run_record(
     Ok(path)
 }
 
+fn sample_size_label(record: &Value) -> String {
+    let overall = &record["metrics"]["overall"];
+    let n = overall["n"].as_u64().unwrap_or(0);
+    let unit = overall["bootstrap_unit"].as_str().unwrap_or("question");
+    let suffix = if n == 1 { "" } else { "s" };
+    format!("{n} {unit}{suffix}")
+}
+
 /// Render a markdown comparison table from run record files.
 pub fn report(paths: &[String]) -> Result<String> {
     let mut out = String::from(
-        "| run | tier | commit | dataset | split | n | err | recall_any (95% CI) | recall_all | nDCG | accuracy (95% CI) | query p50/p95/p99 ms | ingest mem/s |\n\
-         |---|---|---|---|---|---|---|---|---|---|---|---|---|\n",
+        "| run | seed | tier | commit | dataset | split | n (bootstrap unit) | err | recall_any (95% CI) | recall_all | nDCG | accuracy (95% CI) | query p50/p95/p99 ms | ingest mem/s |\n\
+         |---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n",
     );
     let fmt_ci = |v: &Value| -> String {
         match (v["mean"].as_f64(), v["ci95"].as_array()) {
@@ -398,14 +458,15 @@ pub fn report(paths: &[String]) -> Result<String> {
         let dirty = if r["git"]["dirty"].as_bool().unwrap_or(false) { "*" } else { "" };
         let tier = r["tier"].as_str().or_else(|| r["host"]["tier"].as_str()).unwrap_or("–");
         out.push_str(&format!(
-            "| {} | {} | {}{} | {} | {} | {} | {} | {} | {} | {} | {} | {}/{}/{} | {:.1} |\n",
+            "| {} | {} | {} | {}{} | {} | {} | {} | {} | {} | {} | {} | {} | {}/{}/{} | {:.1} |\n",
             Path::new(path).file_stem().map(|s| s.to_string_lossy()).unwrap_or_default(),
+            r["seed"].as_u64().map_or("–".to_string(), |seed| seed.to_string()),
             tier,
             commit,
             dirty,
             r["dataset"]["kind"].as_str().unwrap_or("?"),
             r["dataset"]["split"].as_str().unwrap_or("?"),
-            m["overall"]["n"],
+            sample_size_label(&r),
             m["overall"]["errored"],
             fmt_ci(&m["overall"]["recall_any"]),
             fmt_mean(&m["overall"]["recall_all"]),
@@ -424,9 +485,9 @@ pub fn report(paths: &[String]) -> Result<String> {
     // quality columns above even mean.
     out.push_str("\n### Configuration\n\n");
     out.push_str(
-        "| run | timestamps | heuristics | lanes | rerank | embed cache hit % | device |\n",
+        "| run | client context | timestamps | heuristics | lanes | rerank | embed cache hit % | device |\n",
     );
-    out.push_str("|---|---|---|---|---|---|---|\n");
+    out.push_str("|---|---|---|---|---|---|---|---|\n");
     for path in paths {
         let data = fs::read_to_string(path).with_context(|| format!("Failed to read {path}"))?;
         let r: Value = serde_json::from_str(&data).with_context(|| format!("Bad record {path}"))?;
@@ -442,8 +503,9 @@ pub fn report(paths: &[String]) -> Result<String> {
             .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join("+"))
             .unwrap_or_else(|| "–".to_string());
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
             Path::new(path).file_stem().map(|s| s.to_string_lossy()).unwrap_or_default(),
+            r["config"]["client_context"].as_str().unwrap_or("–"),
             r["config"]["timestamps"].as_str().unwrap_or("–"),
             e["heuristics"].as_str().unwrap_or("–"),
             if lanes.is_empty() { "–".to_string() } else { lanes },
@@ -498,8 +560,26 @@ pub fn paired_delta_ci(a: &[f64], b: &[f64]) -> Option<(f64, f64, f64)> {
     Some((v["mean"].as_f64()?, ci[0].as_f64()?, ci[1].as_f64()?))
 }
 
-/// Per-question `(recall_any, ndcg)` of answerable questions, by question id.
-fn question_scores(record: &Value) -> BTreeMap<String, (f64, f64)> {
+pub fn paired_delta_clustered_ci(
+    a: &[f64],
+    b: &[f64],
+    clusters: &[String],
+) -> Option<(f64, f64, f64)> {
+    if a.is_empty() || a.len() != b.len() || a.len() != clusters.len() {
+        return None;
+    }
+    let diffs = a
+        .iter()
+        .zip(b)
+        .zip(clusters)
+        .map(|((x, y), cluster)| (cluster.clone(), y - x))
+        .collect::<Vec<_>>();
+    let value = mean_with_clustered_ci(&diffs);
+    let ci = value["ci95"].as_array()?;
+    Some((value["mean"].as_f64()?, ci[0].as_f64()?, ci[1].as_f64()?))
+}
+
+fn question_scores(record: &Value) -> BTreeMap<String, (f64, f64, String)> {
     record["questions"]
         .as_array()
         .map(|rows| {
@@ -509,7 +589,12 @@ fn question_scores(record: &Value) -> BTreeMap<String, (f64, f64)> {
                     let errored = q["errored"].as_bool().unwrap_or(false);
                     let hit = q["hit_any"].as_bool().unwrap_or(false) && !errored;
                     let ndcg = if errored { 0.0 } else { q["ndcg"].as_f64().unwrap_or(0.0) };
-                    Some((q["question_id"].as_str()?.to_string(), (f64::from(u8::from(hit)), ndcg)))
+                    let question_id = q["question_id"].as_str()?.to_string();
+                    let cluster =
+                        q["cluster_id"].as_str().map(str::to_string).unwrap_or_else(|| {
+                            question_id.split('/').next().unwrap_or(&question_id).to_string()
+                        });
+                    Some((question_id, (f64::from(u8::from(hit)), ndcg, cluster)))
                 })
                 .collect()
         })
@@ -544,6 +629,7 @@ pub fn ablation_report(baseline: &str, runs: &[String]) -> Result<String> {
     };
     let base = load(baseline)?;
     let base_scores = question_scores(&base);
+    let clustered = base["dataset"]["kind"].as_str() == Some("locomo");
     let ingest = |r: &Value, key: &str| r["metrics"]["ingest"][key].as_f64();
     let p95 = |r: &Value| r["metrics"]["latency_ms"]["query_client"]["p95"].as_f64();
     let pct = |new: Option<f64>, old: Option<f64>| match (new, old) {
@@ -573,17 +659,26 @@ pub fn ablation_report(baseline: &str, runs: &[String]) -> Result<String> {
     for path in runs {
         let run = load(path)?;
         let scores = question_scores(&run);
-        let (mut a_hit, mut b_hit, mut a_ndcg, mut b_ndcg) = (vec![], vec![], vec![], vec![]);
-        for (qid, (hit, ndcg)) in &base_scores {
-            if let Some((run_hit, run_ndcg)) = scores.get(qid) {
+        let (mut a_hit, mut b_hit, mut a_ndcg, mut b_ndcg, mut clusters) =
+            (vec![], vec![], vec![], vec![], vec![]);
+        for (qid, (hit, ndcg, cluster)) in &base_scores {
+            if let Some((run_hit, run_ndcg, _)) = scores.get(qid) {
                 a_hit.push(*hit);
                 b_hit.push(*run_hit);
                 a_ndcg.push(*ndcg);
                 b_ndcg.push(*run_ndcg);
+                clusters.push(cluster.clone());
             }
         }
-        let d_hit = paired_delta_ci(&a_hit, &b_hit);
-        let d_ndcg = paired_delta_ci(&a_ndcg, &b_ndcg);
+        let delta = |a: &[f64], b: &[f64]| {
+            if clustered {
+                paired_delta_clustered_ci(a, b, &clusters)
+            } else {
+                paired_delta_ci(a, b)
+            }
+        };
+        let d_hit = delta(&a_hit, &b_hit);
+        let d_ndcg = delta(&a_ndcg, &b_ndcg);
         let spans_zero =
             |d: Option<(f64, f64, f64)>| d.is_some_and(|(_, lo, hi)| lo <= 0.0 && hi >= 0.0);
         let verdict = if spans_zero(d_hit) && spans_zero(d_ndcg) { "drop" } else { "keep" };
@@ -666,6 +761,36 @@ mod tests {
     }
 
     #[test]
+    fn clustered_bootstrap_resamples_conversations_and_reports_their_count() {
+        let values: Vec<(String, f64)> = (0..300)
+            .map(|i| {
+                let cluster = format!("conversation-{}", i / 100);
+                let value = f64::from(u8::from(i < 100));
+                (cluster, value)
+            })
+            .collect();
+        let iid = mean_with_ci(&values.iter().map(|(_, value)| *value).collect::<Vec<_>>());
+        let clustered = mean_with_clustered_ci(&values);
+        let iid_ci = iid["ci95"].as_array().unwrap();
+        let clustered_ci = clustered["ci95"].as_array().unwrap();
+        let iid_width = iid_ci[1].as_f64().unwrap() - iid_ci[0].as_f64().unwrap();
+        let clustered_width = clustered_ci[1].as_f64().unwrap() - clustered_ci[0].as_f64().unwrap();
+
+        assert_eq!(clustered["n"], 3);
+        assert!(clustered_width > iid_width);
+    }
+
+    #[test]
+    fn report_labels_locomo_sample_size_as_conversations() {
+        let record = json!({
+            "dataset": { "kind": "locomo" },
+            "metrics": { "overall": { "n": 3, "bootstrap_unit": "conversation" } }
+        });
+
+        assert_eq!(sample_size_label(&record), "3 conversations");
+    }
+
+    #[test]
     fn paired_delta_detects_consistent_change() {
         let a: Vec<f64> = (0..100).map(|i| f64::from(u8::from(i % 2 == 0))).collect();
         let same = paired_delta_ci(&a, &a).unwrap();
@@ -674,6 +799,17 @@ mod tests {
         let (mean, lo, _) = paired_delta_ci(&a, &better).unwrap();
         assert!((mean - 0.5).abs() < 1e-9 && lo > 0.0);
         assert!(paired_delta_ci(&a, &a[..10]).is_none());
+    }
+
+    #[test]
+    fn paired_clustered_delta_resamples_conversations() {
+        let baseline = vec![0.0; 300];
+        let candidate = (0..300).map(|i| f64::from(u8::from(i < 100))).collect::<Vec<_>>();
+        let clusters = (0..300).map(|i| format!("conversation-{}", i / 100)).collect::<Vec<_>>();
+        let iid = paired_delta_ci(&baseline, &candidate).unwrap();
+        let clustered = paired_delta_clustered_ci(&baseline, &candidate, &clusters).unwrap();
+
+        assert!(clustered.2 - clustered.1 > iid.2 - iid.1);
     }
 
     #[test]

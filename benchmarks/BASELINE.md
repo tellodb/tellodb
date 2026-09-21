@@ -1,3 +1,19 @@
+# Baseline
+
+## Canonical protocol
+
+| setting | value |
+|---|---|
+| split | `dev` |
+| client context | `off` |
+| timestamps | `session` |
+| reset | first run of each suite only |
+| seeds | `1..RUNS` |
+
+The results below predate this protocol block and remain stale until E0.3 regenerates them from a clean commit.
+
+## Results
+
 | run | tier | commit | dataset | split | n | err | recall_any (95% CI) | recall_all | nDCG | accuracy (95% CI) | query p50/p95/p99 ms | ingest mem/s |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
 | 1789651919890_longmemeval_s_cleaned_dev_recall | smoke | 878a2b5f* | longmemeval | dev | 10 | 0 | 100.0 (100.0–100.0) | 100.0 | 95.0 | – | 180/285/285 | 62.2 |

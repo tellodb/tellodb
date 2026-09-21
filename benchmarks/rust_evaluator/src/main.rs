@@ -245,6 +245,9 @@ struct Cli {
     #[arg(long, global = true, default_value_t = 500)]
     limit: usize,
 
+    #[arg(long, global = true, default_value_t = 1)]
+    seed: u64,
+
     #[arg(long, global = true, default_value_t = 0)]
     start_index: usize,
 
@@ -327,11 +330,11 @@ struct Cli {
     clear_embedding_cache: bool,
 
     /// What the evaluator sends per turn (see `ClientContext`).
-    #[arg(long, global = true, value_enum, default_value_t = ClientContext::Window)]
+    #[arg(long, global = true, value_enum, default_value_t = ClientContext::Off)]
     client_context: ClientContext,
 
-    /// How to assign timestamps during ingest: `wallclock` (default) or `session`.
-    #[arg(long, global = true, value_enum, default_value_t = TimestampMode::Wallclock)]
+    /// How to assign timestamps during ingest: `wallclock` or `session`.
+    #[arg(long, global = true, value_enum, default_value_t = TimestampMode::Session)]
     timestamps: TimestampMode,
 }
 
@@ -542,6 +545,7 @@ struct NumericExtraction {
 #[derive(Clone)]
 struct EvalConfig {
     dataset_kind: DatasetKind,
+    seed: u64,
     timestamps: TimestampMode,
     tier: EvalTier,
     clear_embedding_cache: bool,
@@ -715,6 +719,7 @@ async fn main() -> Result<()> {
 
     let config = EvalConfig {
         dataset_kind: cli.dataset_kind,
+        seed: cli.seed,
         timestamps: cli.timestamps,
         tier: cli.tier,
         clear_embedding_cache: cli.clear_embedding_cache,
@@ -760,7 +765,8 @@ async fn main() -> Result<()> {
     match cli.mode {
         EvalMode::Recall => {
             let dataset_path = resolve_dataset_path(cli.dataset_kind, cli.dataset.as_deref())?;
-            let dataset = load_split(&dataset_path)?;
+            let mut dataset = load_split(&dataset_path)?;
+            shuffle_questions(&mut dataset, cli.seed);
             let config = EvalConfig { dataset_path, ..config };
             run_recall(&client, &dataset, cli.start_index, cli.limit, &config).await?
         }
@@ -774,7 +780,8 @@ async fn main() -> Result<()> {
             output_jsonl,
         } => {
             let dataset_path = resolve_dataset_path(cli.dataset_kind, cli.dataset.as_deref())?;
-            let dataset = load_split(&dataset_path)?;
+            let mut dataset = load_split(&dataset_path)?;
+            shuffle_questions(&mut dataset, cli.seed);
             let config = EvalConfig { dataset_path, ..config };
             run_llm(
                 &client,
@@ -856,6 +863,18 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn shuffle_questions(dataset: &mut [Instance], seed: u64) {
+    let mut state = seed;
+    for index in (1..dataset.len()).rev() {
+        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut value = state;
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^= value >> 31;
+        dataset.swap(index, value as usize % (index + 1));
+    }
 }
 
 fn resolve_dataset_path(dataset_kind: DatasetKind, user_path: Option<&str>) -> Result<String> {
@@ -1189,7 +1208,7 @@ async fn run_recall(
     };
     let mut totals = EvalTotals::default();
     let max_questions = limit.min(available);
-    let mut active_entity_id: Option<String> = None;
+    let mut ingested_entities = HashSet::new();
     let started_ms = record::now_ms();
     let mut rows: Vec<QuestionRecord> = Vec::with_capacity(max_questions);
     let mut ingest_stats = IngestStats::default();
@@ -1204,7 +1223,7 @@ async fn run_recall(
         if instance.haystack_sessions.is_empty() {
             println!("Skipping empty haystack");
             totals.skipped += 1;
-            rows.push(errored_row(&eval_question_id, question_type));
+            rows.push(errored_row(&eval_question_id, question_type, &entity_id));
             continue;
         }
 
@@ -1212,10 +1231,9 @@ async fn run_recall(
 
         let ingest_ms = if config.skip_ingest {
             0
-        } else if active_entity_id.as_deref() != Some(entity_id.as_str()) {
+        } else if ingested_entities.insert(entity_id.clone()) {
             let ingest_start = Instant::now();
             let outcome = ingest_instance(client, config, &entity_id, instance).await?;
-            active_entity_id = Some(entity_id.clone());
             let elapsed = ingest_start.elapsed().as_millis();
             ingest_stats.entities += 1;
             ingest_stats.memories += outcome.memories;
@@ -1250,6 +1268,7 @@ async fn run_recall(
         rows.push(QuestionRecord {
             question_id: eval_question_id.clone(),
             question_type: question_type.to_string(),
+            cluster_id: entity_id.clone(),
             hit_any: hit,
             hit_all,
             ndcg,
@@ -1373,10 +1392,11 @@ async fn run_recall(
     Ok(())
 }
 
-fn errored_row(question_id: &str, question_type: &str) -> QuestionRecord {
+fn errored_row(question_id: &str, question_type: &str, cluster_id: &str) -> QuestionRecord {
     QuestionRecord {
         question_id: question_id.to_string(),
         question_type: question_type.to_string(),
+        cluster_id: cluster_id.to_string(),
         hit_any: false,
         hit_all: false,
         ndcg: 0.0,
@@ -1412,8 +1432,10 @@ async fn save_run_record(
         split: config.split.as_str(),
         tier: &tier_str,
         top_k: config.top_k,
+        seed: config.seed,
         config: json!({
             "tier": &tier_str,
+            "seed": config.seed,
             "client_context": format!("{:?}", config.client_context).to_lowercase(),
             "ingest_concurrency": config.ingest_concurrency,
             "dev_fast": config.dev_fast,
@@ -1602,6 +1624,7 @@ async fn run_llm(
                     Ok(r) => QuestionRecord {
                         question_id: r.question_id,
                         question_type: r.question_type,
+                        cluster_id: entity_id,
                         hit_any: r.retrieval_hit,
                         hit_all: r.hit_all,
                         ndcg: r.ndcg,
@@ -1617,6 +1640,7 @@ async fn run_llm(
                         errored_row(
                             &eval_question_id,
                             instance.question_type.as_deref().unwrap_or("single-session-user"),
+                            &entity_id,
                         )
                     }
                 }
@@ -4603,6 +4627,49 @@ fn print_timing_summary(timings: &AggregateTimings, evaluated: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ordering_instance(id: &str) -> Instance {
+        Instance {
+            question_id: Some(id.to_string()),
+            entity_id: Some("entity".to_string()),
+            question_type: Some("type".to_string()),
+            question_date: None,
+            question: id.to_string(),
+            haystack_dates: vec![],
+            haystack_sessions: vec![],
+            haystack_session_ids: vec![],
+            answer_session_ids: vec![],
+            answer: None,
+        }
+    }
+
+    #[test]
+    fn cli_defaults_to_canonical_protocol_and_seed() {
+        let cli = Cli::try_parse_from(["rust_evaluator", "recall"]).unwrap();
+
+        assert_eq!(cli.client_context, ClientContext::Off);
+        assert_eq!(cli.timestamps, TimestampMode::Session);
+        assert_eq!(cli.seed, 1);
+        assert_eq!(cli.split, Split::Dev);
+    }
+
+    #[test]
+    fn seeded_question_order_is_repeatable_and_seed_dependent() {
+        let make = || (0..20).map(|i| ordering_instance(&format!("q{i}"))).collect::<Vec<_>>();
+        let mut first = make();
+        let mut repeated = make();
+        let mut second = make();
+
+        shuffle_questions(&mut first, 1);
+        shuffle_questions(&mut repeated, 1);
+        shuffle_questions(&mut second, 2);
+
+        let ids = |items: &[Instance]| {
+            items.iter().map(|item| item.question_id.clone().unwrap()).collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&first), ids(&repeated));
+        assert_ne!(ids(&first), ids(&second));
+    }
 
     #[test]
     fn locomo_dialog_ids_map_to_session_ids() {

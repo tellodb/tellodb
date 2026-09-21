@@ -9,6 +9,8 @@ TIER="smoke"
 # sizes. Iterating on one dataset should not cost a full matrix.
 ONLY=""
 RUNS_OVERRIDE=""
+TIMESTAMPS="session"
+CLIENT_CONTEXT="off"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --tier|-t)
@@ -113,7 +115,7 @@ esac
 echo "============================================================"
 echo "Tellodb Baseline Runner: Tier = ${TIER}"
 echo "Threads = ${TELLODB_THREADS}, Rerank = ${TELLODB_RERANK}, Max tokens = ${TELLODB_EMBED_MAX_TOKENS}, Limit = ${LIMIT}, Runs = ${RUNS}"
-echo "Embed text = ${TELLODB_EMBED_TEXT:-context} (window ${TELLODB_CONTEXT_WINDOW:-1}), Client context = ${CLIENT_CONTEXT:-window}"
+echo "Embed text = ${TELLODB_EMBED_TEXT:-context} (window ${TELLODB_CONTEXT_WINDOW:-1}), Client context = ${CLIENT_CONTEXT}"
 echo "============================================================"
 
 # Persistent cache directories to avoid re-downloading model weights
@@ -142,7 +144,6 @@ TELLODB_EMBED_CACHE="${TELLODB_EMBED_CACHE:-on}"
 # flatters the engine by ~2 recall points; it is not a setting any result
 # should be reported under. run_matrix.sh already defaulted to `session`, and
 # the mismatch made runs from the two scripts silently incomparable.
-TIMESTAMPS="${TIMESTAMPS:-session}"
 # Memory representation (WP2): what the engine embeds (legacy|turn|context),
 # how many neighbouring turns `context` adds, and whether the evaluator also
 # prepends its own header/window to each turn (window|off).
@@ -153,7 +154,6 @@ TELLODB_CONTEXT_WINDOW="${TELLODB_CONTEXT_WINDOW:-1}"
 # payload is already a 3-turn block, and the engine then windows those blocks
 # against their neighbours. `off` sends the turn as written and lets the
 # engine do it once.
-CLIENT_CONTEXT="${CLIENT_CONTEXT:-off}"
 
 ENGINE_BIN="${REPO_ROOT}/target/${PROFILE}/tellodb"
 EVALUATOR_BIN="${REPO_ROOT}/benchmarks/rust_evaluator/target/release/rust_evaluator"
@@ -230,9 +230,14 @@ if want_suite longmemeval; then
 echo "=== Running LongMemEval-S (dev split, ${RUNS} run(s)) ==="
 for run in $(seq 1 "$RUNS"); do
     echo "--- LongMemEval-S run $run/$RUNS ---"
+    reset_args=()
+    if [[ "$run" -eq 1 ]]; then
+        reset_args=(--reset-first)
+    fi
     "$EVALUATOR_BIN" \
         --dataset-kind longmemeval \
         --split dev \
+        --seed "$run" \
         --tier "$TIER" \
         --client-context "$CLIENT_CONTEXT" \
         --timestamps "$TIMESTAMPS" \
@@ -241,7 +246,7 @@ for run in $(seq 1 "$RUNS"); do
         --engine-url "$ENGINE_URL" \
         --engine-api-key "$ENGINE_API_KEY" \
         --runs-dir "$RUNS_DIR" \
-        --reset-first \
+        "${reset_args[@]}" \
         recall
 done
 fi
@@ -250,9 +255,14 @@ if want_suite locomo; then
 echo "=== Running LoCoMo (dev split, ${RUNS} run(s)) ==="
 for run in $(seq 1 "$RUNS"); do
     echo "--- LoCoMo run $run/$RUNS ---"
+    reset_args=()
+    if [[ "$run" -eq 1 ]]; then
+        reset_args=(--reset-first)
+    fi
     "$EVALUATOR_BIN" \
         --dataset-kind locomo \
         --split dev \
+        --seed "$run" \
         --tier "$TIER" \
         --client-context "$CLIENT_CONTEXT" \
         --timestamps "$TIMESTAMPS" \
@@ -261,7 +271,7 @@ for run in $(seq 1 "$RUNS"); do
         --engine-url "$ENGINE_URL" \
         --engine-api-key "$ENGINE_API_KEY" \
         --runs-dir "$RUNS_DIR" \
-        --reset-first \
+        "${reset_args[@]}" \
         recall
 done
 fi
@@ -275,6 +285,7 @@ echo "Evaluating synthetic 1k..."
     --dataset-kind longmemeval \
     --dataset "$SYNTH_DIR/synth_1k.json" \
     --split all \
+    --seed 1 \
     --tier "$TIER" \
         --client-context "$CLIENT_CONTEXT" \
     --timestamps session \
@@ -295,6 +306,7 @@ if [[ "$RUN_SYNTH_10K" -eq 1 ]]; then
         --dataset-kind longmemeval \
         --dataset "$SYNTH_DIR/synth_10k.json" \
         --split all \
+        --seed 1 \
         --tier "$TIER" \
         --client-context "$CLIENT_CONTEXT" \
         --timestamps session \
@@ -316,6 +328,7 @@ if [[ "$RUN_SYNTH_100K" -eq 1 ]]; then
         --dataset-kind longmemeval \
         --dataset "$SYNTH_DIR/synth_100k.json" \
         --split all \
+        --seed 1 \
         --tier "$TIER" \
         --client-context "$CLIENT_CONTEXT" \
         --timestamps session \
@@ -335,7 +348,23 @@ cp "$RUNS_DIR"/[0-9]*.json "$SNAPSHOT_DIR/"
 echo "Snapshotted $(ls -1 "$SNAPSHOT_DIR"/*.json | wc -l | tr -d ' ') record(s) to $SNAPSHOT_DIR"
 
 echo "=== Generating BASELINE.md ==="
-"$EVALUATOR_BIN" report "$RUNS_DIR"/[0-9]*.json > "$REPO_ROOT/benchmarks/BASELINE.md"
+{
+    echo "# Baseline"
+    echo
+    echo "## Canonical protocol"
+    echo
+    echo '| setting | value |'
+    echo '|---|---|'
+    echo '| split | `dev` |'
+    echo '| client context | `off` |'
+    echo '| timestamps | `session` |'
+    echo '| reset | first run of each suite only |'
+    echo '| seeds | `1..RUNS` |'
+    echo
+    echo "## Results"
+    echo
+    "$EVALUATOR_BIN" report "$RUNS_DIR"/[0-9]*.json
+} > "$REPO_ROOT/benchmarks/BASELINE.md"
 echo "Embedding cache: $(curl -s "${ENGINE_URL}/version" -H "x-api-key: ${ENGINE_API_KEY}" | grep -o '"embed_cache_[a-z]*":[0-9]*' | tr '\n' ' ')"
 cat "$REPO_ROOT/benchmarks/BASELINE.md"
 echo "Baseline written to $REPO_ROOT/benchmarks/BASELINE.md"

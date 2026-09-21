@@ -35,6 +35,7 @@ case "$TIER" in
     TELLODB_RERANK="${TELLODB_RERANK:-off}"
     TELLODB_EMBED_MAX_TOKENS="${TELLODB_EMBED_MAX_TOKENS:-256}"
     TELLODB_EMBED_BATCH="${TELLODB_EMBED_BATCH:-8}"
+    RUNS=1
     ;;
   dev)
     PROFILE=fastrelease
@@ -49,6 +50,7 @@ case "$TIER" in
     # cache is cold and inference actually runs.
     TELLODB_EMBED_MAX_TOKENS="${TELLODB_EMBED_MAX_TOKENS:-512}"
     TELLODB_EMBED_BATCH="${TELLODB_EMBED_BATCH:-8}"
+    RUNS=3
     ;;
   *) echo "Unsupported tier: $TIER (smoke|dev)" >&2; exit 1 ;;
 esac
@@ -59,7 +61,7 @@ if [[ -z "${MATRIX:-}" ]]; then
 fi
 NAME="${NAME:-matrix}"
 DATASETS="${DATASETS:-longmemeval,locomo,synthetic}"
-TIMESTAMPS="${TIMESTAMPS:-session}"
+TIMESTAMPS="session"
 TELLODB_EMBED_TEXT="${TELLODB_EMBED_TEXT:-context}"
 TELLODB_CONTEXT_WINDOW="${TELLODB_CONTEXT_WINDOW:-1}"
 # The engine assembles context itself from stored turns
@@ -67,7 +69,7 @@ TELLODB_CONTEXT_WINDOW="${TELLODB_CONTEXT_WINDOW:-1}"
 # payload is already a 3-turn block, and the engine then windows those blocks
 # against their neighbours. `off` sends the turn as written and lets the
 # engine do it once.
-CLIENT_CONTEXT="${CLIENT_CONTEXT:-off}"
+CLIENT_CONTEXT="off"
 
 export HF_HOME="${HF_HOME:-$HOME/.cache/tellodb/hf}"
 export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-$HF_HOME/hub}"
@@ -149,15 +151,22 @@ run_dataset() {
       synthetic) args=(--dataset-kind longmemeval --dataset "$WORK_DIR/synth.json" --split all --limit "$SYNTH_LIMIT" --timestamps session) ;;
     esac
     mkdir -p "$out_dir"
-    "$EVALUATOR_BIN" "${args[@]}" \
-        --tier "$TIER" \
-        --client-context "$CLIENT_CONTEXT" \
-        --ingest-concurrency "$CONCURRENCY" \
-        --engine-url "$ENGINE_URL" \
-        --engine-api-key "$ENGINE_API_KEY" \
-        --runs-dir "$out_dir" \
-        --reset-first \
-        recall
+    for seed in $(seq 1 "$RUNS"); do
+        reset_args=()
+        if [[ "$seed" -eq 1 ]]; then
+            reset_args=(--reset-first)
+        fi
+        "$EVALUATOR_BIN" "${args[@]}" \
+            --seed "$seed" \
+            --tier "$TIER" \
+            --client-context "$CLIENT_CONTEXT" \
+            --ingest-concurrency "$CONCURRENCY" \
+            --engine-url "$ENGINE_URL" \
+            --engine-api-key "$ENGINE_API_KEY" \
+            --runs-dir "$out_dir" \
+            "${reset_args[@]}" \
+            recall
+    done
 }
 
 IFS=, read -ra DATASET_LIST <<< "$DATASETS"
