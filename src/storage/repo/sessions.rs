@@ -27,63 +27,11 @@ impl TenantStore {
     ) -> Result<Vec<SessionRouterRecord>> {
         let mut conn = self.get_conn()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let mut merged_results = Vec::new();
-        {
-            let mut select_stmt = tx.prepare_cached(
-                "SELECT rowid, record_json FROM session_router WHERE session_id = ?1 AND entity_id = ?2",
-            )?;
-            let mut upsert_stmt = tx.prepare_cached(
-                "INSERT INTO session_router (session_id, entity_id, record_json, router_text, created_at_ms, updated_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(session_id, entity_id) DO UPDATE SET
-                    record_json = excluded.record_json,
-                    router_text = excluded.router_text,
-                    updated_at_ms = excluded.updated_at_ms
-                 RETURNING rowid"
-            )?;
-            let mut fts = tx.prepare_cached(
-                "INSERT OR REPLACE INTO fts_session_router (rowid, session_id, entity_id, router_text) VALUES (?1, ?2, ?3, ?4)"
-            )?;
-            let now = unix_timestamp_ms()? as u64;
-            for record in updates {
-                // Fetch existing record if any and merge
-                let merged = match select_stmt
-                    .query_row(params![record.session_id, record.entity_id], |row| {
-                        row.get::<_, String>(1)
-                    }) {
-                    Ok(existing_json) => {
-                        if let Ok(existing) =
-                            serde_json::from_str::<SessionRouterRecord>(&existing_json)
-                        {
-                            merge_router_records(&existing, record)
-                        } else {
-                            record.clone()
-                        }
-                    }
-                    Err(_) => record.clone(),
-                };
-                let json = serde_json::to_string(&merged)?;
-                let rowid: i64 = upsert_stmt.query_row(
-                    params![
-                        merged.session_id,
-                        merged.entity_id,
-                        json,
-                        &merged.router_text,
-                        merged.created_at_ms.min(now),
-                        now,
-                    ],
-                    |row| row.get(0),
-                )?;
-
-                fts.execute(params![
-                    rowid,
-                    &merged.session_id,
-                    &merged.entity_id,
-                    &merged.router_text
-                ])?;
-                merged_results.push(merged);
-            }
-        }
+        // merge_router_records_tx now writes the router FTS document into
+        // fts_memories inside this same transaction (durability fix — see
+        // its comment in ingest.rs), so there is no longer a post-commit
+        // fts_index_batch step to run here.
+        let merged_results = super::ingest::merge_router_records_tx(&tx, updates)?;
         tx.commit()?;
         Ok(merged_results)
     }
@@ -265,41 +213,50 @@ impl TenantStore {
         if subject_entities.is_empty() {
             return Ok(Vec::new());
         }
-        // Use FTS5 OR-query so we tokenize properly and the planner can use the
-        // fts_session_router index. Fall back to LIKE if all terms are too short
-        // for FTS5 (less than SEARCH_MIN_TERM_LEN).
+        // Query FTS5 per entity, rather than one OR-combined query, so we know
+        // per entity whether FTS found anything. The LIKE backstop below used
+        // to run unconditionally for every entity regardless of the FTS
+        // result, doubling the cost of every pivot lookup with a scan that
+        // can't use an index beyond the entity_id prefix (AUDIT-2026-09-21.md
+        // "entity_pivot_sessions unconditional full scan"). Entities too short
+        // for FTS5 (<= SEARCH_MIN_TERM_LEN) skip straight to the backstop, same
+        // as before.
         let conn = self.get_conn()?;
-        let fts_terms: Vec<String> = subject_entities
-            .iter()
-            .filter(|e| e.len() > SEARCH_MIN_TERM_LEN)
-            .map(|e| format!("\"{}\"", e.to_ascii_lowercase()))
-            .collect();
-
         let mut session_to_hits: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
+        let mut needs_backstop: Vec<&String> = Vec::new();
 
-        if !fts_terms.is_empty() {
-            let fts_query = fts_terms.join(" OR ");
-            let mut stmt = conn.prepare_cached(
-                "SELECT sr.session_id, fsr.fts_session_router
-                 FROM fts_session_router fsr
-                 JOIN session_router sr
-                   ON sr.session_id = fsr.session_id AND sr.entity_id = fsr.entity_id
-                 WHERE fsr.fts_session_router MATCH ?1 AND fsr.entity_id = ?2
-                 ORDER BY rank LIMIT ?3",
-            )?;
-            let rows = stmt.query_map(
-                params![fts_query, entity_id, (subject_entities.len().saturating_mul(8)) as i64],
-                |row| row.get::<_, String>(0),
-            )?;
+        let mut fts_stmt = conn.prepare_cached(
+            "SELECT sr.session_id
+             FROM fts_session_router fsr
+             JOIN session_router sr
+               ON sr.session_id = fsr.session_id AND sr.entity_id = fsr.entity_id
+             WHERE fsr.fts_session_router MATCH ?1 AND fsr.entity_id = ?2
+             ORDER BY rank LIMIT ?3",
+        )?;
+        for entity in subject_entities {
+            if entity.len() <= SEARCH_MIN_TERM_LEN {
+                needs_backstop.push(entity);
+                continue;
+            }
+            let fts_query = format!("\"{}\"", entity.to_ascii_lowercase());
+            let rows = fts_stmt
+                .query_map(params![fts_query, entity_id, 8i64], |row| row.get::<_, String>(0))?;
+            let mut any_hit = false;
             for row in rows.flatten() {
+                any_hit = true;
                 *session_to_hits.entry(row).or_insert(0) += 1;
+            }
+            if !any_hit {
+                needs_backstop.push(entity);
             }
         }
 
-        // Backstop: LIKE-based scan in case FTS5 missed something due to token
-        // boundaries. Cheap because session_router is one row per session.
-        for entity in subject_entities {
+        // Backstop: LIKE-based scan for entities FTS5's tokenizer missed
+        // (very short or oddly-cased names) or that had zero FTS hits. Cheap
+        // because session_router is one row per session, but no longer paid
+        // for entities FTS already resolved.
+        for entity in needs_backstop {
             if entity.len() < 3 {
                 continue;
             }
@@ -409,5 +366,41 @@ impl TenantStore {
             merge_turn(&mut by_turn, key, turn);
         }
         Ok(order.into_iter().filter_map(|key| by_turn.remove(&key)).collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::storage::{SessionRouterRecord, TenantStore};
+    use tempfile::tempdir;
+
+    // Pins the AUDIT-2026-09-21.md "entity_pivot_sessions unconditional full
+    // scan" fix: the LIKE backstop must be skipped once FTS already found an
+    // entity for a session, but must still run when FTS's tokenizer misses.
+    #[test]
+    fn entity_pivot_sessions_skips_like_backstop_after_fts_hit() {
+        let temp = tempdir().unwrap();
+        let store = TenantStore::new(&temp.path().join("tenant.db")).unwrap();
+
+        // "paris" is its own FTS token; "sam" only appears glued inside
+        // "xsamx", so FTS5's tokenizer can never match it as a whole token.
+        let record = SessionRouterRecord {
+            session_id: "s1".to_string(),
+            entity_id: "alice".to_string(),
+            router_text: "paris and xsamx".to_string(),
+            ..Default::default()
+        };
+        store.merge_session_router_records_batch(&[record]).unwrap();
+
+        let hits = store
+            .entity_pivot_sessions("alice", &["paris".to_string(), "sam".to_string()])
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        // "paris" contributes exactly one hit (FTS only — the backstop must
+        // not also count it, or every FTS hit would be silently
+        // double-weighted). "sam" contributes exactly one hit via the LIKE
+        // backstop, since FTS missed it — recall for names FTS5 swallows
+        // into a larger token must survive this change.
+        assert_eq!(hits[0].entity_hits, 2);
     }
 }

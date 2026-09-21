@@ -433,13 +433,19 @@ pub(crate) fn plan_phase(s: &mut QueryPipelineState) {
     // On failure keep the embedding empty: retrieval_ann skips ANN for a
     // wrong-dimension vector, and searching with a zero vector would return
     // arbitrary neighbours.
+    //
+    // Timed on its own instead of only inside the enclosing `planning` span:
+    // previously `embed_ms`/`embed_us` were never assigned, so
+    // `x-tm-embed-ms` was structurally zero on every query even though the
+    // embedding call itself is real, measurable work.
+    let embed_start = Instant::now();
     s.primary_qembed =
         s.state.semantic.generate_query_embedding(&s.query_text).unwrap_or_else(|err| {
             tracing::warn!(query = %s.raw_query_text, error = ?err, "query embedding failed; skipping ANN");
             Vec::new()
         });
+    (s.diag.embed_ms, s.diag.embed_us) = elapsed_ms_and_us(embed_start);
 
-    s.route.memory_scores = HashMap::new();
     s.route.session_scores = HashMap::new();
     if let Some(ref entity_id) = s.payload.entity_id {
         let entity_for_routes = entity_id.clone();
@@ -502,6 +508,12 @@ pub(crate) fn plan_phase(s: &mut QueryPipelineState) {
                 h_pivot.join().unwrap_or_default(),
             )
         });
+
+        // Cache the pivot hits: `route_phase` Lane 1 needs the identical
+        // `entity_pivot_sessions(entity_id, subject_entities)` result and
+        // previously re-issued the same DB call unconditionally rather than
+        // reusing this one.
+        s.route.pivot_hits.clone_from(&pivot_hits);
 
         let start_proc = Instant::now();
         for hit in sr_hits {

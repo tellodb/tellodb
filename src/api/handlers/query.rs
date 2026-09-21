@@ -144,7 +144,7 @@ pub async fn query_handler(
                 superseded_by: None,
                 why_stale: None,
                 stability_score: None,
-                origin: ResultOrigin::Stored,
+                origin: ResultOrigin::SynthesizedObservationBlock,
             },
         );
     }

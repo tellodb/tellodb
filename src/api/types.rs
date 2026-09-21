@@ -254,6 +254,11 @@ pub enum ResultOrigin {
     Stored,
     SynthesizedFact,
     SynthesizedCard,
+    /// The per-entity context block prepended to a response. It is generated
+    /// from retrieved text, not itself a stored memory, and must not be
+    /// counted as a retrieved result — reporting it as `Stored` made every
+    /// `recall@k` computed from this API count a synthesized row as a hit.
+    SynthesizedObservationBlock,
 }
 
 impl ResultOrigin {
@@ -343,6 +348,7 @@ pub struct QueryPayload {
     pub max_evidence_turns_per_session: Option<usize>,
     /// Optional point in time to run the query as-of (milliseconds timestamp).
     pub point_in_time_ms: Option<u64>,
+    pub known_as_of_ms: Option<u64>,
     /// Optional reference time to resolve temporal expressions against (milliseconds timestamp).
     pub reference_time_ms: Option<u64>,
 }

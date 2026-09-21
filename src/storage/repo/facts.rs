@@ -1,6 +1,130 @@
 use super::prelude::*;
 
+type FactPosition = (String, u64, u64, i64, String);
+
+/// Pad a chunk of (entity_id, fact_key, version_memory_id) triples up to
+/// IN_CHUNK by repeating the last one, mirroring `padded_in_chunk` above —
+/// a fixed-shape query lets `prepare_cached` actually reuse the statement.
+/// Repeated triples are harmless: `IN (...)` is a set-membership test, so a
+/// duplicated triple cannot make a row match (and thus appear) twice.
+fn padded_triples(chunk: &[(String, String, String)]) -> Vec<(String, String, String)> {
+    let Some(last) = chunk.last().cloned() else {
+        return Vec::new();
+    };
+    let mut padded = Vec::with_capacity(IN_CHUNK);
+    padded.extend(chunk.iter().cloned());
+    padded.resize(IN_CHUNK, last);
+    padded
+}
+
+fn fact_neighbour(
+    tx: &rusqlite::Transaction<'_>,
+    fact_key: &str,
+    entity_id: &str,
+    condition: &str,
+    ordering: &str,
+    timestamp: u64,
+) -> Result<Option<FactPosition>> {
+    let sql = format!(
+        "SELECT memory_id, timestamp_ms, recorded_at_ms, rowid, COALESCE(object, '')
+         FROM fact_versions
+         WHERE fact_key = ?1 AND entity_id = ?2 AND {condition}
+         ORDER BY {ordering} LIMIT 1"
+    );
+    match tx.query_row(&sql, params![fact_key, entity_id, timestamp as i64], |row| {
+        Ok((
+            row.get(0)?,
+            row.get::<_, i64>(1)? as u64,
+            row.get::<_, i64>(2)? as u64,
+            row.get(3)?,
+            row.get(4)?,
+        ))
+    }) {
+        Ok(position) => Ok(Some(position)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn fact_version(
+    tx: &rusqlite::Transaction<'_>,
+    fact_key: &str,
+    memory_id: &str,
+) -> Result<FactPosition> {
+    Ok(tx.query_row(
+        "SELECT memory_id, timestamp_ms, recorded_at_ms, rowid, COALESCE(object, '')
+         FROM fact_versions WHERE fact_key = ?1 AND memory_id = ?2",
+        params![fact_key, memory_id],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get::<_, i64>(1)? as u64,
+                row.get::<_, i64>(2)? as u64,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
+    )?)
+}
+
+fn current_fact_version(
+    tx: &rusqlite::Transaction<'_>,
+    fact_key: &str,
+    entity_id: &str,
+) -> Result<Option<(String, u64)>> {
+    match tx.query_row(
+        "SELECT memory_id, timestamp_ms FROM fact_versions
+         WHERE fact_key = ?1 AND entity_id = ?2 AND status = 'current'
+         ORDER BY timestamp_ms DESC, recorded_at_ms DESC, rowid DESC LIMIT 1",
+        params![fact_key, entity_id],
+        |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as u64)),
+    ) {
+        Ok(version) => Ok(Some(version)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn ordered_fact_neighbour(
+    tx: &rusqlite::Transaction<'_>,
+    fact_key: &str,
+    entity_id: &str,
+    timestamp: u64,
+    recorded_at: u64,
+    rowid: i64,
+    predecessor: bool,
+) -> Result<Option<FactPosition>> {
+    let (comparison, ordering) = if predecessor { ("<", "DESC") } else { (">", "ASC") };
+    let sql = format!(
+        "SELECT memory_id, timestamp_ms, recorded_at_ms, rowid, COALESCE(object, '')
+         FROM fact_versions
+         WHERE fact_key = ?1 AND entity_id = ?2
+           AND ((timestamp_ms {comparison} ?3)
+             OR (timestamp_ms = ?3 AND recorded_at_ms {comparison} ?4)
+             OR (timestamp_ms = ?3 AND recorded_at_ms = ?4 AND rowid {comparison} ?5))
+         ORDER BY timestamp_ms {ordering}, recorded_at_ms {ordering}, rowid {ordering} LIMIT 1"
+    );
+    match tx.query_row(
+        &sql,
+        params![fact_key, entity_id, timestamp as i64, recorded_at as i64, rowid],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get::<_, i64>(1)? as u64,
+                row.get::<_, i64>(2)? as u64,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
+    ) {
+        Ok(position) => Ok(Some(position)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 impl TenantStore {
+    #[allow(clippy::too_many_lines)]
     pub fn fact_versions_for_memories(
         &self,
         memory_ids: &[String],
@@ -71,25 +195,61 @@ impl TenantStore {
             }
         }
 
-        // Evidence per version, newest first.
-        let mut stmt = conn.prepare_cached(
-            "SELECT COALESCE(
-                        (SELECT em.parent_memory_id FROM memories em
-                          WHERE em.memory_id = e.memory_id),
-                        e.memory_id
-                    )
-             FROM fact_evidence e
-             WHERE e.entity_id = ?1 AND e.fact_key = ?2 AND e.version_memory_id = ?3
-             ORDER BY e.timestamp_ms DESC, e.memory_id",
-        )?;
+        // Evidence per version, newest first. Batched into one IN-chunked
+        // query over the (entity_id, fact_key, version_memory_id) triples
+        // instead of one prepared-statement round trip per row — that N+1
+        // was the dominant cost of the hydrate/factver query stage (see
+        // AUDIT-2026-09-21.md, "fact_evidence N+1"). idx_fact_evidence_version
+        // covers the lookup.
+        let mut evidence_keys: Vec<(String, String, String)> = rows_by_memory
+            .values()
+            .map(|(version_memory_id, version)| {
+                (version.entity_id.clone(), version.fact_key.clone(), version_memory_id.clone())
+            })
+            .collect();
+        evidence_keys.sort();
+        evidence_keys.dedup();
+
+        let mut evidence_by_key: HashMap<(String, String, String), Vec<String>> =
+            HashMap::with_capacity(evidence_keys.len());
+        for chunk in evidence_keys.chunks(IN_CHUNK) {
+            let padded = padded_triples(chunk);
+            let placeholders =
+                std::iter::repeat("(?,?,?)").take(padded.len()).collect::<Vec<_>>().join(",");
+            let mut stmt = conn.prepare_cached(&format!(
+                "SELECT e.entity_id, e.fact_key, e.version_memory_id,
+                        COALESCE(
+                            (SELECT em.parent_memory_id FROM memories em
+                              WHERE em.memory_id = e.memory_id),
+                            e.memory_id
+                        )
+                 FROM fact_evidence e
+                 WHERE (e.entity_id, e.fact_key, e.version_memory_id) IN ({placeholders})
+                 ORDER BY e.entity_id, e.fact_key, e.version_memory_id,
+                          e.timestamp_ms DESC, e.memory_id"
+            ))?;
+            let bind_params: Vec<&str> = padded
+                .iter()
+                .flat_map(|(entity_id, fact_key, version_memory_id)| {
+                    [entity_id.as_str(), fact_key.as_str(), version_memory_id.as_str()]
+                })
+                .collect();
+            let mapped = stmt.query_map(rusqlite::params_from_iter(bind_params), |row| {
+                Ok((
+                    (row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?),
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+            for row in mapped {
+                let (key, evidence_memory_id) = row?;
+                evidence_by_key.entry(key).or_default().push(evidence_memory_id);
+            }
+        }
+
         let mut result = HashMap::with_capacity(rows_by_memory.len());
         for (asked_for, (version_memory_id, mut version)) in rows_by_memory {
-            version.evidence = stmt
-                .query_map(
-                    params![version.entity_id, version.fact_key, version_memory_id],
-                    |row| row.get(0),
-                )?
-                .collect::<rusqlite::Result<_>>()?;
+            let key = (version.entity_id.clone(), version.fact_key.clone(), version_memory_id);
+            version.evidence = evidence_by_key.get(&key).cloned().unwrap_or_default();
             result.insert(asked_for, version);
         }
         Ok(result)
@@ -217,7 +377,6 @@ impl TenantStore {
         Ok(assigned)
     }
 
-    #[allow(clippy::too_many_lines)]
     pub fn register_fact_versions_batch(
         &self,
         entity_id: &str,
@@ -225,118 +384,12 @@ impl TenantStore {
     ) -> Result<Vec<FactVersionStatus>> {
         let mut conn = self.get_conn()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let recorded_at = unix_timestamp_ms()?;
-        let mut statuses = Vec::with_capacity(registrations.len());
-        {
-            let mut insert = tx.prepare_cached(
-                "INSERT INTO fact_versions (fact_key, memory_id, entity_id, subject, predicate, object, status, timestamp_ms, valid_from_ms, recorded_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'current', ?7, ?7, ?8)
-                 ON CONFLICT(fact_key, memory_id) DO NOTHING",
-            )?;
-            let mut latest_stmt = tx.prepare_cached(
-                "SELECT memory_id, timestamp_ms FROM fact_versions
-                 WHERE fact_key = ?1 AND entity_id = ?2 AND status = 'current'",
-            )?;
-            let mut chain_stmt = tx.prepare_cached(
-                "SELECT memory_id, timestamp_ms, COALESCE(object, '') FROM fact_versions
-                 WHERE fact_key = ?1 AND entity_id = ?2
-                 ORDER BY timestamp_ms ASC, rowid DESC",
-            )?;
-            let mut evidence = tx.prepare_cached(
-                "INSERT OR IGNORE INTO fact_evidence
-                     (fact_key, entity_id, version_memory_id, memory_id, timestamp_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-            )?;
-            let mut update = tx.prepare_cached(
-                "UPDATE fact_versions
-                 SET status = ?1, valid_from_ms = ?2, valid_to_ms = ?3, superseded_by = ?4, supersedes = ?5
-                 WHERE fact_key = ?6 AND memory_id = ?7",
-            )?;
-
-            for (fact_key, ts, memory_id, subject, predicate, object) in registrations {
-                // A memory that restates the value already covering its
-                // timestamp confirms that version instead of starting a new
-                // one, so repeating "I live in Seattle" does not look like a
-                // change of residence.
-                let existing: Vec<(String, u64, String)> = chain_stmt
-                    .query_map(params![fact_key, entity_id], |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, i64>(1)? as u64,
-                            row.get::<_, String>(2)?,
-                        ))
-                    })?
-                    .collect::<rusqlite::Result<_>>()?;
-                let covering = existing
-                    .iter()
-                    .rev()
-                    .find(|(_, version_ts, _)| version_ts <= ts)
-                    .or_else(|| existing.first());
-                if let Some((version_id, version_ts, version_object)) = covering {
-                    if version_id != memory_id && same_fact_object(version_object, object) {
-                        evidence.execute(params![
-                            fact_key, entity_id, version_id, memory_id, *ts as i64
-                        ])?;
-                        statuses.push(FactVersionStatus::Confirmed {
-                            version: (*version_ts, version_id.clone()),
-                        });
-                        continue;
-                    }
-                }
-
-                let previous_latest: Option<(String, u64)> = match latest_stmt
-                    .query_row(params![fact_key, entity_id], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
-                    }) {
-                    Ok(latest) => Some(latest),
-                    Err(rusqlite::Error::QueryReturnedNoRows) => None,
-                    Err(err) => return Err(err.into()),
-                };
-
-                insert.execute(params![
-                    fact_key,
-                    memory_id,
-                    entity_id,
-                    subject,
-                    predicate,
-                    object,
-                    *ts as i64,
-                    recorded_at
-                ])?;
-
-                evidence.execute(params![fact_key, entity_id, memory_id, memory_id, *ts as i64])?;
-
-                let chain: Vec<(String, u64)> = chain_stmt
-                    .query_map(params![fact_key, entity_id], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
-                    })?
-                    .collect::<rusqlite::Result<_>>()?;
-                for (idx, (version_id, version_ts)) in chain.iter().enumerate() {
-                    let next = chain.get(idx + 1);
-                    let prev = idx.checked_sub(1).map(|p| &chain[p]);
-                    update.execute(params![
-                        if next.is_none() { "current" } else { "stale" },
-                        *version_ts as i64,
-                        next.map(|(_, next_ts)| *next_ts as i64),
-                        next.map(|(next_id, _)| next_id.as_str()),
-                        prev.map(|(prev_id, _)| prev_id.as_str()),
-                        fact_key,
-                        version_id,
-                    ])?;
-                }
-
-                let (latest_id, latest_ts) = chain.last().expect("chain contains the new version");
-                statuses.push(if latest_id == memory_id {
-                    FactVersionStatus::Current {
-                        superseded: previous_latest
-                            .filter(|(id, _)| id != *memory_id)
-                            .map(|(id, t)| (t, id)),
-                    }
-                } else {
-                    FactVersionStatus::Stale { current: (*latest_ts, latest_id.clone()) }
-                });
-            }
-        }
+        let statuses = Self::register_fact_versions_tx(
+            &tx,
+            entity_id,
+            registrations,
+            unix_timestamp_ms()? as u64,
+        )?;
         tx.commit()?;
         Ok(statuses)
     }
@@ -349,115 +402,129 @@ impl TenantStore {
         recorded_at: u64,
     ) -> Result<Vec<FactVersionStatus>> {
         let mut statuses = Vec::with_capacity(registrations.len());
-        {
-            let mut insert = tx.prepare_cached(
-                "INSERT INTO fact_versions (fact_key, memory_id, entity_id, subject, predicate, object, status, timestamp_ms, valid_from_ms, recorded_at_ms)
+        for (fact_key, timestamp, memory_id, subject, predicate, object) in registrations {
+            let covering = match fact_neighbour(
+                tx,
+                fact_key,
+                entity_id,
+                "timestamp_ms <= ?3",
+                "timestamp_ms DESC, recorded_at_ms DESC, rowid DESC",
+                *timestamp,
+            )? {
+                Some(position) => Some(position),
+                None => fact_neighbour(
+                    tx,
+                    fact_key,
+                    entity_id,
+                    "?3 = ?3",
+                    "timestamp_ms ASC, recorded_at_ms ASC, rowid ASC",
+                    *timestamp,
+                )?,
+            };
+            if let Some((version_id, version_timestamp, _, _, version_object)) = covering {
+                if version_id != *memory_id && same_fact_object(&version_object, object) {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO fact_evidence
+                             (fact_key, entity_id, version_memory_id, memory_id, timestamp_ms)
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![fact_key, entity_id, version_id, memory_id, *timestamp as i64],
+                    )?;
+                    statuses.push(FactVersionStatus::Confirmed {
+                        version: (version_timestamp, version_id),
+                    });
+                    continue;
+                }
+            }
+
+            let previous_latest = current_fact_version(tx, fact_key, entity_id)?;
+            tx.execute(
+                "INSERT INTO fact_versions
+                     (fact_key, memory_id, entity_id, subject, predicate, object, status,
+                      timestamp_ms, valid_from_ms, recorded_at_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'current', ?7, ?7, ?8)
                  ON CONFLICT(fact_key, memory_id) DO NOTHING",
-            )?;
-            let mut latest_stmt = tx.prepare_cached(
-                "SELECT memory_id, timestamp_ms FROM fact_versions
-                 WHERE fact_key = ?1 AND entity_id = ?2 AND status = 'current'",
-            )?;
-            let mut chain_stmt = tx.prepare_cached(
-                "SELECT memory_id, timestamp_ms, COALESCE(object, '') FROM fact_versions
-                 WHERE fact_key = ?1 AND entity_id = ?2
-                 ORDER BY timestamp_ms ASC, rowid DESC",
-            )?;
-            let mut evidence = tx.prepare_cached(
-                "INSERT OR IGNORE INTO fact_evidence
-                     (fact_key, entity_id, version_memory_id, memory_id, timestamp_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-            )?;
-            let mut update = tx.prepare_cached(
-                "UPDATE fact_versions
-                 SET status = ?1, valid_from_ms = ?2, valid_to_ms = ?3, superseded_by = ?4, supersedes = ?5
-                 WHERE fact_key = ?6 AND memory_id = ?7",
-            )?;
-
-            for (fact_key, ts, memory_id, subject, predicate, object) in registrations {
-                // A memory that restates the value already covering its
-                // timestamp confirms that version instead of starting a new
-                // one, so repeating "I live in Seattle" does not look like a
-                // change of residence.
-                let existing: Vec<(String, u64, String)> = chain_stmt
-                    .query_map(params![fact_key, entity_id], |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, i64>(1)? as u64,
-                            row.get::<_, String>(2)?,
-                        ))
-                    })?
-                    .collect::<rusqlite::Result<_>>()?;
-                let covering = existing
-                    .iter()
-                    .rev()
-                    .find(|(_, version_ts, _)| version_ts <= ts)
-                    .or_else(|| existing.first());
-                if let Some((version_id, version_ts, version_object)) = covering {
-                    if version_id != memory_id && same_fact_object(version_object, object) {
-                        evidence.execute(params![
-                            fact_key, entity_id, version_id, memory_id, *ts as i64
-                        ])?;
-                        statuses.push(FactVersionStatus::Confirmed {
-                            version: (*version_ts, version_id.clone()),
-                        });
-                        continue;
-                    }
-                }
-
-                let previous_latest: Option<(String, u64)> = match latest_stmt
-                    .query_row(params![fact_key, entity_id], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
-                    }) {
-                    Ok(latest) => Some(latest),
-                    Err(rusqlite::Error::QueryReturnedNoRows) => None,
-                    Err(err) => return Err(err.into()),
-                };
-
-                insert.execute(params![
+                params![
                     fact_key,
                     memory_id,
                     entity_id,
                     subject,
                     predicate,
                     object,
-                    *ts as i64,
-                    recorded_at
-                ])?;
+                    *timestamp as i64,
+                    recorded_at as i64
+                ],
+            )?;
+            tx.execute(
+                "INSERT OR IGNORE INTO fact_evidence
+                     (fact_key, entity_id, version_memory_id, memory_id, timestamp_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![fact_key, entity_id, memory_id, memory_id, *timestamp as i64],
+            )?;
 
-                evidence.execute(params![fact_key, entity_id, memory_id, memory_id, *ts as i64])?;
+            let (_, _, stored_recorded_at, rowid, _) = fact_version(tx, fact_key, memory_id)?;
+            let predecessor = ordered_fact_neighbour(
+                tx,
+                fact_key,
+                entity_id,
+                *timestamp,
+                stored_recorded_at,
+                rowid,
+                true,
+            )?;
+            let successor = ordered_fact_neighbour(
+                tx,
+                fact_key,
+                entity_id,
+                *timestamp,
+                stored_recorded_at,
+                rowid,
+                false,
+            )?;
 
-                let chain: Vec<(String, u64)> = chain_stmt
-                    .query_map(params![fact_key, entity_id], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
-                    })?
-                    .collect::<rusqlite::Result<_>>()?;
-                for (idx, (version_id, version_ts)) in chain.iter().enumerate() {
-                    let next = chain.get(idx + 1);
-                    let prev = idx.checked_sub(1).map(|p| &chain[p]);
-                    update.execute(params![
-                        if next.is_none() { "current" } else { "stale" },
-                        *version_ts as i64,
-                        next.map(|(_, next_ts)| *next_ts as i64),
-                        next.map(|(next_id, _)| next_id.as_str()),
-                        prev.map(|(prev_id, _)| prev_id.as_str()),
-                        fact_key,
-                        version_id,
-                    ])?;
-                }
-
-                let (latest_id, latest_ts) = chain.last().expect("chain contains the new version");
-                statuses.push(if latest_id == memory_id {
-                    FactVersionStatus::Current {
-                        superseded: previous_latest
-                            .filter(|(id, _)| id != *memory_id)
-                            .map(|(id, t)| (t, id)),
-                    }
-                } else {
-                    FactVersionStatus::Stale { current: (*latest_ts, latest_id.clone()) }
-                });
+            tx.execute(
+                "UPDATE fact_versions
+                 SET status = ?1, valid_from_ms = ?2, valid_to_ms = ?3,
+                     superseded_by = ?4, supersedes = ?5
+                 WHERE fact_key = ?6 AND memory_id = ?7",
+                params![
+                    if successor.is_none() { "current" } else { "stale" },
+                    *timestamp as i64,
+                    successor.as_ref().map(|(_, ts, _, _, _)| *ts as i64),
+                    successor.as_ref().map(|(id, _, _, _, _)| id.as_str()),
+                    predecessor.as_ref().map(|(id, _, _, _, _)| id.as_str()),
+                    fact_key,
+                    memory_id
+                ],
+            )?;
+            if let Some((predecessor_id, _, _, _, _)) = &predecessor {
+                tx.execute(
+                    "UPDATE fact_versions
+                     SET status = 'stale', valid_to_ms = ?1, superseded_by = ?2
+                     WHERE fact_key = ?3 AND memory_id = ?4",
+                    params![*timestamp as i64, memory_id, fact_key, predecessor_id],
+                )?;
             }
+            if let Some((successor_id, _, _, _, _)) = &successor {
+                tx.execute(
+                    "UPDATE fact_versions SET supersedes = ?1
+                     WHERE fact_key = ?2 AND memory_id = ?3",
+                    params![memory_id, fact_key, successor_id],
+                )?;
+            }
+
+            statuses.push(if successor.is_none() {
+                FactVersionStatus::Current {
+                    superseded: previous_latest
+                        .filter(|(id, _)| id != memory_id)
+                        .map(|(id, timestamp)| (timestamp, id)),
+                }
+            } else {
+                FactVersionStatus::Stale {
+                    current: current_fact_version(tx, fact_key, entity_id)?
+                        .map(|(id, timestamp)| (timestamp, id))
+                        .expect("fact chain contains a current version"),
+                }
+            });
         }
 
         Ok(statuses)
@@ -534,5 +601,58 @@ impl TenantStore {
             }
         }
         Ok(set)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::storage::TenantStore;
+    use tempfile::tempdir;
+
+    // Evidence lookup used to be one prepared-statement round trip per fact
+    // version (facts.rs "fact_evidence N+1"); this pins that the batched,
+    // IN-chunked replacement still groups evidence correctly per
+    // (entity_id, fact_key, version_memory_id) and keeps different entities'
+    // evidence lists from bleeding into each other.
+    #[test]
+    fn fact_evidence_batches_without_crossing_entities() {
+        let temp = tempdir().unwrap();
+        let store = TenantStore::new(&temp.path().join("tenant.db")).unwrap();
+
+        store
+            .register_fact_versions_batch(
+                "alice",
+                &[("residence", 100, "m1", "alice", "lives_in", "Austin")],
+            )
+            .unwrap();
+        // Restates the same value later: merged as evidence for m1, not a
+        // new version.
+        store
+            .register_fact_versions_batch(
+                "alice",
+                &[("residence", 150, "m2", "alice", "lives_in", "Austin")],
+            )
+            .unwrap();
+
+        store
+            .register_fact_versions_batch(
+                "bob",
+                &[("residence", 100, "m3", "bob", "lives_in", "Chicago")],
+            )
+            .unwrap();
+        store
+            .register_fact_versions_batch(
+                "bob",
+                &[("residence", 150, "m4", "bob", "lives_in", "Chicago")],
+            )
+            .unwrap();
+
+        let result =
+            store.fact_versions_for_memories(&["m1".to_string(), "m3".to_string()]).unwrap();
+
+        // Newest evidence first, and bob's confirmation never lands on
+        // alice's version (or vice versa).
+        assert_eq!(result["m1"].evidence, vec!["m2".to_string(), "m1".to_string()]);
+        assert_eq!(result["m3"].evidence, vec!["m4".to_string(), "m3".to_string()]);
     }
 }

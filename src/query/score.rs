@@ -67,8 +67,11 @@ pub(crate) fn score_hydrate(s: &mut QueryPipelineState) -> EngineResult<()> {
     if let Some(scope) = s.payload.entity_id.clone() {
         let (observations, cards) = (&s.data.scoring.observations, &s.data.scoring.memory_cards);
         let in_scope = |mid: &String| {
-            observations.get(mid).map_or(true, |o| o.entity_id == scope)
-                && cards.get(mid).map_or(true, |c| c.entity_id == scope)
+            observations
+                .get(mid)
+                .map(|observation| observation.entity_id == scope)
+                .or_else(|| cards.get(mid).map(|card| card.entity_id == scope))
+                .unwrap_or(false)
         };
         s.data.fused.items.retain(|(mid, _, _)| in_scope(mid));
         let kept: HashSet<String> =
@@ -113,6 +116,9 @@ pub(crate) fn score_loop(s: &mut QueryPipelineState) -> Vec<EvidenceCard> {
                 continue;
             }
         }
+        if s.payload.known_as_of_ms.is_some_and(|known| obs.recorded_at_ms > known) {
+            continue;
+        }
         let Some(scorable) = scorables.get(mid) else {
             continue;
         };
@@ -153,9 +159,6 @@ pub(crate) fn score_loop(s: &mut QueryPipelineState) -> Vec<EvidenceCard> {
         let mut fs = apply_decay_with_policy(base_score, created_at_ms, obs.kind, now_ms);
         fs += lifecycle_adjustment;
         let superseded_card = memory_cards.get(mid).is_some_and(|card| !card.is_latest);
-        if is_stale_fact || (plan.prefers_latest && superseded_card) {
-            fs *= s.weights.stale_fact_decay;
-        }
         fs -= attractor_negative_penalty(
             scorable,
             plan,
@@ -189,16 +192,34 @@ pub(crate) fn score_loop(s: &mut QueryPipelineState) -> Vec<EvidenceCard> {
 
         let weights = FourSignalWeights::for_intent(plan_intent);
         let semantic_signal = base_score.max(0.0);
-        let temporal_signal = temporal_adjust.max(0.0);
+        // `temporal_consistency_adjustment` and `confidence_signal` are
+        // signed on purpose: a stale fact or a temporally inconsistent
+        // candidate should be able to demote a score, not just fail to
+        // boost it. Clamping them to `[0, 1]` via `.max(0.0)` silently
+        // discarded every negative case — `rerank_stale_penalty` (-0.15)
+        // could never apply, and the negative half of
+        // `temporal_consistency_adjustment` (aged-out temporal/numeric
+        // facts) was dead. Clamp to `[-1, 1]` instead so the sign survives.
+        let temporal_signal = temporal_adjust.clamp(-1.0, 1.0);
         let reweighted = fuse_four_signals(
             semantic_signal,
             temporal_signal,
-            confidence_signal.max(0.0),
+            confidence_signal.clamp(-1.0, 1.0),
             graph_score.max(0.0),
             &weights,
         );
         fs = fs * (1.0 - s.weights.four_signal_temporal_weight)
             + reweighted * s.weights.four_signal_temporal_weight;
+        // Apply the stale/superseded decay after the four-signal blend, at
+        // full weight. Applying it earlier (as `fs *= stale_fact_decay`
+        // before the blend, the previous order) meant only the
+        // `(1 - four_signal_temporal_weight)` share of it survived into the
+        // final score — the rest was overwritten by `reweighted`, which
+        // only carried a diluted echo of staleness via `confidence_signal`
+        // (and that path was itself dead until the clamp fix above).
+        if is_stale_fact || (plan.prefers_latest && superseded_card) {
+            fs *= s.weights.stale_fact_decay;
+        }
         if adaptive_profile.route_strength > 0.0 {
             let routed_sid = memory_cards
                 .get(mid)
@@ -316,6 +337,42 @@ pub(crate) fn describe_stale_fact(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::plan::types::QueryIntent;
+
+    #[test]
+    fn negative_confidence_and_temporal_signals_survive_the_clamp() {
+        // R5 regression: `.max(0.0)` used to zero out the negative case
+        // entirely, so `rerank_stale_penalty` (-0.15 by default) and the
+        // negative half of `temporal_consistency_adjustment` (aged-out
+        // temporal/numeric facts) could never demote a candidate. Clamping
+        // to `[-1, 1]` instead of `[0, 1]` must let the sign through.
+        let stale_confidence_signal: f32 = -0.15;
+        let stale_temporal_adjust: f32 = -0.03;
+
+        assert!(stale_confidence_signal.clamp(-1.0, 1.0) < 0.0);
+        assert!(stale_temporal_adjust.clamp(-1.0, 1.0) < 0.0);
+
+        let weights = FourSignalWeights::for_intent(QueryIntent::General);
+        let reweighted_with_fix = fuse_four_signals(
+            0.5,
+            stale_temporal_adjust.clamp(-1.0, 1.0),
+            stale_confidence_signal.clamp(-1.0, 1.0),
+            0.0,
+            &weights,
+        );
+        // The old, dead-clamp behaviour: negatives zeroed before blending.
+        let reweighted_with_old_clamp = fuse_four_signals(
+            0.5,
+            stale_temporal_adjust.max(0.0),
+            stale_confidence_signal.max(0.0),
+            0.0,
+            &weights,
+        );
+        assert!(
+            reweighted_with_fix < reweighted_with_old_clamp,
+            "a stale/temporally-inconsistent candidate must score lower under the fixed clamp"
+        );
+    }
 
     fn card(memory_id: &str, created_at_ms: u64, final_score: f32) -> EvidenceCard {
         EvidenceCard {

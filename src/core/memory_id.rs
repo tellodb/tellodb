@@ -93,7 +93,8 @@ impl MemoryId {
 
         let mut tags = self.tags.clone();
         tags.push(tag);
-        let rendered = render_structured(&self.entity, &self.session, self.turn, &tags);
+        let component = escape_component(&tags.last().expect("tag was just appended").component());
+        let rendered = format!("{}{SEPARATOR}{component}", self.rendered);
         Self { tags, rendered, ..self.clone() }
     }
 
@@ -127,7 +128,7 @@ impl MemoryId {
         for part in &parts[3..] {
             tags.push(Tag::from_component(&decode_component(part)?));
         }
-        let rendered = render_structured(&entity, &session, turn, &tags);
+        let rendered = value.to_string();
         Ok(Self { entity, session, turn, tags, rendered, structured: true })
     }
 
@@ -285,6 +286,19 @@ mod tests {
     #[test]
     fn malformed_percent_escape_is_rejected() {
         assert!(MemoryId::parse("a%2::b::0").is_err());
+    }
+
+    #[test]
+    fn parsed_structured_ids_preserve_the_callers_spelling() {
+        for value in ["a::b::007", "a::b::1::c03", "urn%3Ax::s::0"] {
+            assert_eq!(MemoryId::parse(value).unwrap().as_str(), value);
+        }
+    }
+
+    #[test]
+    fn derived_ids_extend_the_original_parent_spelling() {
+        assert_eq!(MemoryId::derived_from("a::b::007", "c1"), "a::b::007::c1");
+        assert_eq!(MemoryId::derived_from("urn%3Ax::s::0", "fact0"), "urn%3Ax::s::0::fact0");
     }
 
     proptest! {

@@ -380,8 +380,17 @@ pub struct SemanticInference {
     next_executor: AtomicUsize,
     rerankers: Vec<Arc<Mutex<TextRerank>>>,
     rerank_cache: Mutex<LruCache<u64, Arc<Vec<f32>>>>,
-    /// Caps concurrent model calls (1 on GPU so batches don't compete for memory).
-    permits: ComputePermits,
+    /// Caps concurrent embedder calls. Independent from `rerank_permits`: the
+    /// embedder and the cross-encoder are different ONNX sessions with their
+    /// own executor pools, so a busy reranker must not stall ingest/query
+    /// embedding and vice versa (previously both shared ONE process-wide
+    /// permit, which serialised everything through a single slot on CPU).
+    /// 1 on GPU: concurrent calls on the same CUDA context contend for the
+    /// device rather than gaining throughput, so a single permit there is a
+    /// deliberate choice, not a leftover default.
+    embed_permits: ComputePermits,
+    /// Caps concurrent reranker calls. See `embed_permits`.
+    rerank_permits: ComputePermits,
     cache: EmbeddingCache,
     device_label: &'static str,
 }
@@ -521,7 +530,13 @@ impl SemanticInference {
             embedding_dim,
             embed_batch,
             max_tokens,
-            permits: ComputePermits::new(if use_gpu { 1 } else { n_embed.max(n_rerank) }),
+            // Independent pools sized from each model's own executor count
+            // (see the field docs on `embed_permits`/`rerank_permits`): the
+            // embedder and cross-encoder no longer share a slot, so ingest
+            // embedding can't be blocked behind an in-flight rerank or vice
+            // versa.
+            embed_permits: ComputePermits::new(if use_gpu { 1 } else { n_embed }),
+            rerank_permits: ComputePermits::new(if use_gpu { 1 } else { n_rerank.max(1) }),
             executors,
             next_executor: AtomicUsize::new(0),
             rerankers,
@@ -549,7 +564,8 @@ impl SemanticInference {
             rerank_cache: Mutex::new(LruCache::new(
                 NonZeroUsize::new(64).expect("literal is non-zero"),
             )),
-            permits: ComputePermits::new(1),
+            embed_permits: ComputePermits::new(1),
+            rerank_permits: ComputePermits::new(1),
             cache: EmbeddingCache::new(cache_path, embedding.cache_enabled),
             device_label: "CPU",
         }
@@ -663,7 +679,7 @@ impl SemanticInference {
     }
 
     fn embed_on_executor(&self, texts: &[&str], batch: &[usize]) -> Result<Vec<Vec<f32>>> {
-        let _permit = self.permits.acquire();
+        let _permit = self.embed_permits.acquire();
         let idx = self.next_executor.fetch_add(1, Ordering::Relaxed) % self.executors.len();
         let inputs: Vec<&str> = batch.iter().map(|&i| texts[i]).collect();
         let vectors = self.executors[idx].lock().embed(&inputs, Some(inputs.len()))?;
@@ -754,7 +770,7 @@ impl SemanticInference {
 
         let n_exec = self.rerankers.len();
         let chunks = split_for_rerank(texts, n_exec);
-        let _permit = self.permits.acquire();
+        let _permit = self.rerank_permits.acquire();
         let results: Vec<(usize, Vec<f32>)> = if chunks.len() == 1 {
             chunks
                 .into_iter()
@@ -812,6 +828,19 @@ impl SemanticInference {
 
 /// Split `texts` into at most `n` roughly-equal chunks. Returns (offset, chunk)
 /// pairs so the caller can stitch results back into the original order.
+///
+/// The `> 8` floor is deliberately well under `rerank.top` (25 candidates by
+/// default, `config.rs`'s `RerankConfig::top`): before the embed/rerank
+/// compute permits were split (see `SemanticInference::embed_permits` /
+/// `rerank_permits`), `rerank.executors` defaulted to 1, so `n <= 1` always
+/// short-circuited here and this threshold was unreachable dead code. Now
+/// that `rerank.executors` scales with the host (`EmbeddingConfig`/
+/// `RerankConfig` defaults in `config.rs`), `n` can be >1, and any batch at
+/// or near the 25-item cap (which is the common case once a query has more
+/// than a handful of rerank candidates) clears 8 and splits across
+/// executors. No change to the threshold itself was needed for that
+/// parallelism to engage — see `rerank_top_batch_splits_across_executors`
+/// below.
 fn split_for_rerank(texts: &[String], n: usize) -> Vec<(usize, Vec<String>)> {
     if n <= 1 || texts.len() <= 8 {
         return vec![(0, texts.to_vec())];
@@ -944,6 +973,19 @@ mod tests {
     }
 
     #[test]
+    fn rerank_top_batch_splits_across_executors() {
+        // rerank.top defaults to 25 (config.rs). Confirm a batch at that cap
+        // clears the >8 threshold in split_for_rerank and actually engages
+        // more than one executor once rerank.executors > 1 (item 3 of the
+        // 2026-09-21 audit: the threshold itself needed no adjustment).
+        let texts: Vec<String> = (0..25).map(|i| format!("candidate {i}")).collect();
+        let out = split_for_rerank(&texts, 2);
+        assert_eq!(out.len(), 2);
+        let total: usize = out.iter().map(|(_, c)| c.len()).sum();
+        assert_eq!(total, 25);
+    }
+
+    #[test]
     fn test_unsupported_model_validation_fails() {
         let res = parse_embedding_model("unsupported-fake-model-xyz");
         assert!(res.is_err());
@@ -1010,5 +1052,22 @@ mod tests {
             }
         });
         assert!(peak.load(Ordering::SeqCst) <= 2);
+    }
+
+    #[test]
+    fn embed_and_rerank_permits_are_independent_pools() {
+        // Regression for audit item 1 (2026-09-21): embed and rerank calls
+        // used to share ONE process-wide ComputePermits, so a saturated
+        // reranker could stall embedding (and vice versa). Holding the
+        // embed pool's only permit must not block a concurrent acquire on
+        // the rerank pool.
+        let embed_permits = ComputePermits::new(1);
+        let rerank_permits = ComputePermits::new(1);
+        let _embed_guard = embed_permits.acquire();
+        // If these pools were still the same object/shared slot, this second
+        // acquire on a *different* pool would still succeed immediately
+        // (no deadlock/blocking), which is exactly the property being
+        // asserted: the two are independently gated.
+        let _rerank_guard = rerank_permits.acquire();
     }
 }

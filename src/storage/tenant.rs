@@ -15,10 +15,11 @@ use std::fmt::Write as _;
 
 pub(crate) type GraphEdgeBatch<'a> = [GraphEdgeEntry<'a>];
 
-const PRAGMA_CACHE_SIZE: i64 = -262_144;
+const PRAGMA_CACHE_SIZE: i64 = -32_768;
 const PRAGMA_MMAP_SIZE: i64 = 1_073_741_824;
 const PRAGMA_BUSY_TIMEOUT: i64 = 10000;
 const PRAGMA_PAGE_SIZE: i64 = 8192;
+const PRAGMA_WAL_AUTOCHECKPOINT: i64 = 2000;
 const STATEMENT_CACHE_CAPACITY: usize = 512;
 
 pub(crate) const METRICS_DDL: &str = "CREATE TABLE IF NOT EXISTS metrics (
@@ -114,27 +115,38 @@ pub(crate) fn fts_rowid(key: &str) -> i64 {
 }
 
 /// Schema version recorded in `PRAGMA user_version`.
-pub(crate) const SCHEMA_VERSION: i64 = 5;
+pub(crate) const SCHEMA_VERSION: i64 = 7;
 
 impl TenantStore {
     pub fn new(path: &Path) -> Result<Self> {
-        let manager = SqliteConnectionManager::file(path).with_init(|conn| {
+        let synchronous = match std::env::var("TELLODB_DURABILITY")
+            .unwrap_or_else(|_| "full".to_string())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "full" => "FULL",
+            "normal" => "NORMAL",
+            value => anyhow::bail!("unknown TELLODB_DURABILITY {value:?} (full, normal)"),
+        };
+        let manager = SqliteConnectionManager::file(path).with_init(move |conn| {
             // The store uses ~70 distinct cached statements plus IN-list
             // queries; with rusqlite's default capacity of 16 they were
             // evicted and re-parsed constantly.
             conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
             conn.execute_batch(&format!(
-                "PRAGMA journal_mode = WAL;
-                     PRAGMA synchronous = NORMAL;
+                "PRAGMA page_size = {PRAGMA_PAGE_SIZE};
+                     PRAGMA journal_mode = WAL;
+                     PRAGMA synchronous = {synchronous};
                      PRAGMA foreign_keys = ON;
                      PRAGMA temp_store = MEMORY;
                      PRAGMA cache_size = {PRAGMA_CACHE_SIZE};
                      PRAGMA mmap_size = {PRAGMA_MMAP_SIZE};
                      PRAGMA busy_timeout = {PRAGMA_BUSY_TIMEOUT};
-                     PRAGMA page_size = {PRAGMA_PAGE_SIZE};",
+                     PRAGMA wal_autocheckpoint = {PRAGMA_WAL_AUTOCHECKPOINT};",
             ))
         });
-        let max_size = (num_cpus::get().saturating_mul(2)).max(16) as u32;
+        let max_size = num_cpus::get().clamp(4, 16) as u32;
         let pool = Pool::builder()
             .max_size(max_size)
             .build(manager)
@@ -183,74 +195,15 @@ impl TenantStore {
         &self,
         items: impl IntoIterator<Item = (u64, &'a str, &'a AgentObservation)>,
     ) -> Result<Vec<Option<u64>>> {
+        let items = items
+            .into_iter()
+            .map(|(timestamp, memory_id, observation)| {
+                (timestamp, memory_id.to_string(), observation.clone())
+            })
+            .collect::<Vec<_>>();
         let mut conn = self.get_conn()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let mut rowids = Vec::new();
-        {
-            let mut select_stmt =
-                tx.prepare_cached("SELECT rowid FROM memories WHERE memory_id = ?1")?;
-            let mut update_stmt = tx.prepare_cached(
-                "UPDATE memories SET content = ?1, kind = ?2, created_at_ms = ?3, entity_id = ?4, content_hash = ?5,
-                 session_id = ?7, turn_index = ?8, role = ?9, parent_memory_id = ?10, indexed = 0 WHERE rowid = ?6",
-            )?;
-            let mut insert_stmt = tx.prepare_cached(
-                "INSERT INTO memories (memory_id, entity_id, content, kind, content_hash, created_at_ms,
-                                       session_id, turn_index, role, parent_memory_id, indexed)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0)",
-            )?;
-            let mut vec_stmt = tx.prepare_cached(
-                "INSERT OR REPLACE INTO vector_lookup (vector_id, memory_id, entity_id, timestamp_ms, embedding)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-            )?;
-            let mut del_vec_stmt =
-                tx.prepare_cached("DELETE FROM vector_lookup WHERE vector_id = ?1")?;
-            for (ts, mem_id, obs) in items {
-                let existing_rid: Option<i64> =
-                    select_stmt.query_row(params![mem_id], |row| row.get(0)).ok();
-                let rid = if let Some(rid) = existing_rid {
-                    update_stmt.execute(params![
-                        obs.textual_content,
-                        obs.kind.as_str(),
-                        ts,
-                        obs.entity_id,
-                        obs.content_hash,
-                        rid,
-                        obs.session_id,
-                        obs.turn_index,
-                        obs.role,
-                        obs.parent_memory_id
-                    ])?;
-                    rid
-                } else {
-                    insert_stmt.execute(params![
-                        mem_id,
-                        obs.entity_id,
-                        obs.textual_content,
-                        obs.kind.as_str(),
-                        obs.content_hash,
-                        ts,
-                        obs.session_id,
-                        obs.turn_index,
-                        obs.role,
-                        obs.parent_memory_id
-                    ])?;
-                    tx.last_insert_rowid()
-                };
-
-                if obs.embedding.is_empty() {
-                    del_vec_stmt.execute(params![rid])?;
-                } else {
-                    vec_stmt.execute(params![
-                        rid,
-                        mem_id,
-                        obs.entity_id,
-                        ts,
-                        vec_f32_to_bytes(&obs.embedding)
-                    ])?;
-                }
-                rowids.push(Some(rid as u64));
-            }
-        }
+        let rowids = crate::storage::repo::ingest::insert_observations_tx(&tx, &items)?;
         tx.commit()?;
         Ok(rowids)
     }
@@ -453,10 +406,10 @@ pub(crate) fn memory_card_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Memor
         root_card_id: row.get(15)?,
         parent_card_id: row.get(16)?,
         lifecycle: lifecycle_str.and_then(|s| serde_json::from_str(&s).ok()),
-        source_turn_index: 0,
-        document_time: 0,
-        conversation_time: 0,
-        event_time: None,
+        source_turn_index: row.get::<_, i64>(20)? as usize,
+        document_time: row.get(21)?,
+        conversation_time: row.get(22)?,
+        event_time: row.get(23)?,
         created_at_ms: row.get(18)?,
         updated_at_ms: row.get(19)?,
     })
@@ -529,6 +482,58 @@ mod tests {
             let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
             assert_eq!(version, SCHEMA_VERSION);
         }
+    }
+
+    #[test]
+    fn new_databases_use_durable_bounded_pragmas() {
+        let temp = tempdir().unwrap();
+        let store = TenantStore::new(&temp.path().join("tenant.db")).unwrap();
+        let conn = store.get_conn().unwrap();
+        let synchronous: i64 = conn.query_row("PRAGMA synchronous", [], |row| row.get(0)).unwrap();
+        let page_size: i64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0)).unwrap();
+        let cache_size: i64 = conn.query_row("PRAGMA cache_size", [], |row| row.get(0)).unwrap();
+        let autocheckpoint: i64 =
+            conn.query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0)).unwrap();
+
+        assert_eq!(synchronous, 2);
+        assert_eq!(page_size, 8192);
+        assert_eq!(cache_size, -32_768);
+        assert_eq!(autocheckpoint, 2_000);
+    }
+
+    #[test]
+    fn newer_schema_versions_are_rejected() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("tenant.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(&format!("PRAGMA user_version = {};", SCHEMA_VERSION + 1)).unwrap();
+        drop(conn);
+
+        let error = TenantStore::new(&path).err().expect("newer schema must fail");
+        assert!(error.to_string().contains("newer than supported"));
+    }
+
+    #[test]
+    fn retention_expiry_physically_deletes_the_memory() {
+        let temp = tempdir().unwrap();
+        let store = TenantStore::new(&temp.path().join("tenant.db")).unwrap();
+        store
+            .insert_observation(
+                100,
+                "expired",
+                &AgentObservation {
+                    entity_id: "alice".into(),
+                    textual_content: "temporary secret".into(),
+                    expires_at_ms: Some(200),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(store.purge_expired_memories(199, 10).unwrap(), 0);
+        assert_eq!(store.purge_expired_memories(200, 10).unwrap(), 1);
+        assert!(store.get_observation(100, "expired").unwrap().is_none());
+        assert_eq!(store.purge_expired_memories(200, 10).unwrap(), 0);
     }
 
     #[test]
@@ -1008,6 +1013,10 @@ mod tests {
         assert_eq!(swept, 0);
 
         let card_loaded = store.get_memory_card("card-123").unwrap().unwrap();
+        assert_eq!(card_loaded.source_turn_index, 0);
+        assert_eq!(card_loaded.document_time, 100);
+        assert_eq!(card_loaded.conversation_time, 100);
+        assert_eq!(card_loaded.event_time, None);
         assert_ne!(
             card_loaded.lifecycle.unwrap().lifecycle_state,
             crate::lifecycle::LifecycleState::Expired
@@ -1033,7 +1042,7 @@ mod tests {
         let mut stmt = conn
             .prepare(
                 "SELECT memory_id, status, valid_from_ms, valid_to_ms FROM fact_versions
-                 WHERE fact_key = ?1 ORDER BY valid_from_ms, rowid DESC",
+                 WHERE fact_key = ?1 ORDER BY valid_from_ms, recorded_at_ms, rowid",
             )
             .unwrap();
         stmt.query_map(params![fact_key], |row| {
@@ -1097,6 +1106,36 @@ mod tests {
             FactVersionStatus::Current { superseded: None }
         ));
         assert_eq!(fact_chain(&store, "residence").len(), 4);
+    }
+
+    #[test]
+    fn later_recorded_fact_wins_when_event_times_match() {
+        let temp = tempdir().unwrap();
+        let store = TenantStore::new(&temp.path().join("tenant.db")).unwrap();
+        store
+            .register_fact_versions_batch(
+                "user",
+                &[("residence", 100, "first", "user", "lives_in", "Austin")],
+            )
+            .unwrap();
+        store
+            .register_fact_versions_batch(
+                "user",
+                &[("residence", 100, "second", "user", "lives_in", "Boston")],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.get_current_fact_value("user", "residence").unwrap().as_deref(),
+            Some("Boston")
+        );
+        assert_eq!(
+            fact_chain(&store, "residence"),
+            vec![
+                ("first".into(), "stale".into(), 100, Some(100)),
+                ("second".into(), "current".into(), 100, None),
+            ]
+        );
     }
 
     proptest::proptest! {
@@ -1177,6 +1216,48 @@ mod tests {
         // Unscoped still spans both entities.
         let all = store.fts_search("garden plan", 10, None).unwrap();
         assert!(all.iter().any(|(id, _)| id.starts_with("bob::")));
+    }
+
+    #[test]
+    fn point_in_time_fts_fills_the_requested_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TenantStore::new(&dir.path().join("t.db")).unwrap();
+        let items: Vec<_> = (1..=30)
+            .map(|timestamp| {
+                let memory_id = format!("alice::s::{timestamp}");
+                (
+                    timestamp,
+                    memory_id,
+                    AgentObservation {
+                        entity_id: "alice".into(),
+                        textual_content: "shared timeline term".into(),
+                        created_at_ms: timestamp,
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        store.insert_observations_batch(&items).unwrap();
+        let fts: Vec<_> = items
+            .iter()
+            .map(|(_, memory_id, observation)| {
+                (
+                    memory_id.clone(),
+                    observation.entity_id.clone(),
+                    observation.textual_content.clone(),
+                )
+            })
+            .collect();
+        store.fts_index_batch(&fts).unwrap();
+
+        let hits = store.fts_search_at("timeline", 10, Some("alice"), Some(10), None).unwrap();
+        assert_eq!(hits.len(), 10);
+        let identities = store
+            .lookup_by_memory_ids_batch(
+                &hits.iter().map(|(memory_id, _)| memory_id.clone()).collect::<Vec<_>>(),
+            )
+            .unwrap();
+        assert!(identities.values().all(|(timestamp, _)| *timestamp <= 10));
     }
 
     #[test]

@@ -23,6 +23,24 @@ const BUILTIN_EXPANSION_RULES_JSON: &str =
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/rules/expansions.v1.json"));
 pub(crate) const LEGACY_ENV_REMOVAL_DATE: &str = "2027-01-01";
 
+/// Conservative default executor count for a CPU compute pool (embedder or
+/// reranker), scaled from the host's core count instead of hardcoded to 1.
+///
+/// Each executor is a distinct ONNX session, and fastembed already points
+/// every session's own intra-op threads at *all visible CPUs*
+/// (`SemanticInference::with_config`'s comment on the rayon pool). Handing
+/// out one executor per core would therefore have `n_cpus` ONNX sessions
+/// each independently trying to claim every core, on top of the tokio
+/// runtime (one worker per core by default) and the rayon pool used for
+/// ingest NLP (`embedding.threads`, also `num_cpus` by default). Dividing
+/// down and clamping leaves headroom for those other two subsystems instead
+/// of handing every core to one compute pool. `TELLODB_EMBED_EXECUTORS` /
+/// `TELLODB_RERANK_EXECUTORS` (and their legacy aliases) remain authoritative
+/// overrides — this only changes what happens when neither is set.
+fn default_executor_count(divisor: usize, max: usize) -> usize {
+    (num_cpus::get() / divisor.max(1)).clamp(1, max.max(1))
+}
+
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct ExpansionRule {
     pub trigger_tokens: Vec<String>,
@@ -87,7 +105,41 @@ impl Default for ExpansionRules {
     }
 }
 
-#[derive(Debug, Clone)]
+/// Redacts a secret so it never appears in a serialized `Config` (e.g. a
+/// benchmark record or a debug dump): emits `"<set>"` when present, `null`
+/// otherwise. Never the value itself.
+// serde's `serialize_with` contract fixes this signature; `Option<&T>`
+// would not satisfy it.
+#[allow(clippy::ref_option)]
+fn serialize_redacted_secret<S: serde::Serializer>(
+    secret: &Option<String>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    match secret {
+        Some(_) => serializer.serialize_str("<set>"),
+        None => serializer.serialize_none(),
+    }
+}
+
+/// Redacts an absolute filesystem path down to whether it was configured at
+/// all, so a serialized `Config` never leaks local directory layout.
+#[derive(serde::Serialize)]
+struct PathPresence {
+    set: bool,
+}
+
+// serde's `serialize_with` contract fixes this signature; `Option<&T>`
+// would not satisfy it.
+#[allow(clippy::ref_option)]
+fn serialize_redacted_path<S: serde::Serializer>(
+    path: &Option<PathBuf>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    use serde::Serialize as _;
+    PathPresence { set: path.is_some() }.serialize(serializer)
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Config {
     pub features: Features,
     pub heuristics: Profile,
@@ -105,7 +157,7 @@ pub struct Config {
     pub temporal: TemporalConfig,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct RetrievalConfig {
     pub profile: RetrievalProfile,
     pub auto_rerank: Option<bool>,
@@ -124,7 +176,8 @@ pub struct RetrievalConfig {
 }
 
 #[repr(usize)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum RetrievalProfile {
     Fast,
     Balanced,
@@ -141,10 +194,12 @@ impl RetrievalProfile {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct EmbeddingConfig {
     pub model_id: String,
+    #[serde(serialize_with = "serialize_redacted_path")]
     pub model_dir: Option<PathBuf>,
+    #[serde(serialize_with = "serialize_redacted_path")]
     pub cache_path: Option<PathBuf>,
     pub device: String,
     pub threads: usize,
@@ -157,7 +212,8 @@ pub struct EmbeddingConfig {
     pub text: EmbedTextConfig,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum EmbedTextMode {
     Legacy,
     Turn,
@@ -174,13 +230,13 @@ impl EmbedTextMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct EmbedTextConfig {
     pub mode: EmbedTextMode,
     pub window: u32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct RerankConfig {
     pub model: String,
     pub enabled: bool,
@@ -191,7 +247,8 @@ pub struct RerankConfig {
     pub top: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum RerankPolicy {
     Heuristic,
     Always,
@@ -216,31 +273,35 @@ impl RerankPolicy {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
     pub request_timeout_secs: u64,
     pub trust_proxy: bool,
     pub cors_origins: Vec<String>,
+    // CRITICAL: never serialize the actual key (2026-09-21 audit, §4/§5) —
+    // a benchmark record or config dump must not carry the credential.
+    #[serde(serialize_with = "serialize_redacted_secret")]
     pub api_key: Option<String>,
     pub ml_intent: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ExtractorConfig {
     pub kind: String,
+    #[serde(serialize_with = "serialize_redacted_path")]
     pub model_dir: Option<PathBuf>,
     pub labels: Vec<String>,
     pub threshold: f32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct IngestConfig {
     pub predicate_canon_tau: f32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct TemporalConfig {
     pub recency_scoring: bool,
 }
@@ -401,7 +462,10 @@ impl Default for EmbeddingConfig {
             cache_path: None,
             device: String::new(),
             threads: num_cpus::get().max(1),
-            executors: 1,
+            // Quarter the core count, capped at 4: e.g. 8 cores -> 2, 16 -> 4,
+            // 32+ -> 4. See `default_executor_count` for why this stays well
+            // under `n_cpus`. `TELLODB_EMBED_EXECUTORS` overrides.
+            executors: default_executor_count(4, 4),
             max_tokens: 512,
             batch: 32,
             dimension: None,
@@ -465,7 +529,13 @@ impl Default for RerankConfig {
         Self {
             model: DEFAULT_RERANK_MODEL.to_string(),
             enabled: true,
-            executors: 1,
+            // Eighth the core count, capped at 2: e.g. 8 cores -> 1, 16 -> 2,
+            // 32+ -> 2. Kept smaller than the embedder's share (see
+            // `default_executor_count`) because reranking already runs
+            // behind embedding+retrieval in the query path and the cross
+            // -encoder session is the heavier of the two per call.
+            // `TELLODB_RERANK_EXECUTORS` overrides.
+            executors: default_executor_count(8, 2),
             cache_size: 4096,
             policy: RerankPolicy::Gate,
             margin: 0.05,
@@ -763,5 +833,83 @@ mod tests {
 
         let actual = Config::from_env().unwrap();
         assert_eq!(format!("{actual:?}"), format!("{:?}", Config::default()));
+    }
+
+    #[test]
+    fn embed_and_rerank_executors_scale_with_host_cores_but_stay_bounded() {
+        // Item 2 of the 2026-09-21 audit: defaults must not be hardcoded to 1
+        // regardless of host size, but must also leave headroom for tokio +
+        // rayon rather than handing out one executor per core.
+        assert_eq!(default_executor_count(4, 4), (num_cpus::get() / 4).clamp(1, 4));
+        assert_eq!(default_executor_count(8, 2), (num_cpus::get() / 8).clamp(1, 2));
+        // Always at least 1, whatever the host looks like.
+        assert!(default_executor_count(4, 4) >= 1);
+        assert!(default_executor_count(8, 2) >= 1);
+        // Never exceeds the stated cap even on a very large host.
+        assert!(default_executor_count(4, 4) <= 4);
+        assert!(default_executor_count(8, 2) <= 2);
+
+        let config = Config::default();
+        assert_eq!(config.embedding.executors, default_executor_count(4, 4));
+        assert_eq!(config.rerank.executors, default_executor_count(8, 2));
+    }
+
+    #[test]
+    fn env_override_still_wins_over_scaled_executor_default() {
+        // TELLODB_EMBED_EXECUTORS / TELLODB_RERANK_EXECUTORS must remain
+        // authoritative even though the default is no longer a flat 1.
+        // serial_test isn't a dependency here, so guard with a lock-free
+        // unique value and always clean up.
+        std::env::set_var("TELLODB_EMBED_EXECUTORS", "7");
+        let overridden = EmbeddingConfig::from_env(&EmbeddingConfig::default(), None);
+        std::env::remove_var("TELLODB_EMBED_EXECUTORS");
+        assert_eq!(overridden.executors, 7);
+
+        std::env::set_var("TELLODB_RERANK_EXECUTORS", "9");
+        let overridden = RerankConfig::from_env(&RerankConfig::default());
+        std::env::remove_var("TELLODB_RERANK_EXECUTORS");
+        assert_eq!(overridden.executors, 9);
+    }
+
+    #[test]
+    fn config_serialization_never_contains_the_api_key_value() {
+        // CRITICAL (audit §4/§5): a serialized Config must never leak the
+        // configured API key, only whether one is set.
+        let mut config = Config::default();
+        let secret = "sk-super-secret-tellodb-key-do-not-leak";
+        config.server.api_key = Some(secret.to_string());
+
+        let json = serde_json::to_string(&config).expect("Config must serialize");
+        assert!(!json.contains(secret), "serialized Config leaked the raw api_key value");
+        assert!(json.contains("\"api_key\":\"<set>\""));
+
+        // And the unset case must not read as a value either.
+        config.server.api_key = None;
+        let json_unset = serde_json::to_string(&config).unwrap();
+        assert!(json_unset.contains("\"api_key\":null"));
+    }
+
+    #[test]
+    fn config_serialization_redacts_filesystem_paths() {
+        let mut config = Config::default();
+        config.embedding.model_dir = Some(PathBuf::from("/Users/alice/secret-models/bge"));
+        config.embedding.cache_path = Some(PathBuf::from("/Users/alice/.cache/tellodb/emb.sqlite"));
+        config.extractor.model_dir = Some(PathBuf::from("/Users/alice/secret-models/extractor"));
+
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(!json.contains("alice"), "serialized Config leaked a filesystem path");
+        assert!(!json.contains("secret-models"));
+        assert!(json.contains("\"model_dir\":{\"set\":true}"));
+    }
+
+    #[test]
+    fn config_serialization_round_trips_non_secret_fields() {
+        let config = Config::default();
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(json["server"]["port"], 3000);
+        assert_eq!(json["rerank"]["top"], 25);
+        assert_eq!(json["retrieval"]["profile"], "fast");
+        assert_eq!(json["embedding"]["text"]["mode"], "context");
+        assert_eq!(json["rerank"]["policy"], "gate");
     }
 }

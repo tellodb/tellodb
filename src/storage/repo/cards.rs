@@ -10,8 +10,9 @@ impl TenantStore {
                     card_id, entity_id, user_id, source_memory_id, source_session_id,
                     subject, predicate, object, memory_text, card_type, confidence,
                     is_latest, is_static, is_inference, expires_at, root_card_id, parent_card_id,
-                    lifecycle, created_at_ms, updated_at_ms
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+                    lifecycle, created_at_ms, updated_at_ms, source_turn_index, document_time,
+                    conversation_time, event_time
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
             )?;
             for card in cards {
                 stmt.execute(params![
@@ -41,6 +42,10 @@ impl TenantStore {
                         .unwrap_or(""),
                     card.created_at_ms,
                     card.updated_at_ms,
+                    card.source_turn_index as i64,
+                    card.document_time,
+                    card.conversation_time,
+                    card.event_time,
                 ])?;
             }
         }
@@ -54,7 +59,8 @@ impl TenantStore {
             "SELECT card_id, entity_id, user_id, source_memory_id, source_session_id,
                     subject, predicate, object, memory_text, card_type, confidence,
                     is_latest, is_static, is_inference, expires_at, root_card_id, parent_card_id,
-                    lifecycle, created_at_ms, updated_at_ms
+                    lifecycle, created_at_ms, updated_at_ms, source_turn_index, document_time,
+                    conversation_time, event_time
              FROM memory_cards WHERE card_id = ?1",
         )?;
         let res = stmt.query_row(params![card_id], memory_card_row);
@@ -88,29 +94,45 @@ impl TenantStore {
         if query.limit == 0 {
             return Ok(Vec::new());
         }
-        let now_ms = unix_timestamp_ms()? as u64;
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT card_id, source_memory_id, source_session_id, subject, predicate, object,
                     memory_text, card_type, confidence, is_latest, expires_at, created_at_ms
-             FROM memory_cards WHERE entity_id = ?1",
+             FROM memory_cards c
+             LEFT JOIN memories m ON m.memory_id = c.card_id
+             WHERE c.entity_id = ?1
+               AND (?2 OR c.is_latest = 1)
+               AND (c.expires_at IS NULL OR c.expires_at > ?3)
+               AND (?4 IS NULL OR c.created_at_ms <= ?4)
+               AND (?5 IS NULL OR COALESCE(m.recorded_at_ms, c.created_at_ms) <= ?5)
+             LIMIT ?6",
         )?;
-        let rows = stmt.query_map(params![query.entity_id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, String>(7)?,
-                row.get::<_, f64>(8)? as f32,
-                row.get::<_, i32>(9)? != 0,
-                row.get::<_, Option<i64>>(10)?.map(|v| v as u64),
-                row.get::<_, i64>(11)? as u64,
-            ))
-        })?;
+        let rows = stmt.query_map(
+            params![
+                query.entity_id,
+                query.include_stale,
+                query.now_ms as i64,
+                query.point_in_time_ms.map(|value| value as i64),
+                query.known_as_of_ms.map(|value| value as i64),
+                query.limit.saturating_mul(20) as i64
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, f64>(8)? as f32,
+                    row.get::<_, i32>(9)? != 0,
+                    row.get::<_, Option<i64>>(10)?.map(|v| v as u64),
+                    row.get::<_, i64>(11)? as u64,
+                ))
+            },
+        )?;
 
         let mut hits = Vec::new();
         for row in rows {
@@ -125,16 +147,9 @@ impl TenantStore {
                 card_type,
                 confidence,
                 is_latest,
-                expires_at,
+                _expires_at,
                 created_at_ms,
             ) = row?;
-
-            if !query.include_stale && !is_latest {
-                continue;
-            }
-            if expires_at.is_some_and(|exp| exp <= now_ms) {
-                continue;
-            }
 
             let text = format!(
                 "{subject} {predicate} {object} {memory_text} {card_type} {source_session_id}"
@@ -211,7 +226,8 @@ impl TenantStore {
             "SELECT card_id, entity_id, user_id, source_memory_id, source_session_id,
                     subject, predicate, object, memory_text, card_type, confidence,
                     is_latest, is_static, is_inference, expires_at, root_card_id, parent_card_id,
-                    lifecycle, created_at_ms, updated_at_ms
+                    lifecycle, created_at_ms, updated_at_ms, source_turn_index, document_time,
+                    conversation_time, event_time
              FROM memory_cards WHERE source_memory_id = ?1
              ORDER BY is_latest DESC, updated_at_ms DESC LIMIT 1",
         )?;
@@ -238,7 +254,8 @@ impl TenantStore {
                 "SELECT card_id, entity_id, user_id, source_memory_id, source_session_id,
                         subject, predicate, object, memory_text, card_type, confidence,
                         is_latest, is_static, is_inference, expires_at, root_card_id, parent_card_id,
-                        lifecycle, created_at_ms, updated_at_ms
+                        lifecycle, created_at_ms, updated_at_ms, source_turn_index, document_time,
+                        conversation_time, event_time
                  FROM memory_cards WHERE card_id IN ({})",
                 in_placeholders(IN_CHUNK)
             );

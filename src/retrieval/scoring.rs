@@ -7,7 +7,7 @@
 /// These defaults are the result of empirical tuning on the LoCoMo benchmark.
 /// Values between ±10% produce similar results; changes beyond that should be
 /// benchmarked against the evaluation suite before merging.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ScoringWeights {
     /// Bonus applied per session when the memory falls within the query's time window.
     /// Determined empirically; 0.55 balances precision and recall on LoCoMo.

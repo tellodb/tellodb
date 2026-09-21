@@ -56,6 +56,8 @@ fn prepared_record(payload: IngestPayload, enable_consolidation: bool) -> Prepar
         kind,
         content_hash: "hash".to_string(),
         created_at_ms: payload.timestamp,
+        recorded_at_ms: payload.timestamp,
+        expires_at_ms: lifecycle.expires_at_ms,
         session_id: payload.session_id.clone().unwrap_or_default(),
         turn_index: payload.turn_index.unwrap_or_default(),
         role: payload.role.clone().unwrap_or_default(),
@@ -403,6 +405,37 @@ fn build_artifacts_skips_derived_structures_for_synthetic_queries() {
     assert!(batches.memory_card_batch.is_empty());
     assert!(batches.session_router_updates.is_empty());
     assert!(batches.preference_batch.is_empty());
+}
+
+#[test]
+fn retry_keeps_identical_content_when_indexing_is_pending() {
+    let (_directory, tenant) = test_tenant();
+    let item = payload("retry text");
+    let mut diag = IngestDiagnostics::default();
+    let prepared = build_observations(
+        tenant.vector_repo(),
+        vec![item.clone()],
+        vec![Vec::new()],
+        &mut diag,
+        Features::default(),
+        crate::heuristics::Profile::Generic,
+    )
+    .unwrap();
+    let mut batches = build_artifacts(prepared, &mut diag, Features::default());
+    let storage = crate::storage::repo::ingest::IngestBatches {
+        observations: std::mem::take(&mut batches.observations),
+        ..Default::default()
+    };
+    tenant.commit_ingest(&storage).unwrap();
+
+    let states = tenant.stored_content_states(std::slice::from_ref(&item.memory_id)).unwrap();
+    let (hash, indexed) = &states[&item.memory_id];
+    assert_eq!(*indexed, 0);
+    assert_eq!(
+        hash,
+        &content_hash(&item.textual_content, &item.entity_id, MemoryKind::Conversational)
+    );
+    assert!(should_keep_payload(states.get(&item.memory_id), hash));
 }
 
 #[test]

@@ -262,7 +262,7 @@ fn salience_score(lower: &str, kind: MemoryKind, reasons: &mut Vec<String>) -> f
         MemoryKind::Fact => SALIENCE_FACT,
         MemoryKind::Lesson => SALIENCE_LESSON,
         MemoryKind::SessionSummary => SALIENCE_SESSION_SUMMARY,
-        MemoryKind::Conversational => SALIENCE_CONVERSATIONAL,
+        MemoryKind::Conversational | MemoryKind::SyntheticQuery => SALIENCE_CONVERSATIONAL,
     };
     let salient = [
         "adopted",
@@ -351,7 +351,7 @@ fn confidence_for_kind(kind: MemoryKind, is_inference: bool) -> f32 {
         MemoryKind::Fact | MemoryKind::Preference | MemoryKind::Decision => CONFIDENCE_HIGH,
         MemoryKind::Lesson => CONFIDENCE_LESSON,
         MemoryKind::SessionSummary => CONFIDENCE_SESSION_SUMMARY,
-        MemoryKind::Conversational => CONFIDENCE_CONVERSATIONAL,
+        MemoryKind::Conversational | MemoryKind::SyntheticQuery => CONFIDENCE_CONVERSATIONAL,
     }
 }
 
@@ -384,7 +384,7 @@ fn stability_score(
         MemoryKind::Preference | MemoryKind::Decision | MemoryKind::Fact => STABILITY_PERMANENT,
         MemoryKind::Lesson => STABILITY_LESSON,
         MemoryKind::SessionSummary => STABILITY_SESSION_SUMMARY,
-        MemoryKind::Conversational => STABILITY_CONVERSATIONAL,
+        MemoryKind::Conversational | MemoryKind::SyntheticQuery => STABILITY_CONVERSATIONAL,
     }
 }
 
@@ -414,7 +414,7 @@ fn utility_score(lower: &str, kind: MemoryKind, reasons: &mut Vec<String>) -> f3
         MemoryKind::Preference | MemoryKind::Decision | MemoryKind::Lesson => UTILITY_HIGH,
         MemoryKind::Fact => UTILITY_FACT,
         MemoryKind::SessionSummary => UTILITY_SESSION_SUMMARY,
-        MemoryKind::Conversational => UTILITY_CONVERSATIONAL,
+        MemoryKind::Conversational | MemoryKind::SyntheticQuery => UTILITY_CONVERSATIONAL,
     } + (hits as f32 * UTILITY_KEYWORD_BOOST).min(UTILITY_KEYWORD_BOOST_MAX))
     .clamp(0.0, 1.0)
 }
@@ -480,7 +480,9 @@ fn retention_class(
             RetentionClass::LongTerm
         }
         MemoryKind::Lesson => RetentionClass::Archive,
-        MemoryKind::SessionSummary | MemoryKind::Conversational => RetentionClass::Episodic,
+        MemoryKind::SessionSummary | MemoryKind::Conversational | MemoryKind::SyntheticQuery => {
+            RetentionClass::Episodic
+        }
     }
 }
 

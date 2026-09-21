@@ -116,6 +116,8 @@ pub struct Query {
     /// Only memories that existed at this time are considered.
     #[serde(default)]
     pub as_of_ms: Option<u64>,
+    #[serde(default)]
+    pub known_as_of_ms: Option<u64>,
     /// "Now" for relative dates in the query ("last week"); defaults to now.
     #[serde(default)]
     pub reference_time_ms: Option<u64>,
@@ -135,6 +137,7 @@ impl Query {
             entity_id: None,
             limit: Self::default_limit(),
             as_of_ms: None,
+            known_as_of_ms: None,
             reference_time_ms: None,
             rerank: false,
         }
@@ -155,6 +158,12 @@ impl Query {
     #[must_use]
     pub fn as_of(mut self, as_of_ms: u64) -> Self {
         self.as_of_ms = Some(as_of_ms);
+        self
+    }
+
+    #[must_use]
+    pub fn known_as_of(mut self, known_as_of_ms: u64) -> Self {
+        self.known_as_of_ms = Some(known_as_of_ms);
         self
     }
 }
@@ -248,6 +257,7 @@ impl Engine {
             proof_mode: None,
             max_evidence_turns_per_session: None,
             point_in_time_ms: query.as_of_ms,
+            known_as_of_ms: query.known_as_of_ms,
             reference_time_ms: query.reference_time_ms,
         };
         let (state, tenant, rerank) = (self.state.clone(), self.tenant.clone(), query.rerank);

@@ -85,8 +85,9 @@ pub async fn build_state(
         rescore_factor = vector_config.rescore_factor,
         "Vector segments"
     );
-    let tenant_manager =
-        Arc::new(storage::TenantDatabaseManager::new(paths.clone(), vector_config));
+    let tenant_manager = storage::TenantDatabaseManager::new(paths.clone(), vector_config);
+    tenant_manager.migrate_existing_tenants()?;
+    let tenant_manager = Arc::new(tenant_manager);
 
     let platform =
         Arc::new(platform::PlatformStore::new(paths.platform_db().to_string_lossy().as_ref())?);

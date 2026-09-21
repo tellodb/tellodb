@@ -3,6 +3,12 @@ use super::prelude::*;
 impl TenantStore {
     #[allow(clippy::too_many_lines)]
     pub(crate) fn init_schema(conn: &rusqlite::Connection) -> Result<()> {
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version > SCHEMA_VERSION {
+            anyhow::bail!(
+                "database schema version {version} is newer than supported version {SCHEMA_VERSION}"
+            );
+        }
         conn.execute_batch(
             "
             -- Core memories
@@ -14,6 +20,8 @@ impl TenantStore {
                 kind TEXT NOT NULL,
                 content_hash TEXT NOT NULL DEFAULT '',
                 created_at_ms INTEGER NOT NULL,
+                recorded_at_ms INTEGER NOT NULL,
+                expires_at_ms INTEGER,
                 session_id TEXT NOT NULL DEFAULT '',
                 turn_index INTEGER NOT NULL DEFAULT 0,
                 role TEXT NOT NULL DEFAULT '',
@@ -22,6 +30,8 @@ impl TenantStore {
             );
             CREATE INDEX IF NOT EXISTS idx_memories_entity ON memories(entity_id);
             CREATE INDEX IF NOT EXISTS idx_memories_memory_id ON memories(memory_id);
+            CREATE INDEX IF NOT EXISTS idx_memories_recorded_at ON memories(recorded_at_ms);
+            CREATE INDEX IF NOT EXISTS idx_memories_expiry ON memories(expires_at_ms);
 
             -- Memory cards
             CREATE TABLE IF NOT EXISTS memory_cards (
@@ -44,11 +54,17 @@ impl TenantStore {
                 parent_card_id TEXT,
                 lifecycle TEXT,
                 created_at_ms INTEGER,
-                updated_at_ms INTEGER
+                updated_at_ms INTEGER,
+                source_turn_index INTEGER NOT NULL DEFAULT 0,
+                document_time INTEGER NOT NULL DEFAULT 0,
+                conversation_time INTEGER NOT NULL DEFAULT 0,
+                event_time INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_memory_cards_entity ON memory_cards(entity_id);
             CREATE INDEX IF NOT EXISTS idx_memory_cards_session ON memory_cards(source_session_id);
             CREATE INDEX IF NOT EXISTS idx_memory_cards_source ON memory_cards(source_memory_id);
+            CREATE INDEX IF NOT EXISTS idx_memory_cards_entity_latest
+                ON memory_cards(entity_id, is_latest, expires_at);
 
             -- Graph edges
             CREATE TABLE IF NOT EXISTS edges (
@@ -103,6 +119,16 @@ impl TenantStore {
             );
             CREATE INDEX IF NOT EXISTS idx_router_entity ON session_router(entity_id);
 
+            CREATE TABLE IF NOT EXISTS session_router_sources (
+                session_id TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                memory_id TEXT NOT NULL,
+                record_json TEXT NOT NULL,
+                PRIMARY KEY(session_id, entity_id, memory_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_router_sources_memory
+                ON session_router_sources(memory_id);
+
             CREATE VIRTUAL TABLE IF NOT EXISTS fts_session_router USING fts5(
                 session_id UNINDEXED,
                 entity_id UNINDEXED,
@@ -151,10 +177,13 @@ impl TenantStore {
                 supersedes TEXT,
                 valid_from_ms INTEGER,
                 valid_to_ms INTEGER,
+                recorded_at_ms INTEGER NOT NULL,
                 PRIMARY KEY(fact_key, memory_id)
             );
             CREATE INDEX IF NOT EXISTS idx_fact_entity ON fact_versions(entity_id);
             CREATE INDEX IF NOT EXISTS idx_fact_versions_lookup ON fact_versions(fact_key, entity_id, status);
+            CREATE INDEX IF NOT EXISTS idx_fact_versions_order
+                ON fact_versions(fact_key, entity_id, timestamp_ms, recorded_at_ms);
 
             -- Memories that support a fact version (restatements merge into
             -- the version they confirm instead of creating a new one).
@@ -186,6 +215,13 @@ impl TenantStore {
                 entity_id TEXT PRIMARY KEY,
                 profile_json TEXT NOT NULL,
                 updated_at_ms INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS consolidation_queue (
+                memory_id TEXT PRIMARY KEY,
+                entity_id TEXT NOT NULL,
+                timestamp_ms INTEGER NOT NULL,
+                textual_content TEXT NOT NULL
             );
 
             -- Entity embeddings
@@ -291,11 +327,24 @@ impl TenantStore {
             ("role", "ALTER TABLE memories ADD COLUMN role TEXT NOT NULL DEFAULT ''"),
             ("parent_memory_id", "ALTER TABLE memories ADD COLUMN parent_memory_id TEXT"),
             ("indexed", "ALTER TABLE memories ADD COLUMN indexed INTEGER NOT NULL DEFAULT 0"),
+            (
+                "recorded_at_ms",
+                "ALTER TABLE memories ADD COLUMN recorded_at_ms INTEGER NOT NULL DEFAULT 0",
+            ),
+            ("expires_at_ms", "ALTER TABLE memories ADD COLUMN expires_at_ms INTEGER"),
         ] {
             if !Self::has_column(conn, "memories", column)? {
                 conn.execute_batch(ddl)?;
             }
         }
+        conn.execute(
+            "UPDATE memories SET recorded_at_ms = created_at_ms WHERE recorded_at_ms = 0",
+            [],
+        )?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_memories_recorded_at ON memories(recorded_at_ms);
+             CREATE INDEX IF NOT EXISTS idx_memories_expiry ON memories(expires_at_ms);",
+        )?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version < 4 {
             conn.execute("UPDATE memories SET indexed = 1", [])?;
@@ -322,30 +371,61 @@ impl TenantStore {
         if !Self::has_column(conn, "fact_versions", "recorded_at_ms")? {
             conn.execute_batch("ALTER TABLE fact_versions ADD COLUMN recorded_at_ms INTEGER;")?;
         }
+        conn.execute(
+            "UPDATE fact_versions SET recorded_at_ms = timestamp_ms WHERE recorded_at_ms IS NULL",
+            [],
+        )?;
+        for (column, ddl) in [
+            (
+                "source_turn_index",
+                "ALTER TABLE memory_cards ADD COLUMN source_turn_index INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "document_time",
+                "ALTER TABLE memory_cards ADD COLUMN document_time INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "conversation_time",
+                "ALTER TABLE memory_cards ADD COLUMN conversation_time INTEGER NOT NULL DEFAULT 0",
+            ),
+            ("event_time", "ALTER TABLE memory_cards ADD COLUMN event_time INTEGER"),
+        ] {
+            if !Self::has_column(conn, "memory_cards", column)? {
+                conn.execute_batch(ddl)?;
+            }
+        }
         conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_fact_versions_memory ON fact_versions(memory_id);",
+            "CREATE INDEX IF NOT EXISTS idx_fact_versions_memory ON fact_versions(memory_id);
+             CREATE INDEX IF NOT EXISTS idx_fact_versions_order
+                 ON fact_versions(fact_key, entity_id, timestamp_ms, recorded_at_ms);",
         )?;
 
-        if version < SCHEMA_VERSION {
-            let rows: Vec<(i64, String, String, String)> = {
-                let mut stmt = conn.prepare_cached(
-                    "SELECT rowid, content, entity_id, kind FROM memories ORDER BY rowid",
-                )?;
-                let mapped = stmt.query_map([], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-                })?;
-                mapped.collect::<rusqlite::Result<Vec<_>>>()?
-            };
+        if version < 5 {
             let tx = conn.unchecked_transaction()?;
-            {
+            let mut last_rowid = 0_i64;
+            loop {
+                let rows: Vec<(i64, String, String, String)> = {
+                    let mut stmt = tx.prepare_cached(
+                        "SELECT rowid, content, entity_id, kind FROM memories
+                         WHERE rowid > ?1 ORDER BY rowid LIMIT 10000",
+                    )?;
+                    let mapped = stmt.query_map(params![last_rowid], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                    })?;
+                    mapped.collect::<rusqlite::Result<Vec<_>>>()?
+                };
+                if rows.is_empty() {
+                    break;
+                }
                 let mut update =
                     tx.prepare_cached("UPDATE memories SET content_hash = ?1 WHERE rowid = ?2")?;
-                for (rowid, content, entity_id, kind) in rows {
+                for (rowid, content, entity_id, kind) in &rows {
                     update.execute(params![
-                        content_hash(&content, &entity_id, MemoryKind::parse(&kind)),
+                        content_hash(content, entity_id, MemoryKind::parse(kind)),
                         rowid,
                     ])?;
                 }
+                last_rowid = rows.last().expect("batch is non-empty").0;
             }
             tx.commit()?;
         }

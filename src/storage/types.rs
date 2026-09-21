@@ -13,16 +13,18 @@ pub enum MemoryKind {
     Preference,
     SessionSummary,
     Fact,
+    SyntheticQuery,
 }
 
 impl MemoryKind {
-    pub const ALL: [MemoryKind; 6] = [
+    pub const ALL: [MemoryKind; 7] = [
         MemoryKind::Conversational,
         MemoryKind::Decision,
         MemoryKind::Lesson,
         MemoryKind::Preference,
         MemoryKind::SessionSummary,
         MemoryKind::Fact,
+        MemoryKind::SyntheticQuery,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -33,6 +35,7 @@ impl MemoryKind {
             MemoryKind::Preference => "preference",
             MemoryKind::SessionSummary => "session_summary",
             MemoryKind::Fact => "fact",
+            MemoryKind::SyntheticQuery => "synthetic_query",
         }
     }
 
@@ -44,6 +47,7 @@ impl MemoryKind {
             "preference" => MemoryKind::Preference,
             "session_summary" | "session-summary" | "sessionsummary" => MemoryKind::SessionSummary,
             "fact" => MemoryKind::Fact,
+            "synthetic_query" | "synthetic-query" | "syntheticquery" => MemoryKind::SyntheticQuery,
             _ => MemoryKind::Conversational,
         }
     }
@@ -78,6 +82,8 @@ pub struct AgentObservation {
     pub kind: MemoryKind,
     pub content_hash: String,
     pub created_at_ms: u64,
+    pub recorded_at_ms: u64,
+    pub expires_at_ms: Option<u64>,
     /// Session the memory belongs to ("" if unknown).
     pub session_id: String,
     pub turn_index: u32,
@@ -208,6 +214,8 @@ pub struct DeletedObservation {
     pub chunk_vector_ids: Vec<u64>,
     pub entity_id: String,
     pub tombstone: Option<crate::lifecycle::DeletionTombstone>,
+    pub fts_removed: usize,
+    pub graph_edges_removed: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -325,6 +333,9 @@ pub struct MemoryCardSearchInput<'a> {
     pub entities: &'a [String],
     pub route_sessions: &'a HashSet<String>,
     pub include_stale: bool,
+    pub point_in_time_ms: Option<u64>,
+    pub known_as_of_ms: Option<u64>,
+    pub now_ms: u64,
     pub limit: usize,
 }
 
@@ -386,6 +397,13 @@ mod tests {
     fn memory_kind_fact_variants_parse() {
         assert_eq!(MemoryKind::parse("fact"), MemoryKind::Fact);
         assert_eq!(MemoryKind::parse("Fact"), MemoryKind::Fact);
+    }
+
+    #[test]
+    fn memory_kind_synthetic_query_round_trips() {
+        let kind = MemoryKind::parse("synthetic_query");
+        assert_eq!(kind.as_str(), "synthetic_query");
+        assert_eq!(MemoryKind::parse(kind.as_str()), kind);
     }
 
     #[test]

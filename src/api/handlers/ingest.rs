@@ -228,6 +228,9 @@ struct ArtifactBatches {
     predicate_canon_tau: f32,
     retrospective_candidates: Vec<RetrospectiveCandidate>,
     fact_batch: Vec<FactRegistration>,
+    metric_batch: Vec<crate::storage::repo::ingest::IngestMetric>,
+    metric_memory_ids: Vec<String>,
+    neighbour_embedding_updates: Vec<(String, Vec<f32>)>,
     consolidation_tasks: Vec<ConsolidationTask>,
 }
 
@@ -590,6 +593,8 @@ fn build_observations(
             kind,
             content_hash: hash,
             created_at_ms: payload.timestamp,
+            recorded_at_ms,
+            expires_at_ms: lifecycle.expires_at_ms,
             session_id: payload.session_id.clone().unwrap_or_default(),
             turn_index: payload.turn_index.unwrap_or(0),
             role: payload.role.clone().unwrap_or_default(),
@@ -601,6 +606,13 @@ fn build_observations(
 
     diag.dedup_build_ms = dedup_build_start.elapsed().as_millis() as u64;
     Ok(prepared)
+}
+
+fn should_keep_payload(stored: Option<&(String, i64)>, content_hash: &str) -> bool {
+    match stored {
+        Some((stored_hash, indexed)) => stored_hash != content_hash || *indexed == 0,
+        None => true,
+    }
 }
 
 // ── Phase 4: Artifact building ──
@@ -620,15 +632,16 @@ fn build_artifacts(
             record.obs.clone(),
         ));
         let is_synthetic_query = record.payload.kind.as_deref() == Some("synthetic_query");
-        if !is_synthetic_query {
+        if let Some(index_text) =
+            crate::core::text::index_text_for(record.obs.kind, &record.payload.textual_content)
+        {
             batches.fts_batch.push((
                 record.payload.memory_id.clone(),
                 record.payload.entity_id.clone(),
                 // Without stripping, `[Session Date: 2023/05/20]` is indexed
                 // with every memory and a lexical query can match a document
                 // by its metadata instead of its content.
-                crate::api::ingest::dialogue::content_for_index(&record.payload.textual_content)
-                    .to_string(),
+                index_text.to_string(),
             ));
             if features.enabled(Feature::MemoryCards) {
                 if let Some(card) = build_memory_card_from_payload(
@@ -814,6 +827,19 @@ async fn commit_batches(
                 object: fact.object,
             })
             .collect(),
+        metric_batch: std::mem::take(&mut batches.metric_batch),
+        metric_memory_ids: std::mem::take(&mut batches.metric_memory_ids),
+        neighbour_embedding_updates: std::mem::take(&mut batches.neighbour_embedding_updates),
+        consolidation_tasks: batches
+            .consolidation_tasks
+            .iter()
+            .map(|task| crate::storage::repo::ingest::IngestConsolidationTask {
+                entity_id: task.entity_id.clone(),
+                memory_id: task.memory_id.clone(),
+                timestamp: task.timestamp,
+                textual_content: task.textual_content.clone(),
+            })
+            .collect(),
     };
 
     let storage_start = Instant::now();
@@ -864,8 +890,27 @@ async fn commit_batches(
                 EngineError::internal("ingest operation failed")
             })
         };
-    let res_fts = join_stage("fts", res_fts)?;
-    let res_vix = join_stage("vector", res_vix)?;
+    let res_fts = join_stage("fts", res_fts);
+    let res_vix = join_stage("vector", res_vix);
+    let (res_fts, res_vix) = match (res_fts, res_vix) {
+        (Ok(fts), Ok(vector)) => (fts, vector),
+        (fts, vector) => {
+            let failure = fts.err().or_else(|| vector.err()).expect("one indexing stage failed");
+            let tenant_for_repair = tenant.clone();
+            let ids_for_repair = indexed_memory_ids.clone();
+            if let Err(repair_error) = tokio::task::spawn_blocking(move || {
+                tenant_for_repair.reindex_memory_ids(&ids_for_repair)
+            })
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|result| result)
+            {
+                tracing::error!(error = ?repair_error, "inline ingest repair failed");
+                return Err(failure);
+            }
+            (Duration::ZERO, Duration::ZERO)
+        }
+    };
     diag.fts_ms = res_fts.as_millis() as u64;
     diag.fts_us = res_fts.as_micros() as u64;
     diag.vector_ms = res_vix.as_millis() as u64;
@@ -926,7 +971,7 @@ fn build_memory_card_from_payload(
             MemoryKind::SessionSummary => "summarizes".to_string(),
             MemoryKind::Lesson => "learned".to_string(),
             MemoryKind::Fact => "states".to_string(),
-            MemoryKind::Conversational => "mentions".to_string(),
+            MemoryKind::Conversational | MemoryKind::SyntheticQuery => "mentions".to_string(),
         });
     let object =
         payload.fact_object.clone().unwrap_or_else(|| truncate_router_value(&memory_text, 320));
@@ -934,7 +979,7 @@ fn build_memory_card_from_payload(
     let confidence = payload
         .fact_confidence
         .unwrap_or(match kind {
-            MemoryKind::Conversational => 0.78,
+            MemoryKind::Conversational | MemoryKind::SyntheticQuery => 0.78,
             MemoryKind::SessionSummary => 0.84,
             MemoryKind::Fact | MemoryKind::Preference | MemoryKind::Decision => 0.92,
             MemoryKind::Lesson => 0.86,
@@ -986,7 +1031,7 @@ fn card_type_for_kind(kind: MemoryKind, text: &str) -> String {
                 "episode"
             }
         }
-        MemoryKind::Conversational => "episode",
+        MemoryKind::Conversational | MemoryKind::SyntheticQuery => "episode",
     }
     .to_string()
 }
@@ -1235,9 +1280,28 @@ pub(crate) fn spawn_consolidation_tasks(tenant: Arc<TenantStore>, tasks: Vec<Con
         for task in &tasks {
             if let Err(err) = update_core_profile_heuristic(&tenant, task) {
                 tracing::warn!(entity_id = %task.entity_id, error = ?err, "core profile update failed");
+            } else if let Err(err) = tenant.complete_consolidation_task(&task.memory_id) {
+                tracing::warn!(entity_id = %task.entity_id, error = ?err, "consolidation completion failed");
             }
         }
     });
+}
+
+pub fn run_pending_consolidations(tenant: &TenantStore, limit: usize) -> anyhow::Result<usize> {
+    let tasks = tenant.pending_consolidation_tasks(limit)?;
+    let mut completed = 0;
+    for task in tasks {
+        let task = ConsolidationTask {
+            entity_id: task.entity_id,
+            memory_id: task.memory_id,
+            timestamp: task.timestamp,
+            textual_content: task.textual_content,
+        };
+        update_core_profile_heuristic(tenant, &task)?;
+        tenant.complete_consolidation_task(&task.memory_id)?;
+        completed += 1;
+    }
+    Ok(completed)
 }
 
 /// Keeps the most recent facts per entity, ordered by fact time. Replaced
@@ -1355,7 +1419,7 @@ async fn execute_ingest_pipeline(
     {
         let stage_start = Instant::now();
         let ids: Vec<String> = expanded_payloads.iter().map(|p| p.memory_id.clone()).collect();
-        let stored = tenant.stored_content_hashes(&ids).map_err(|err| {
+        let stored = tenant.stored_content_states(&ids).map_err(|err| {
             tracing::error!(error = ?err, "content hash lookup failed");
             EngineError::internal("ingest operation failed")
         })?;
@@ -1367,7 +1431,7 @@ async fn execute_ingest_pipeline(
                     &p.entity_id,
                     MemoryKind::parse(p.kind.as_deref().unwrap_or_default()),
                 );
-                stored.get(&p.memory_id) != Some(&hash)
+                should_keep_payload(stored.get(&p.memory_id), &hash)
             })
             .collect();
         let mut kept = keep.iter();
@@ -1398,10 +1462,23 @@ async fn execute_ingest_pipeline(
     // Phase 4: Artifact building
     let mut batches = build_artifacts(prepared, &mut diag, features);
 
-    // Phase 5: Storage commit
-    commit_batches(tenant, state, &mut batches, &mut diag).await?;
+    let analytics_start = Instant::now();
+    for (entity_id, memory_id, timestamp, text) in &metric_sources {
+        batches.metric_memory_ids.push(memory_id.clone());
+        batches.metric_batch.extend(state.analytics.extractor().extract(text).into_iter().map(
+            |metric| crate::storage::repo::ingest::IngestMetric {
+                entity_id: entity_id.clone(),
+                memory_id: memory_id.clone(),
+                timestamp: *timestamp,
+                label: metric.label,
+                value: metric.value,
+                unit: metric.unit,
+                source_text: metric.source_text,
+            },
+        ));
+    }
+    (diag.analytics_ms, diag.analytics_us) = elapsed_ms_and_us(analytics_start);
 
-    // Stored neighbours whose context window changed get re-embedded.
     if !neighbour_updates.is_empty() {
         let (ids, texts): (Vec<String>, Vec<String>) = neighbour_updates.into_iter().unzip();
         diag.count("context_reembeds", texts.len());
@@ -1410,49 +1487,11 @@ async fn execute_ingest_pipeline(
             tracing::error!(error = ?err, "neighbour re-embedding failed");
             EngineError::internal("ingest operation failed")
         })?;
-        let tenant = tenant.clone();
-        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            let applied =
-                tenant.update_embeddings(&ids.into_iter().zip(embeddings).collect::<Vec<_>>())?;
-            let vectors = tenant.vectors()?;
-            let mut by_entity: std::collections::HashMap<String, Vec<(u64, Vec<f32>)>> =
-                std::collections::HashMap::new();
-            for (vector_id, entity_id, embedding) in applied {
-                by_entity.entry(entity_id).or_default().push((vector_id, embedding));
-            }
-            for (entity_id, items) in by_entity {
-                vectors.insert_batch(&entity_id, &items)?;
-            }
-            Ok(())
-        })
-        .await
-        .map_err(anyhow::Error::from)
-        .and_then(|r| r)
-        .map_err(|err| {
-            tracing::error!(error = ?err, "neighbour vector update failed");
-            EngineError::internal("ingest operation failed")
-        })?;
+        batches.neighbour_embedding_updates = ids.into_iter().zip(embeddings).collect();
     }
 
-    // Phase 6: Numeric memory
-    let stage_start = Instant::now();
-    tokio::task::spawn_blocking({
-        let (analytics, tenant) = (state.analytics.clone(), tenant.clone());
-        move || -> anyhow::Result<()> {
-            for (entity_id, memory_id, timestamp, text) in &metric_sources {
-                analytics.record_memory(&tenant, entity_id, memory_id, *timestamp, text)?;
-            }
-            Ok(())
-        }
-    })
-    .await
-    .map_err(anyhow::Error::from)
-    .and_then(|r| r)
-    .map_err(|err| {
-        tracing::error!(error = ?err, "metric extraction failed");
-        EngineError::internal("ingest operation failed")
-    })?;
-    (diag.analytics_ms, diag.analytics_us) = elapsed_ms_and_us(stage_start);
+    // Phase 5: Storage commit
+    commit_batches(tenant, state, &mut batches, &mut diag).await?;
 
     (diag.total_ms, diag.total_us) = elapsed_ms_and_us(total_start);
     tracing::debug!("[CP] final: μs={}", total_start.elapsed().as_micros());

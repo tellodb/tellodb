@@ -5,6 +5,23 @@ use super::{
     QueryResult, ResultOrigin, Tag, TenantStore,
 };
 
+// R2: every result carries a `similarity`, and a caller computing a rank
+// metric from the returned order is trusting it reflects that score.
+// `select_candidates_with_session_head` orders by a session-diversity
+// heuristic instead, and the synthetic answer row spliced in below is
+// positioned without regard to score, so `results[0].similarity` was
+// frequently lower than `results[3].similarity`. Call this right before
+// anything treats list order as rank order, and again right before
+// returning.
+fn sort_results_by_similarity_desc(results: &mut [QueryResult]) {
+    results.sort_by(|a, b| {
+        b.similarity
+            .partial_cmp(&a.similarity)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.memory_id.cmp(&b.memory_id))
+    });
+}
+
 #[allow(clippy::too_many_lines)]
 fn build_proof_packet(
     tenant: &TenantStore,
@@ -297,6 +314,11 @@ pub(crate) fn score_build_response(
     };
     let source_observations =
         s.tenant.get_observations_batch(&source_keys).map_err(read_failed("observations"))?;
+    // Measure only this fetch. `factver_us` and `build_cards_us` below have
+    // their own dedicated diag fields; previously this timer was read after
+    // both of those stages ran, so their cost was counted twice — once
+    // under their own name and again folded into `hydrate_obs_ms`.
+    (s.diag.hydrate_obs_ms, s.diag.hydrate_obs_us) = elapsed_ms_and_us(hydrate_obs_start);
 
     let mut fact_memory_ids = Vec::new();
     let mut card_ids = Vec::new();
@@ -319,8 +341,6 @@ pub(crate) fn score_build_response(
     let memory_cards =
         s.tenant.get_memory_cards_batch(&card_ids).map_err(read_failed("memory_cards"))?;
     s.diag.build_cards_us = cards_start.elapsed().as_micros() as u64;
-
-    (s.diag.hydrate_obs_ms, s.diag.hydrate_obs_us) = elapsed_ms_and_us(hydrate_obs_start);
 
     let proof_us = std::sync::atomic::AtomicU64::new(0);
     let mut queries: Vec<QueryResult> = selected
@@ -393,6 +413,12 @@ pub(crate) fn score_build_response(
             }
         })
         .collect();
+
+    // Restore rank order before "top-ranked result" below is read as
+    // meaning "highest similarity" rather than "whatever the session
+    // diversity heuristic put first." See `sort_results_by_similarity_desc`.
+    sort_results_by_similarity_desc(&mut queries);
+
     s.diag.proof_us = proof_us.load(std::sync::atomic::Ordering::Relaxed);
     let confidence_start = Instant::now();
     let evidence_conf = compute_evidence_confidence(
@@ -441,11 +467,30 @@ pub(crate) fn score_build_response(
                         stability_score: None,
                         origin: ResultOrigin::SynthesizedCard,
                     };
+                    // R3: this row is extra context layered on top of the
+                    // already-budgeted retrieved set (`s.limit +
+                    // synthetic_cards`, enforced above by
+                    // `select_candidates_with_session_head`). Inserting it
+                    // unconditionally grew the response past what the
+                    // caller asked for. Cap it here: if we are already at
+                    // budget, drop the lowest-ranked retrieved result to
+                    // make room instead of adding a free row. (The
+                    // observation block `api/handlers/query.rs` inserts on
+                    // top of this response is outside this file's
+                    // ownership and is not covered by this cap.)
+                    if queries.len() >= s.limit + synthetic_cards {
+                        queries.pop();
+                    }
                     queries.insert(0, synthetic);
                 }
             }
         }
     }
+
+    // Restore rank order once more: the synthetic row above (similarity
+    // 1.0) was spliced in at position 0 regardless of whether it actually
+    // has the highest score in the list.
+    sort_results_by_similarity_desc(&mut queries);
 
     Ok(queries)
 }
@@ -453,6 +498,55 @@ pub(crate) fn score_build_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn result(memory_id: &str, similarity: f32) -> QueryResult {
+        QueryResult {
+            memory_id: memory_id.to_string(),
+            entity_id: "entity".to_string(),
+            session_id: "session".to_string(),
+            turn_index: 0,
+            created_at_ms: 100,
+            similarity,
+            textual_content: "text".to_string(),
+            evidence: None,
+            inference_notes: None,
+            fact_key: None,
+            conflict_flag: None,
+            superseded_by: None,
+            why_stale: None,
+            stability_score: None,
+            origin: ResultOrigin::Stored,
+        }
+    }
+
+    #[test]
+    fn sort_by_similarity_puts_results_in_rank_order() {
+        // R2 regression: `select_candidates_with_session_head` returns
+        // candidates ordered by a session-diversity heuristic, not by
+        // score, so callers cannot assume `results[0]` is the best match
+        // without this pass.
+        let mut results =
+            vec![result("memory-low", 0.2), result("memory-high", 0.9), result("memory-mid", 0.5)];
+
+        sort_results_by_similarity_desc(&mut results);
+
+        assert_eq!(
+            results.iter().map(|r| r.memory_id.as_str()).collect::<Vec<_>>(),
+            vec!["memory-high", "memory-mid", "memory-low"]
+        );
+    }
+
+    #[test]
+    fn sort_by_similarity_breaks_ties_by_memory_id() {
+        let mut results = vec![result("memory-b", 0.5), result("memory-a", 0.5)];
+
+        sort_results_by_similarity_desc(&mut results);
+
+        assert_eq!(
+            results.iter().map(|r| r.memory_id.as_str()).collect::<Vec<_>>(),
+            vec!["memory-a", "memory-b"]
+        );
+    }
 
     fn card(source_memory_id: &str, source_session_id: &str) -> EvidenceCard {
         EvidenceCard {

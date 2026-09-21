@@ -20,7 +20,7 @@ pub fn apply_time_decay(base_score: f32, age_in_days: f32, half_life_days: f32, 
 
 pub fn decay_policy(kind: MemoryKind) -> (f32, f32) {
     match kind {
-        MemoryKind::Conversational => (30.0, DECAY_FLOOR),
+        MemoryKind::Conversational | MemoryKind::SyntheticQuery => (30.0, DECAY_FLOOR),
         MemoryKind::Lesson => (90.0, DECAY_FLOOR),
         MemoryKind::Fact => (180.0, DECAY_FLOOR),
         MemoryKind::SessionSummary => (14.0, DECAY_FLOOR),

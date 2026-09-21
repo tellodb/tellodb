@@ -156,8 +156,6 @@ pub async fn reset_handler(
     }
 
     tenant.clear_all().map_err(internal_error)?;
-    tenant.fts_clear().map_err(internal_error)?;
-    tenant.graph_clear().map_err(internal_error)?;
     tenant.vectors().and_then(|v| v.clear(None)).map_err(internal_error)?;
 
     if payload.clear_embedding_cache.unwrap_or(false) {
@@ -269,15 +267,6 @@ pub async fn memory_delete_handler(
             .lookup_by_memory_id(&payload.memory_id)
             .map_err(internal_error)?
             .map(|(ts, _)| ts);
-        let observation = if let Some(ts) = timestamp {
-            tenant
-                .get_observations_batch(&[(ts, payload.memory_id.clone())])
-                .map_err(internal_error)?
-                .remove(&payload.memory_id)
-        } else {
-            None
-        };
-
         let Some(ts) = timestamp else {
             return Ok::<MemoryDeleteResponse, EngineError>(MemoryDeleteResponse {
                 deleted: false,
@@ -292,16 +281,12 @@ pub async fn memory_delete_handler(
 
         let deleted =
             tenant.delete_observation(ts, &payload.memory_id, &reason).map_err(internal_error)?;
-        let fts_removed = if observation.is_some() {
-            tenant.fts_remove_document(&payload.memory_id).map(|()| 1).map_err(internal_error)?
-        } else {
-            0
-        };
-        let graph_edges_removed =
-            tenant.graph_remove_memory(&payload.memory_id).map_err(internal_error)?;
-        let vectors = tenant.vectors().map_err(internal_error)?;
-        for vector_id in deleted.vector_id.iter().chain(deleted.chunk_vector_ids.iter()) {
-            vectors.remove(&deleted.entity_id, *vector_id).map_err(internal_error)?;
+        if let Ok(vectors) = tenant.vectors() {
+            for vector_id in deleted.vector_id.iter().chain(deleted.chunk_vector_ids.iter()) {
+                if let Err(error) = vectors.remove(&deleted.entity_id, *vector_id) {
+                    tracing::error!(error = ?error, vector_id, "deleted vector cleanup failed");
+                }
+            }
         }
 
         Ok::<MemoryDeleteResponse, EngineError>(MemoryDeleteResponse {
@@ -310,8 +295,8 @@ pub async fn memory_delete_handler(
             timestamp: Some(ts),
             vector_id: deleted.vector_id,
             tombstone: deleted.tombstone,
-            fts_removed,
-            graph_edges_removed,
+            fts_removed: deleted.fts_removed,
+            graph_edges_removed: deleted.graph_edges_removed,
         })
     })
     .await

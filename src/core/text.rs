@@ -1,9 +1,32 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::fts::tokenize_for_similarity;
+use crate::storage::MemoryKind;
 
 const MIN_SALIENT_TOKEN_LEN: usize = 3;
 const MIN_PHRASE_LEN: usize = 2;
+
+pub fn content_for_index(text: &str) -> &str {
+    let mut rest = text.trim();
+    loop {
+        if !rest.starts_with('[') {
+            break;
+        }
+        let Some(end_idx) = rest.find(']') else {
+            break;
+        };
+        rest = rest[end_idx + 1..].trim_start();
+    }
+    if rest.is_empty() {
+        text
+    } else {
+        rest
+    }
+}
+
+pub fn index_text_for(kind: MemoryKind, content: &str) -> Option<&str> {
+    (kind != MemoryKind::SyntheticQuery).then(|| content_for_index(content))
+}
 
 pub fn normalize_fact_text(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")

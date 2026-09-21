@@ -116,6 +116,15 @@ pub struct Features {
     disabled: u32,
 }
 
+// Serialized as the list of disabled feature names rather than the raw
+// bitmask: a benchmark record has to say which structures were off in terms a
+// reader (and a future ablation table) can use, not as an opaque integer.
+impl serde::Serialize for Features {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.disabled_names())
+    }
+}
+
 impl Features {
     pub fn parse(spec: &str) -> Result<Self> {
         let mut disabled = 0;

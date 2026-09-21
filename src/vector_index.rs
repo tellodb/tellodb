@@ -116,7 +116,8 @@ impl VectorSource for MemoryVectorSource {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Quantization {
     F32,
     F16,
@@ -165,7 +166,7 @@ impl Quantization {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct VectorConfig {
     pub dimensions: usize,
     pub quantization: Quantization,

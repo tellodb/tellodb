@@ -1,6 +1,6 @@
 use super::{
-    elapsed_ms_and_us, routed_session_from_memory_id, rrf_fuse, Feature, HashMap, HashSet, Lane,
-    QueryPipelineState, TenantStore,
+    elapsed_ms_and_us, routed_session_from_memory_id, rrf_fuse, Feature, HashMap, HashSet, Instant,
+    Lane, QueryPipelineState, TenantStore,
 };
 use crate::graph::EdgeType;
 
@@ -98,6 +98,11 @@ pub(crate) fn intent_weight_for_edge(
 
 #[allow(clippy::too_many_lines)]
 pub(crate) fn route_phase(s: &mut QueryPipelineState) {
+    // `route_start` was captured once in `QueryPipelineState::new`, before
+    // `plan_phase` runs, so the `route_ms` computed at the end of this
+    // function silently included all of `planning_ms`. Reset it here so the
+    // span actually measures only this phase.
+    s.route_start = Instant::now();
     if !s.state.config.features.enabled(Feature::SessionRouter)
         || !s.state.config.lanes.enabled(Lane::Route)
     {
@@ -148,13 +153,17 @@ pub(crate) fn route_phase(s: &mut QueryPipelineState) {
 
     // Lane 1: entity-anchored pivot (resolved subjects → sessions). Strongest
     // signal for multi-hop and cross-entity questions.
+    //
+    // `plan_phase` already ran `entity_pivot_sessions` with these exact
+    // inputs (entity id + subject entities) to compute a session-score
+    // bonus; reuse that result instead of issuing the identical DB call
+    // again. When `plan_phase` skipped it (no `entity_id` on the payload),
+    // `pivot_hits` is empty here too — `entity_pivot_sessions` scopes its
+    // query to `entity_id`, so a direct call with `""` would have returned
+    // nothing anyway.
     if !s.plan.subject_entities.is_empty() {
-        let tenant = s.tenant.clone();
-        let eid = s.payload.entity_id.clone();
-        let subjects = s.plan.subject_entities.clone();
-        if let Ok(hits) = tenant.entity_pivot_sessions(eid.as_deref().unwrap_or(""), &subjects) {
-            lanes.push(hits.into_iter().map(|h| (h.session_id, h.score)).collect());
-        }
+        let hits = std::mem::take(&mut s.route.pivot_hits);
+        lanes.push(hits.into_iter().map(|h| (h.session_id, h.score)).collect());
     }
 
     // Lane 2: FTS session router (router_text OR of query terms).

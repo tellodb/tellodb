@@ -1,6 +1,32 @@
 use super::prelude::*;
 
 impl TenantStore {
+    pub fn pending_consolidation_tasks(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<super::ingest::IngestConsolidationTask>> {
+        let conn = self.get_conn()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT entity_id, memory_id, timestamp_ms, textual_content
+             FROM consolidation_queue ORDER BY timestamp_ms, memory_id LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            Ok(super::ingest::IngestConsolidationTask {
+                entity_id: row.get(0)?,
+                memory_id: row.get(1)?,
+                timestamp: row.get::<_, i64>(2)? as u64,
+                textual_content: row.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn complete_consolidation_task(&self, memory_id: &str) -> Result<()> {
+        let conn = self.get_conn()?;
+        conn.execute("DELETE FROM consolidation_queue WHERE memory_id = ?1", params![memory_id])?;
+        Ok(())
+    }
+
     pub fn get_deletion_tombstones_for_target(
         &self,
         memory_id: &str,
@@ -116,14 +142,14 @@ impl TenantStore {
                 "SELECT card_id, lifecycle FROM memory_cards WHERE expires_at IS NOT NULL AND expires_at <= ?1"
             )?;
             let rows = stmt.query_map(params![now_ms as i64], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
             })?;
 
             for row in rows {
                 let (card_id, lifecycle_json) = row?;
-                if let Ok(mut lifecycle) =
-                    serde_json::from_str::<crate::lifecycle::LifecycleMetadata>(&lifecycle_json)
-                {
+                if let Some(mut lifecycle) = lifecycle_json.as_deref().and_then(|json| {
+                    serde_json::from_str::<crate::lifecycle::LifecycleMetadata>(json).ok()
+                }) {
                     if lifecycle.lifecycle_state != crate::lifecycle::LifecycleState::Expired
                         && matches!(
                             lifecycle.retention_class,
@@ -154,5 +180,38 @@ impl TenantStore {
             tx.commit()?;
         }
         Ok(count)
+    }
+
+    pub fn purge_expired_memories(&self, now_ms: u64, limit: usize) -> Result<usize> {
+        let expired = {
+            let conn = self.get_conn()?;
+            let mut stmt = conn.prepare_cached(
+                "SELECT created_at_ms, memory_id FROM memories
+                 WHERE expires_at_ms IS NOT NULL AND expires_at_ms <= ?1
+                 ORDER BY expires_at_ms, rowid LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![now_ms as i64, limit as i64], |row| {
+                Ok((row.get::<_, i64>(0)? as u64, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut deleted = 0;
+        for (timestamp, memory_id) in expired {
+            let result = self.delete_observation(timestamp, &memory_id, "retention_expired")?;
+            let vector_ids = result
+                .vector_id
+                .iter()
+                .chain(result.chunk_vector_ids.iter())
+                .copied()
+                .collect::<Vec<_>>();
+            if !vector_ids.is_empty() {
+                let vectors = self.vectors()?;
+                for vector_id in vector_ids {
+                    vectors.remove(&result.entity_id, vector_id)?;
+                }
+            }
+            deleted += 1;
+        }
+        Ok(deleted)
     }
 }

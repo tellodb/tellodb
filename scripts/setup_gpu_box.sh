@@ -126,7 +126,13 @@ echo "    wrote $ENV_FILE"
 
 # ── Build ────────────────────────────────────────────────────────────────────
 step "Building tellodb (this takes a few minutes on a cold cache)"
-cargo build --profile fastrelease --bin tellodb
+# ort's CUDA execution provider is gated behind the gpu-cuda feature, so a GPU
+# box must ask for it explicitly or the CUDA check below will fail.
+if [[ $GPU_PRESENT -eq 1 ]]; then
+    cargo build --profile fastrelease --bin tellodb --features gpu-cuda
+else
+    cargo build --profile fastrelease --bin tellodb
+fi
 cargo build --release --manifest-path benchmarks/rust_evaluator/Cargo.toml
 echo "    engine:    $REPO_ROOT/target/fastrelease/tellodb"
 echo "    evaluator: $REPO_ROOT/benchmarks/rust_evaluator/target/release/rust_evaluator"

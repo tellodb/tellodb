@@ -67,12 +67,7 @@ pub fn strip_leading_bracketed_prefixes(text: &str) -> &str {
 /// A document that is nothing but headers is kept as-is rather than reduced
 /// to an empty, unsearchable memory.
 pub fn content_for_index(text: &str) -> &str {
-    let stripped = strip_leading_bracketed_prefixes(text);
-    if stripped.is_empty() {
-        text
-    } else {
-        stripped
-    }
+    crate::core::text::content_for_index(text)
 }
 
 pub fn value_to_text(value: &serde_json::Value) -> Option<String> {

@@ -185,7 +185,7 @@ pub fn kind_query_bonus(kind: MemoryKind, plan: &QueryPlan, obs: &ScorableObserv
         }
     } else if plan.prefer_episodic {
         match kind {
-            MemoryKind::Conversational => 0.08,
+            MemoryKind::Conversational | MemoryKind::SyntheticQuery => 0.08,
             MemoryKind::Fact => -0.06,
             MemoryKind::SessionSummary => -0.14,
             MemoryKind::Lesson => -0.05,
@@ -199,7 +199,7 @@ pub fn kind_query_bonus(kind: MemoryKind, plan: &QueryPlan, obs: &ScorableObserv
         bonus += match kind {
             MemoryKind::Fact => 0.07,
             MemoryKind::SessionSummary => 0.05,
-            MemoryKind::Conversational => 0.02,
+            MemoryKind::Conversational | MemoryKind::SyntheticQuery => 0.02,
             MemoryKind::Lesson | MemoryKind::Decision | MemoryKind::Preference => 0.03,
         };
     }
@@ -538,12 +538,12 @@ pub fn kind_priority(kind: MemoryKind, prefer_distilled: bool) -> u8 {
             MemoryKind::Fact => 4,
             MemoryKind::SessionSummary => 3,
             MemoryKind::Lesson => 2,
-            MemoryKind::Conversational => 1,
+            MemoryKind::Conversational | MemoryKind::SyntheticQuery => 1,
             MemoryKind::Decision | MemoryKind::Preference => 0,
         }
     } else {
         match kind {
-            MemoryKind::Conversational => 4,
+            MemoryKind::Conversational | MemoryKind::SyntheticQuery => 4,
             MemoryKind::Fact => 3,
             MemoryKind::SessionSummary => 2,
             MemoryKind::Lesson => 1,
@@ -917,6 +917,21 @@ pub fn select_candidates_with_session_head(
         }
     }
 
+    // R2: the round-robin loop above interleaves sessions in *session*
+    // score order (`session_score`, computed further up from a blend of
+    // top1/top2/top3 plus coverage bonuses) so it can pick up one candidate
+    // per session per round. That is a different ordering than each
+    // candidate's own `final_score`, and callers reasonably read this
+    // return value as "best candidate first". Sort by `final_score`
+    // descending (memory_id tiebreak for determinism) so the ordering this
+    // function returns actually reflects the score it selected on.
+    selected.sort_by(|a, b| {
+        b.final_score
+            .partial_cmp(&a.final_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.source_memory_id.cmp(&b.source_memory_id))
+    });
+
     selected
 }
 
@@ -1112,4 +1127,79 @@ fn normalize_subject_entity_phrase(phrase: &str) -> String {
         normalized.truncate(normalized.len().saturating_sub(1));
     }
     normalized.trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn evidence_card(memory_id: &str, session_id: &str, final_score: f32) -> EvidenceCard {
+        EvidenceCard {
+            claim_text: memory_id.to_string(),
+            source_memory_id: memory_id.to_string(),
+            source_session_id: session_id.to_string(),
+            card_id: None,
+            semantic_rank: None,
+            semantic_score: final_score,
+            bm25_rank: None,
+            bm25_score: 0.0,
+            session_router_rank: None,
+            session_router_score: 0.0,
+            card_score: 0.0,
+            reranker_score: final_score,
+            entity_hits: 0,
+            lexical_hits: 0,
+            temporal_hits: 0,
+            facet_mask: 0,
+            graph_score: 0.0,
+            child_score: 0.0,
+            is_latest: true,
+            card_type: MemoryKind::Fact.as_str().to_string(),
+            final_score,
+            inference_notes: None,
+            internal_kind: MemoryKind::Fact,
+            created_at_ms: 100,
+            entity_id: "entity".to_string(),
+            source_turn_index: 0,
+        }
+    }
+
+    #[test]
+    fn selection_is_returned_in_final_score_order_across_sessions() {
+        // R2 regression: the round-robin loop interleaves candidates in
+        // `session_score` order (a blend of a session's own top1/top2/top3
+        // plus coverage bonuses), a different formula than each candidate's
+        // own `final_score`. "session-b" outranks "session-a" as a
+        // *session*, so round 0 picks session-b's best item (0.95) then
+        // session-a's only item (0.55); round 1 then picks session-b's
+        // second item (0.6) — landing after the 0.55 one. Pre-sort order is
+        // [0.95, 0.55, 0.6], which is not in score order.
+        let candidates = vec![
+            evidence_card("b-top", "session-b", 0.95),
+            evidence_card("b-second", "session-b", 0.6),
+            evidence_card("a-only", "session-a", 0.55),
+        ];
+
+        let selected =
+            select_candidates_with_session_head(candidates, 3, &QueryPlan::default(), false, false);
+
+        let scores: Vec<f32> = selected.iter().map(|c| c.final_score).collect();
+        assert_eq!(scores, vec![0.95, 0.6, 0.55], "must be sorted by final_score descending");
+    }
+
+    #[test]
+    fn selection_tiebreaks_by_memory_id_for_determinism() {
+        let candidates = vec![
+            evidence_card("memory-b", "session-b", 0.5),
+            evidence_card("memory-a", "session-a", 0.5),
+        ];
+
+        let selected =
+            select_candidates_with_session_head(candidates, 2, &QueryPlan::default(), false, false);
+
+        assert_eq!(
+            selected.iter().map(|c| c.source_memory_id.as_str()).collect::<Vec<_>>(),
+            vec!["memory-a", "memory-b"]
+        );
+    }
 }

@@ -205,8 +205,8 @@ async fn serve(paths: &RuntimePaths) -> anyhow::Result<()> {
         let mut ticker = interval(Duration::from_secs(300));
         loop {
             ticker.tick().await;
-            let tenants = maintenance.all_tenants();
             let platform = platform.clone();
+            let maintenance = maintenance.clone();
             let _ = tokio::task::spawn_blocking(move || {
                 let now_ms = match std::time::SystemTime::now()
                     .duration_since(std::time::SystemTime::UNIX_EPOCH)
@@ -217,15 +217,37 @@ async fn serve(paths: &RuntimePaths) -> anyhow::Result<()> {
                 if let Err(error) = platform.purge_expired_sessions(now_ms) {
                     error!(error = ?error, "Expired session purge failed");
                 }
-                for tenant in tenants {
+                let tenant_ids = match maintenance.tenant_ids() {
+                    Ok(tenant_ids) => tenant_ids,
+                    Err(error) => {
+                        error!(error = ?error, "Tenant maintenance discovery failed");
+                        return;
+                    }
+                };
+                for tenant_id in tenant_ids {
+                    let tenant = match maintenance.get_tenant(&tenant_id) {
+                        Ok(tenant) => tenant,
+                        Err(error) => {
+                            error!(tenant_id, error = ?error, "Tenant maintenance open failed");
+                            continue;
+                        }
+                    };
                     if let Err(error) = tenant.reindex_unindexed(500) {
                         error!(error = ?error, "unindexed memory recovery failed");
+                    }
+                    if let Err(error) =
+                        tellodb::api::handlers::ingest::run_pending_consolidations(&tenant, 500)
+                    {
+                        error!(error = ?error, "pending consolidation recovery failed");
                     }
                     if let Err(error) = tenant.checkpoint() {
                         error!(error = ?error, "WAL checkpoint failed");
                     }
                     if let Err(error) = tenant.expire_records(now_ms) {
                         error!(error = ?error, "Lifecycle expiration sweep failed");
+                    }
+                    if let Err(error) = tenant.purge_expired_memories(now_ms, 500) {
+                        error!(error = ?error, "Expired memory purge failed");
                     }
                 }
             })

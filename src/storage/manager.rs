@@ -2,15 +2,16 @@ use super::tenant::TenantStore;
 use crate::runtime_paths::RuntimePaths;
 use crate::vector_index::{VectorConfig, VectorIndex};
 use anyhow::Result;
+use lru::LruCache;
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use tracing::warn;
 
 pub struct TenantDatabaseManager {
     paths: RuntimePaths,
     vector_config: VectorConfig,
-    tenants: RwLock<HashMap<String, Arc<TenantStore>>>,
+    tenants: RwLock<LruCache<String, Arc<TenantStore>>>,
 }
 
 /// Tenant ids become directory names, so only a safe character set is
@@ -27,20 +28,49 @@ pub fn validate_tenant_id(tenant_id: &str) -> Result<()> {
 
 impl TenantDatabaseManager {
     pub fn new(paths: RuntimePaths, vector_config: VectorConfig) -> Self {
-        Self { paths, vector_config, tenants: RwLock::new(HashMap::new()) }
+        let capacity = std::env::var("TELLODB_MAX_OPEN_TENANTS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .and_then(NonZeroUsize::new)
+            .unwrap_or(NonZeroUsize::new(32).expect("non-zero default"));
+        Self::with_capacity(paths, vector_config, capacity)
+    }
+
+    fn with_capacity(
+        paths: RuntimePaths,
+        vector_config: VectorConfig,
+        capacity: NonZeroUsize,
+    ) -> Self {
+        Self { paths, vector_config, tenants: RwLock::new(LruCache::new(capacity)) }
+    }
+
+    pub fn migrate_existing_tenants(&self) -> Result<usize> {
+        let tenants_dir = self.paths.root().join("tenants");
+        if !tenants_dir.exists() {
+            return Ok(0);
+        }
+        let mut migrated = 0;
+        for entry in std::fs::read_dir(tenants_dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let Some(tenant_id) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            validate_tenant_id(&tenant_id)?;
+            let database = self.paths.tenant_db(&tenant_id);
+            if database.exists() {
+                TenantStore::new(&database)?;
+                migrated += 1;
+            }
+        }
+        Ok(migrated)
     }
 
     pub fn get_tenant(&self, tenant_id: &str) -> Result<Arc<TenantStore>> {
         validate_tenant_id(tenant_id)?;
-        {
-            let read = self.tenants.read();
-            if let Some(store) = read.get(tenant_id) {
-                return Ok(store.clone());
-            }
-        }
-
         let mut write = self.tenants.write();
-        // Double check
         if let Some(store) = write.get(tenant_id) {
             return Ok(store.clone());
         }
@@ -56,14 +86,37 @@ impl TenantDatabaseManager {
             );
         }
         store.attach_vectors(VectorIndex::new(self.vector_config, store.vector_source()))?;
-        write.insert(tenant_id.to_string(), store.clone());
+        write.put(tenant_id.to_string(), store.clone());
 
         Ok(store)
     }
 
     pub fn all_tenants(&self) -> Vec<Arc<TenantStore>> {
         let read = self.tenants.read();
-        read.values().cloned().collect()
+        read.iter().map(|(_, store)| store.clone()).collect()
+    }
+
+    pub fn tenant_ids(&self) -> Result<Vec<String>> {
+        let tenants_dir = self.paths.root().join("tenants");
+        if !tenants_dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut tenant_ids = Vec::new();
+        for entry in std::fs::read_dir(tenants_dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let Some(tenant_id) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            validate_tenant_id(&tenant_id)?;
+            if self.paths.tenant_db(&tenant_id).exists() {
+                tenant_ids.push(tenant_id);
+            }
+        }
+        tenant_ids.sort();
+        Ok(tenant_ids)
     }
 }
 
@@ -108,5 +161,50 @@ mod tests {
         let b_hits = b.vectors().unwrap().search(Some("e"), &[1.0, 0.0, 0.0], 5).unwrap();
         assert!(a_hits[0].1 < 1e-5, "tenant a finds its own vector");
         assert!((b_hits[0].1 - 1.0).abs() < 1e-5, "tenant b only sees its orthogonal vector");
+    }
+
+    #[test]
+    fn evicts_the_least_recently_used_tenant() {
+        let temp = tempfile::tempdir().unwrap();
+        let mgr = TenantDatabaseManager::with_capacity(
+            RuntimePaths::from_root(temp.path().to_path_buf()),
+            VectorConfig::new(3),
+            NonZeroUsize::new(2).unwrap(),
+        );
+        let first = mgr.get_tenant("first").unwrap();
+        mgr.get_tenant("second").unwrap();
+        mgr.get_tenant("third").unwrap();
+
+        let reopened = mgr.get_tenant("first").unwrap();
+        assert!(!Arc::ptr_eq(&first, &reopened));
+        assert_eq!(mgr.all_tenants().len(), 2);
+    }
+
+    #[test]
+    fn migrates_existing_tenants_before_they_are_requested() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::from_root(temp.path().to_path_buf());
+        paths.ensure_tenant_dir("existing").unwrap();
+        let database = paths.tenant_db("existing");
+        drop(TenantStore::new(&database).unwrap());
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection.execute("DROP TABLE consolidation_queue", []).unwrap();
+        connection.execute("PRAGMA user_version = 6", []).unwrap();
+        drop(connection);
+
+        let mgr = TenantDatabaseManager::new(paths, VectorConfig::new(3));
+        assert_eq!(mgr.migrate_existing_tenants().unwrap(), 1);
+        let connection = rusqlite::Connection::open(database).unwrap();
+        let version: i64 =
+            connection.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
+        assert_eq!(version, crate::storage::tenant::SCHEMA_VERSION);
+        let queue_exists: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'consolidation_queue'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(queue_exists, 1);
     }
 }

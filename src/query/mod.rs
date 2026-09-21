@@ -18,7 +18,8 @@ pub use crate::retrieval::lanes::Lane;
 pub use crate::retrieval::{rrf_fuse, ScoringWeights};
 pub use crate::storage::repo::traits::QueryRepo;
 pub use crate::storage::{
-    AgentObservation, MemoryCard, MemoryCardSearchInput, MemoryKind, TenantStore,
+    AgentObservation, MemoryCard, MemoryCardSearchInput, MemoryKind, SessionRouterSearchHit,
+    TenantStore,
 };
 pub use std::collections::{HashMap, HashSet};
 pub use std::ops::{Deref, DerefMut};
@@ -153,7 +154,10 @@ pub struct QueryDiagnostics {
 #[derive(Default)]
 pub(crate) struct RouteResult {
     pub(crate) session_scores: HashMap<String, f32>,
-    pub(crate) memory_scores: HashMap<String, f32>,
+    // Computed once in `plan_phase` and consumed by `route_phase` Lane 1, so
+    // the same `entity_pivot_sessions` DB call is not issued twice per
+    // request with identical inputs (entity id + subject entities).
+    pub(crate) pivot_hits: Vec<SessionRouterSearchHit>,
 }
 
 #[derive(Default)]
@@ -239,7 +243,7 @@ impl QueryPipelineState {
             .ranking_config
             .ambiguity_delta_threshold
             .unwrap_or_else(|| ScoringWeights::default().ambiguity_delta_threshold);
-        let now_ms = payload.reference_time_ms.unwrap_or_else(|| {
+        let now_ms = payload.point_in_time_ms.or(payload.reference_time_ms).unwrap_or_else(|| {
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
         });
         Self {
@@ -268,7 +272,7 @@ mod tests {
     fn route_result_starts_empty() {
         let result = RouteResult::default();
         assert!(result.session_scores.is_empty());
-        assert!(result.memory_scores.is_empty());
+        assert!(result.pivot_hits.is_empty());
     }
 
     #[test]

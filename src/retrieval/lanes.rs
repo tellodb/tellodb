@@ -57,6 +57,14 @@ pub struct Lanes {
     enabled: u32,
 }
 
+// Serialized as the list of enabled lane names, for the same reason as
+// `Features`: the bitmask is private and means nothing in a run record.
+impl serde::Serialize for Lanes {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.enabled_names())
+    }
+}
+
 impl Default for Lanes {
     fn default() -> Self {
         Self { enabled: Lane::ALL.iter().fold(0, |acc, lane| acc | lane.bit()) }

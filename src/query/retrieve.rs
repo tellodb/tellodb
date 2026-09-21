@@ -113,6 +113,8 @@ fn retrieval_ann(s: &mut QueryPipelineState) {
         let semantic_top = s.semantic_top;
         let dedup_threshold = s.weights.dedup_similarity_threshold;
         let retrieval_config = s.state.config.retrieval.clone();
+        let point_in_time_ms = s.payload.point_in_time_ms;
+        let known_as_of_ms = s.payload.known_as_of_ms;
         std::thread::scope(|sc| {
             let mut handles = Vec::with_capacity(embeddings.len());
             for (idx, embedding) in embeddings.iter().enumerate() {
@@ -163,9 +165,11 @@ fn retrieval_ann(s: &mut QueryPipelineState) {
                                 .filter(|vid| !local_cache.contains_key(vid))
                                 .collect();
                             if !unresolved_ids.is_empty() {
-                                if let Ok(looked) =
-                                    tenant.lookup_by_vector_ids_batch(&unresolved_ids)
-                                {
+                                if let Ok(looked) = tenant.lookup_by_vector_ids_batch_at(
+                                    &unresolved_ids,
+                                    point_in_time_ms,
+                                    known_as_of_ms,
+                                ) {
                                     for (vid, hit) in unresolved_ids.into_iter().zip(looked) {
                                         local_cache.insert(vid, hit);
                                     }
@@ -241,7 +245,11 @@ fn retrieval_ann(s: &mut QueryPipelineState) {
                             }
                         };
                         let vids: Vec<u64> = hnsw_raw.iter().map(|(vid, _)| *vid).collect();
-                        if let Ok(looked) = tenant.lookup_by_vector_ids_batch(&vids) {
+                        if let Ok(looked) = tenant.lookup_by_vector_ids_batch_at(
+                            &vids,
+                            point_in_time_ms,
+                            known_as_of_ms,
+                        ) {
                             let looked_ids: Vec<String> =
                                 looked.iter().flatten().map(|(_, m)| m.clone()).collect();
                             let identity =
@@ -328,6 +336,8 @@ fn retrieval_fts(s: &mut QueryPipelineState) {
         let tenant_clone = s.tenant.clone();
         let eid = s.payload.entity_id.clone();
         let fts_top = s.fts_top;
+        let point_in_time_ms = s.payload.point_in_time_ms;
+        let known_as_of_ms = s.payload.known_as_of_ms;
         std::thread::scope(|sc| {
             let mut handles = Vec::new();
             for (idx, fts_query) in fts_queries_to_run.into_iter().enumerate() {
@@ -335,7 +345,13 @@ fn retrieval_fts(s: &mut QueryPipelineState) {
                 let eid = eid.clone();
                 handles.push(sc.spawn(move || {
                     let hits = tenant
-                        .fts_search(fts_query.as_str(), fts_top, eid.as_deref())
+                        .fts_search_at(
+                            fts_query.as_str(),
+                            fts_top,
+                            eid.as_deref(),
+                            point_in_time_ms,
+                            known_as_of_ms,
+                        )
                         .unwrap_or_else(|err| {
                             tracing::warn!(error = %err, query = %fts_query, "FTS lane failed");
                             Vec::new()
@@ -398,6 +414,9 @@ fn retrieval_cards(s: &mut QueryPipelineState) {
                 entities: &s.plan.subject_entities,
                 route_sessions: &s.adaptive_profile.route_sessions,
                 include_stale: include_stale_cards,
+                point_in_time_ms: s.payload.point_in_time_ms,
+                known_as_of_ms: s.payload.known_as_of_ms,
+                now_ms: s.now_ms,
                 limit: s.budget.card_limit,
             })
             .unwrap_or_default();
