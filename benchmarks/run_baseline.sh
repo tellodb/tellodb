@@ -182,9 +182,16 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# ort's CUDA execution provider is gated behind the gpu-cuda feature; without it
+# ORT falls back to CPU silently. Ask for it whenever a GPU is actually present.
+ENGINE_FEATURES=()
+if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+    ENGINE_FEATURES=(--features gpu-cuda)
+fi
+
 echo "Building release binaries..."
 # `fastrelease` skips fat LTO so local rebuilds take ~1 min instead of many.
-cargo build --profile "$PROFILE" --bin tellodb --manifest-path "${REPO_ROOT}/Cargo.toml"
+cargo build --profile "$PROFILE" --bin tellodb "${ENGINE_FEATURES[@]}" --manifest-path "${REPO_ROOT}/Cargo.toml"
 cargo build --release --manifest-path "${REPO_ROOT}/benchmarks/rust_evaluator/Cargo.toml"
 
 echo "Starting Tellodb engine on port ${ENGINE_PORT} with data dir ${DATA_DIR}..."
@@ -208,6 +215,24 @@ TELLODB_EMBEDDING_CACHE_PATH="$TELLODB_EMBEDDING_CACHE_PATH" \
 ENGINE_PID=$!
 echo "Engine log: $RUNS_DIR/engine.log"
 
+# `ort`'s CUDA execution provider is gated behind the gpu-cuda cargo feature.
+# Built without it, ORT logs a warning, silently falls back to CPU, and the
+# engine still reports device=CUDA — so every latency number would be a CPU
+# number wearing a GPU label. Fail loudly instead.
+assert_cuda_live() {
+    local log="$1"
+    case "${TELLODB_DEVICE:-${TEMPORAL_MEMORY_DEVICE:-}}" in
+        cuda|gpu) ;;
+        *) return 0 ;;
+    esac
+    if grep -q "Couldn't register .CUDAExecutionProvider" "$log"; then
+        echo "FATAL: CUDA was requested but the execution provider did not register." >&2
+        echo "The engine is running on CPU. Rebuild with --features gpu-cuda." >&2
+        grep -m2 "CUDAExecutionProvider\|No execution providers" "$log" >&2
+        exit 1
+    fi
+}
+
 echo "Waiting for engine healthz..."
 for i in {1..60}; do
     if curl -s -f "${ENGINE_URL}/healthz" >/dev/null 2>&1; then
@@ -222,6 +247,8 @@ if ! curl -s -f "${ENGINE_URL}/healthz" >/dev/null 2>&1; then
     tail -20 "$RUNS_DIR/engine.log" >&2
     exit 1
 fi
+
+assert_cuda_live "$RUNS_DIR/engine.log"
 
 echo "Warming up engine..."
 curl -s -X POST "${ENGINE_URL}/warmup" -H "x-api-key: ${ENGINE_API_KEY}" >/dev/null

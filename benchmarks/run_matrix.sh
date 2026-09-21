@@ -102,10 +102,35 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# ort's CUDA execution provider is gated behind the gpu-cuda feature; without it
+# ORT falls back to CPU silently. Ask for it whenever a GPU is actually present.
+ENGINE_FEATURES=()
+if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+    ENGINE_FEATURES=(--features gpu-cuda)
+fi
+
 echo "Building..."
-cargo build --profile "$PROFILE" --bin tellodb --manifest-path "${REPO_ROOT}/Cargo.toml"
+cargo build --profile "$PROFILE" --bin tellodb "${ENGINE_FEATURES[@]}" --manifest-path "${REPO_ROOT}/Cargo.toml"
 cargo build --release --manifest-path "${REPO_ROOT}/benchmarks/rust_evaluator/Cargo.toml"
 "$SYNTH_BIN" --entities 50 --memories-per-entity 20 --seed 101 --output "$WORK_DIR/synth.json"
+
+# `ort`'s CUDA execution provider is gated behind the gpu-cuda cargo feature.
+# Built without it, ORT logs a warning, silently falls back to CPU, and the
+# engine still reports device=CUDA — so every latency number would be a CPU
+# number wearing a GPU label. Fail loudly instead.
+assert_cuda_live() {
+    local log="$1"
+    case "${TELLODB_DEVICE:-${TEMPORAL_MEMORY_DEVICE:-}}" in
+        cuda|gpu) ;;
+        *) return 0 ;;
+    esac
+    if grep -q "Couldn't register .CUDAExecutionProvider" "$log"; then
+        echo "FATAL: CUDA was requested but the execution provider did not register." >&2
+        echo "The engine is running on CPU. Rebuild with --features gpu-cuda." >&2
+        grep -m2 "CUDAExecutionProvider\|No execution providers" "$log" >&2
+        exit 1
+    fi
+}
 
 start_engine() {
     local label="$1" log="$2"
@@ -127,6 +152,7 @@ start_engine() {
     ENGINE_PID=$!
     for _ in $(seq 1 120); do
         if curl -sf "${ENGINE_URL}/healthz" >/dev/null 2>&1; then
+            assert_cuda_live "$log"
             curl -s -X POST "${ENGINE_URL}/warmup" -H "x-api-key: ${ENGINE_API_KEY}" >/dev/null
             return 0
         fi
