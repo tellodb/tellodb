@@ -402,6 +402,8 @@ impl TenantStore {
         recorded_at: u64,
     ) -> Result<Vec<FactVersionStatus>> {
         let mut statuses = Vec::with_capacity(registrations.len());
+        // Stale entries whose `current` pointer is resolved after the loop.
+        let mut deferred_stale: Vec<(usize, String, String)> = Vec::new();
         for (fact_key, timestamp, memory_id, subject, predicate, object) in registrations {
             let covering = match fact_neighbour(
                 tx,
@@ -512,19 +514,34 @@ impl TenantStore {
                 )?;
             }
 
-            statuses.push(if successor.is_none() {
-                FactVersionStatus::Current {
+            if successor.is_none() {
+                statuses.push(FactVersionStatus::Current {
                     superseded: previous_latest
                         .filter(|(id, _)| id != memory_id)
                         .map(|(id, timestamp)| (timestamp, id)),
-                }
+                });
             } else {
-                FactVersionStatus::Stale {
-                    current: current_fact_version(tx, fact_key, entity_id)?
-                        .map(|(id, timestamp)| (timestamp, id))
-                        .expect("fact chain contains a current version"),
-                }
-            });
+                // Which version is current cannot be read yet: later rows in
+                // this batch may still supersede each other, and the
+                // predecessor update above can leave the chain transiently
+                // without a `current` row. Resolve after the whole batch has
+                // settled instead of querying mid-loop, which made the answer
+                // depend on the order registrations happened to arrive in.
+                deferred_stale.push((statuses.len(), fact_key.to_string(), entity_id.to_string()));
+                statuses.push(FactVersionStatus::Stale { current: (0, String::new()) });
+            }
+        }
+
+        for (index, fact_key, entity_id) in deferred_stale {
+            let current = current_fact_version(tx, &fact_key, &entity_id)?
+                .map(|(id, timestamp)| (timestamp, id))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "fact chain for {fact_key} (entity {entity_id}) has no current version \
+                         after the batch settled"
+                    )
+                })?;
+            statuses[index] = FactVersionStatus::Stale { current };
         }
 
         Ok(statuses)
