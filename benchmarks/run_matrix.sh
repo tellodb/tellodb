@@ -55,6 +55,13 @@ case "$TIER" in
   *) echo "Unsupported tier: $TIER (smoke|dev)" >&2; exit 1 ;;
 esac
 
+# Seeds cost a full reset and re-ingest each, which on longmemeval is ~14
+# minutes per arm per seed. RUNS=1 keeps the dev question count while getting
+# the whole matrix in a third of the wall time; top up the arms whose
+# intervals land near zero afterwards, since those are the only ones where a
+# second and third seed change the verdict.
+RUNS="${RUNS_OVERRIDE:-$RUNS}"
+
 if [[ -z "${MATRIX:-}" ]]; then
     echo "MATRIX is empty; see the header of $0" >&2
     exit 1
