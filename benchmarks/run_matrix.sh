@@ -177,9 +177,18 @@ run_dataset() {
       synthetic) args=(--dataset-kind longmemeval --dataset "$WORK_DIR/synth.json" --split all --limit "$SYNTH_LIMIT" --timestamps session) ;;
     esac
     mkdir -p "$out_dir"
+    # Reset before EVERY seed. Resetting only the first left seeds 2..N
+    # querying the store seed 1 had already built: the question order changed
+    # but the per-question answers could not, so those runs came back
+    # byte-identical to each other and differed from seed 1 only by whatever
+    # background consolidation had finished in between. That is one sample per
+    # arm wearing three hats, and it put the between-seed spread (1.1 points on
+    # the LoCoMo baseline) outside every interval the report drew.
+    # RESET_EVERY_SEED=0 restores the old behaviour for datasets where a fresh
+    # ingest per seed is too expensive to pay for -- LongMemEval is ~13 minutes.
     for seed in $(seq 1 "$RUNS"); do
         reset_args=()
-        if [[ "$seed" -eq 1 ]]; then
+        if [[ "$seed" -eq 1 || "${RESET_EVERY_SEED:-1}" == "1" ]]; then
             reset_args=(--reset-first)
         fi
         "$EVALUATOR_BIN" "${args[@]}" \
@@ -223,7 +232,6 @@ REPORT="$RUNS_DIR/REPORT.md"
     echo '```'
     echo "$MATRIX"
     echo '```'
-    echo "Deltas are paired over questions against \`${LABELS[0]}\`; \"drop\" means neither quality delta's 95% CI excludes zero."
     for dataset in "${DATASET_LIST[@]}"; do
         echo
         echo "## ${dataset}"
