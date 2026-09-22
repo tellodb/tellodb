@@ -740,6 +740,47 @@ fn rebuild_router_after_delete(
     Ok(())
 }
 
+/// Every place a deleted token could still be hiding, found by walking the
+/// live schema: user tables plus the FTS5 shadow tables, every column cast to
+/// text. Returns `(table, column, rows)` for each column that still matches,
+/// so a failure names the leak instead of just asserting a count.
+#[cfg(test)]
+fn residue_sweep(conn: &rusqlite::Connection, token: &str) -> Vec<(String, String, i64)> {
+    let pattern = format!("%{token}%");
+    let mut tables: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<_>>()
+        })
+        .unwrap_or_default();
+    tables.sort();
+
+    let mut found = Vec::new();
+    for table in tables {
+        let columns: Vec<String> = match conn.prepare(&format!("PRAGMA table_info(\"{table}\")")) {
+            Ok(mut stmt) => stmt
+                .query_map([], |row| row.get::<_, String>(1))
+                .and_then(std::iter::Iterator::collect)
+                .unwrap_or_default(),
+            Err(_) => continue,
+        };
+        for column in columns {
+            // Shadow tables store blobs; CAST lets one probe cover both. A
+            // column that cannot be scanned at all is skipped rather than
+            // failing the sweep.
+            let sql = format!(
+                "SELECT COUNT(*) FROM \"{table}\" WHERE CAST(\"{column}\" AS TEXT) LIKE ?1"
+            );
+            if let Ok(count) = conn.query_row(&sql, params![pattern], |row| row.get::<_, i64>(0)) {
+                if count > 0 {
+                    found.push((table.clone(), column, count));
+                }
+            }
+        }
+    }
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -856,6 +897,20 @@ mod tests {
             )
             .unwrap();
 
+        // Control: the sweep must be able to see the token while it is still
+        // there. Without this, a broken probe and a clean delete are
+        // indistinguishable -- both report nothing.
+        let planted = {
+            let conn = store.get_conn().unwrap();
+            residue_sweep(&conn, token)
+        };
+        assert!(
+            planted.len() >= 5,
+            "probe found the planted token in only {} place(s); it is not searching what it should: {:?}",
+            planted.len(),
+            planted
+        );
+
         store.delete_observation(100, parent, "test").unwrap();
 
         let conn = store.get_conn().unwrap();
@@ -869,23 +924,17 @@ mod tests {
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         assert!(edge_residue.is_empty(), "edge residue: {edge_residue:?}");
-        for sql in [
-            "SELECT COUNT(*) FROM memories WHERE content LIKE ?1",
-            "SELECT COUNT(*) FROM memory_cards WHERE memory_text LIKE ?1 OR object LIKE ?1",
-            "SELECT COUNT(*) FROM fact_versions WHERE object LIKE ?1 OR subject LIKE ?1 OR predicate LIKE ?1",
-            "SELECT COUNT(*) FROM session_router WHERE record_json LIKE ?1 OR router_text LIKE ?1",
-            "SELECT COUNT(*) FROM session_router_sources WHERE record_json LIKE ?1",
-            "SELECT COUNT(*) FROM fts_memories WHERE content LIKE ?1",
-            "SELECT COUNT(*) FROM fts_session_router WHERE router_text LIKE ?1",
-            "SELECT COUNT(*) FROM edges WHERE label LIKE ?1 OR source LIKE ?1 OR target LIKE ?1",
-            "SELECT COUNT(*) FROM core_profiles WHERE profile_json LIKE ?1",
-            "SELECT COUNT(*) FROM consolidation_queue WHERE textual_content LIKE ?1",
-        ] {
-            let count: i64 = conn
-                .query_row(sql, params![format!("%{token}%")], |row| row.get(0))
-                .unwrap();
-            assert_eq!(count, 0, "residue from {sql}");
-        }
+        // Sweep every column the schema actually has rather than a list
+        // written by hand: a hand-kept list silently stops covering each new
+        // table, and "we checked ten tables" is not the claim -- "the token is
+        // nowhere in the file" is.
+        let residue = residue_sweep(&conn, token);
+        assert!(
+            residue.is_empty(),
+            "deleted text still present in {} place(s): {:?}",
+            residue.len(),
+            residue
+        );
         let evidence: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM fact_evidence WHERE memory_id = ?1 OR version_memory_id = ?1",
