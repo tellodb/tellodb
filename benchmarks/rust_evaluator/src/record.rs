@@ -145,6 +145,42 @@ impl SplitMix {
     }
 }
 
+/// Two-sided percentile-bootstrap p-value for H0: mean = 0, read off the
+/// same resample distribution the interval comes from. `means` must be sorted.
+fn bootstrap_p(means: &[f64]) -> f64 {
+    if means.is_empty() {
+        return 1.0;
+    }
+    let total = means.len() as f64;
+    // Both tails include zero. Counting them exclusively makes a distribution
+    // sitting entirely at zero -- an effect of exactly nothing, which the
+    // ablation produces for structures like semantic_dedup -- report p = 0.
+    let at_or_below = means.partition_point(|m| *m <= 0.0) as f64;
+    let at_or_above = total - means.partition_point(|m| *m < 0.0) as f64;
+    (2.0 * at_or_below.min(at_or_above) / total).min(1.0)
+}
+
+/// Holm-Bonferroni step-down adjusted p-values, in the input's order.
+///
+/// Controls the family-wise error rate across a family of tests without
+/// Bonferroni's loss of power. An ablation over N structures is N simultaneous
+/// tests, so at alpha=0.05 roughly one arm in twenty looks significant by
+/// chance; uncorrected verdicts on an 18-arm table are not trustworthy.
+pub fn holm_adjust(ps: &[f64]) -> Vec<f64> {
+    let m = ps.len();
+    let mut order: Vec<usize> = (0..m).collect();
+    order.sort_by(|&i, &j| ps[i].partial_cmp(&ps[j]).unwrap_or(std::cmp::Ordering::Equal));
+    let mut adjusted = vec![1.0; m];
+    let mut running = 0.0f64;
+    for (rank, &index) in order.iter().enumerate() {
+        // Enforce monotonicity: an adjusted p never falls below one that
+        // ranked ahead of it.
+        running = running.max((ps[index] * (m - rank) as f64).min(1.0));
+        adjusted[index] = running;
+    }
+    adjusted
+}
+
 /// Mean with a 95% percentile-bootstrap confidence interval.
 pub fn mean_with_ci(values: &[f64]) -> Value {
     if values.is_empty() {
@@ -159,7 +195,7 @@ pub fn mean_with_ci(values: &[f64]) -> Value {
     means.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let lo = means[(BOOTSTRAP_RESAMPLES as f64 * 0.025) as usize];
     let hi = means[((BOOTSTRAP_RESAMPLES as f64 * 0.975) as usize).min(BOOTSTRAP_RESAMPLES - 1)];
-    json!({ "mean": mean, "ci95": [lo, hi], "n": n })
+    json!({ "mean": mean, "ci95": [lo, hi], "p": bootstrap_p(&means), "n": n })
 }
 
 pub fn mean_with_clustered_ci(values: &[(String, f64)]) -> Value {
@@ -188,7 +224,7 @@ pub fn mean_with_clustered_ci(values: &[(String, f64)]) -> Value {
     means.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let lo = means[(BOOTSTRAP_RESAMPLES as f64 * 0.025) as usize];
     let hi = means[((BOOTSTRAP_RESAMPLES as f64 * 0.975) as usize).min(BOOTSTRAP_RESAMPLES - 1)];
-    json!({ "mean": mean, "ci95": [lo, hi], "n": n })
+    json!({ "mean": mean, "ci95": [lo, hi], "p": bootstrap_p(&means), "n": n })
 }
 
 fn metric_with_ci(
@@ -550,21 +586,21 @@ pub fn report(paths: &[String]) -> Result<String> {
 }
 
 /// Paired bootstrap 95% CI of `mean(b - a)` over aligned samples.
-pub fn paired_delta_ci(a: &[f64], b: &[f64]) -> Option<(f64, f64, f64)> {
+pub fn paired_delta_ci(a: &[f64], b: &[f64]) -> Option<(f64, f64, f64, f64)> {
     if a.is_empty() || a.len() != b.len() {
         return None;
     }
     let diffs: Vec<f64> = a.iter().zip(b).map(|(x, y)| y - x).collect();
     let v = mean_with_ci(&diffs);
     let ci = v["ci95"].as_array()?;
-    Some((v["mean"].as_f64()?, ci[0].as_f64()?, ci[1].as_f64()?))
+    Some((v["mean"].as_f64()?, ci[0].as_f64()?, ci[1].as_f64()?, v["p"].as_f64().unwrap_or(1.0)))
 }
 
 pub fn paired_delta_clustered_ci(
     a: &[f64],
     b: &[f64],
     clusters: &[String],
-) -> Option<(f64, f64, f64)> {
+) -> Option<(f64, f64, f64, f64)> {
     if a.is_empty() || a.len() != b.len() || a.len() != clusters.len() {
         return None;
     }
@@ -576,7 +612,12 @@ pub fn paired_delta_clustered_ci(
         .collect::<Vec<_>>();
     let value = mean_with_clustered_ci(&diffs);
     let ci = value["ci95"].as_array()?;
-    Some((value["mean"].as_f64()?, ci[0].as_f64()?, ci[1].as_f64()?))
+    Some((
+        value["mean"].as_f64()?,
+        ci[0].as_f64()?,
+        ci[1].as_f64()?,
+        value["p"].as_f64().unwrap_or(1.0),
+    ))
 }
 
 fn question_scores(record: &Value) -> BTreeMap<String, (f64, f64, String)> {
@@ -636,8 +677,15 @@ pub fn ablation_report(baseline: &str, runs: &[String]) -> Result<String> {
         (Some(n), Some(o)) if o.abs() > f64::EPSILON => format!("{:+.1}%", (n - o) / o * 100.0),
         _ => "–".to_string(),
     };
-    let fmt_delta = |d: Option<(f64, f64, f64)>| match d {
-        Some((m, lo, hi)) => format!("{:+.1} ({:+.1}…{:+.1})", m * 100.0, lo * 100.0, hi * 100.0),
+    let fmt_delta = |d: Option<(f64, f64, f64, f64)>| match d {
+        Some((m, lo, hi, _)) => {
+            format!("{:+.1} ({:+.1}…{:+.1})", m * 100.0, lo * 100.0, hi * 100.0)
+        }
+        None => "–".to_string(),
+    };
+    let fmt_p = |p: Option<f64>| match p {
+        Some(p) if p < 0.001 => "<0.001".to_string(),
+        Some(p) => format!("{p:.3}"),
         None => "–".to_string(),
     };
 
@@ -652,10 +700,22 @@ pub fn ablation_report(baseline: &str, runs: &[String]) -> Result<String> {
         ingest(&base, "embedded_per_memory").unwrap_or(0.0),
         p95(&base).map(|v| v.to_string()).unwrap_or_else(|| "–".into()),
     );
-    out.push_str(
-        "| config | n paired | Δ recall_any (95% CI) | Δ nDCG (95% CI) | Δ ingest mem/s | Δ bytes/mem | Δ embedded/mem | Δ query p95 | rerank rate | keep? |\n\
-         |---|---|---|---|---|---|---|---|---|---|\n",
-    );
+
+    // Pass one: every arm's paired deltas. The verdicts cannot be written yet —
+    // Holm needs the whole family of p-values before any single one can be
+    // judged.
+    struct Arm {
+        label: String,
+        paired: usize,
+        hit: Option<(f64, f64, f64, f64)>,
+        ndcg: Option<(f64, f64, f64, f64)>,
+        ingest_pct: String,
+        bytes_pct: String,
+        embedded_pct: String,
+        p95_pct: String,
+        rerank_rate: f64,
+    }
+    let mut arms: Vec<Arm> = Vec::new();
     for path in runs {
         let run = load(path)?;
         let scores = question_scores(&run);
@@ -677,25 +737,68 @@ pub fn ablation_report(baseline: &str, runs: &[String]) -> Result<String> {
                 paired_delta_ci(a, b)
             }
         };
-        let d_hit = delta(&a_hit, &b_hit);
-        let d_ndcg = delta(&a_ndcg, &b_ndcg);
-        let spans_zero =
-            |d: Option<(f64, f64, f64)>| d.is_some_and(|(_, lo, hi)| lo <= 0.0 && hi >= 0.0);
-        let verdict = if spans_zero(d_hit) && spans_zero(d_ndcg) { "drop" } else { "keep" };
+        arms.push(Arm {
+            label: ablation_label(path, &run),
+            paired: a_hit.len(),
+            hit: delta(&a_hit, &b_hit),
+            ndcg: delta(&a_ndcg, &b_ndcg),
+            ingest_pct: pct(ingest(&run, "memories_per_sec"), ingest(&base, "memories_per_sec")),
+            bytes_pct: pct(
+                ingest(&run, "db_bytes_per_memory"),
+                ingest(&base, "db_bytes_per_memory"),
+            ),
+            embedded_pct: pct(
+                ingest(&run, "embedded_per_memory"),
+                ingest(&base, "embedded_per_memory"),
+            ),
+            p95_pct: pct(p95(&run), p95(&base)),
+            rerank_rate: run["metrics"]["rerank_applied_rate"].as_f64().unwrap_or(0.0) * 100.0,
+        });
+    }
+
+    // Each metric is its own family: one correction over the arms for recall,
+    // another for nDCG. An arm with no delta (no paired questions) is given
+    // p=1 so it occupies a slot in the family rather than silently shrinking it.
+    let raw = |d: Option<(f64, f64, f64, f64)>| d.map_or(1.0, |(_, _, _, p)| p);
+    let hit_adjusted = holm_adjust(&arms.iter().map(|a| raw(a.hit)).collect::<Vec<_>>());
+    let ndcg_adjusted = holm_adjust(&arms.iter().map(|a| raw(a.ndcg)).collect::<Vec<_>>());
+
+    out.push_str(&format!(
+        "Deltas are paired over questions against `baseline`. p-values are \
+         two-sided percentile bootstrap, Holm-Bonferroni corrected across the \
+         {} arms separately for each metric; \"keep\" means an adjusted p below \
+         0.05 on either metric.\n\n",
+        arms.len()
+    ));
+    out.push_str(
+        "| config | n paired | Δ recall_any (95% CI) | p adj | Δ nDCG (95% CI) | p adj | Δ ingest mem/s | Δ bytes/mem | Δ embedded/mem | Δ query p95 | rerank rate | keep? |\n\
+         |---|---|---|---|---|---|---|---|---|---|---|---|\n",
+    );
+    for (index, arm) in arms.iter().enumerate() {
+        let (p_hit, p_ndcg) = (hit_adjusted[index], ndcg_adjusted[index]);
+        let significant = |d: Option<(f64, f64, f64, f64)>, p: f64| d.is_some() && p < 0.05;
+        let verdict = if significant(arm.hit, p_hit) || significant(arm.ndcg, p_ndcg) {
+            "keep"
+        } else {
+            "drop"
+        };
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {:.0}% | {} |\n",
-            ablation_label(path, &run),
-            a_hit.len(),
-            fmt_delta(d_hit),
-            fmt_delta(d_ndcg),
-            pct(ingest(&run, "memories_per_sec"), ingest(&base, "memories_per_sec")),
-            pct(ingest(&run, "db_bytes_per_memory"), ingest(&base, "db_bytes_per_memory")),
-            pct(ingest(&run, "embedded_per_memory"), ingest(&base, "embedded_per_memory")),
-            pct(p95(&run), p95(&base)),
-            run["metrics"]["rerank_applied_rate"].as_f64().unwrap_or(0.0) * 100.0,
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {:.0}% | {} |\n",
+            arm.label,
+            arm.paired,
+            fmt_delta(arm.hit),
+            fmt_p(arm.hit.map(|_| p_hit)),
+            fmt_delta(arm.ndcg),
+            fmt_p(arm.ndcg.map(|_| p_ndcg)),
+            arm.ingest_pct,
+            arm.bytes_pct,
+            arm.embedded_pct,
+            arm.p95_pct,
+            arm.rerank_rate,
             verdict,
         ));
     }
+
     Ok(out)
 }
 
@@ -791,12 +894,54 @@ mod tests {
     }
 
     #[test]
+    fn holm_adjustment_is_monotone_and_scales_by_remaining_tests() {
+        // Smallest p is multiplied by m, the next by m-1, and so on.
+        let adjusted = holm_adjust(&[0.01, 0.02, 0.04]);
+        assert!((adjusted[0] - 0.03).abs() < 1e-9, "{adjusted:?}");
+        assert!((adjusted[1] - 0.04).abs() < 1e-9, "{adjusted:?}");
+        assert!((adjusted[2] - 0.04).abs() < 1e-9, "{adjusted:?}");
+        // Monotone in the original order too, whatever order they arrive in.
+        let shuffled = holm_adjust(&[0.04, 0.01, 0.02]);
+        assert!(shuffled[1] <= shuffled[2] && shuffled[2] <= shuffled[0]);
+    }
+
+    #[test]
+    fn holm_adjustment_never_exceeds_one_and_handles_the_single_test_case() {
+        assert_eq!(holm_adjust(&[0.9, 0.95]), vec![1.0, 1.0]);
+        let single = holm_adjust(&[0.03]);
+        assert!((single[0] - 0.03).abs() < 1e-9, "one test needs no correction");
+        assert!(holm_adjust(&[]).is_empty());
+    }
+
+    #[test]
+    fn holm_correction_can_overturn_an_uncorrected_verdict() {
+        // A marginal effect that clears 0.05 alone does not survive a family
+        // of 18 arms -- the exact situation the ablation table is in.
+        let mut family = vec![0.04];
+        family.extend(std::iter::repeat_n(0.9, 17));
+        let adjusted = holm_adjust(&family);
+        assert!(family[0] < 0.05, "uncorrected, this arm reads as significant");
+        assert!(adjusted[0] > 0.05, "corrected, it does not: {}", adjusted[0]);
+    }
+
+    #[test]
+    fn bootstrap_p_is_small_for_a_clear_effect_and_large_for_none() {
+        let a: Vec<f64> = (0..200).map(|i| f64::from(u8::from(i % 2 == 0))).collect();
+        let unchanged = paired_delta_ci(&a, &a).unwrap();
+        assert!(unchanged.3 > 0.5, "no difference should not look significant: {}", unchanged.3);
+
+        let better: Vec<f64> = a.iter().map(|_| 1.0).collect();
+        let moved = paired_delta_ci(&a, &better).unwrap();
+        assert!(moved.3 < 0.01, "a half-point shift should be significant: {}", moved.3);
+    }
+
+    #[test]
     fn paired_delta_detects_consistent_change() {
         let a: Vec<f64> = (0..100).map(|i| f64::from(u8::from(i % 2 == 0))).collect();
         let same = paired_delta_ci(&a, &a).unwrap();
         assert!(same.1 <= 0.0 && same.2 >= 0.0);
         let better: Vec<f64> = a.iter().map(|_| 1.0).collect();
-        let (mean, lo, _) = paired_delta_ci(&a, &better).unwrap();
+        let (mean, lo, _, _) = paired_delta_ci(&a, &better).unwrap();
         assert!((mean - 0.5).abs() < 1e-9 && lo > 0.0);
         assert!(paired_delta_ci(&a, &a[..10]).is_none());
     }
