@@ -1172,6 +1172,52 @@ mod tests {
         }
     }
 
+    proptest::proptest! {
+        /// The sequential test above registers one version per batch, so the
+        /// chain is always settled before the next call sees it. Registering a
+        /// whole set in ONE batch is the case that panicked with "fact chain
+        /// contains a current version" on a LongMemEval ingest: the status for
+        /// a superseded row used to read the chain's head mid-loop, while later
+        /// rows in the same batch could still supersede each other and the
+        /// predecessor update could leave the chain transiently with no current
+        /// row at all.
+        #[test]
+        fn one_batch_of_versions_settles_into_a_consistent_chain(
+            timestamps in proptest::collection::vec(0u64..50, 1..8)
+        ) {
+            let temp = tempdir().unwrap();
+            let store = TenantStore::new(&temp.path().join("tenant.db")).unwrap();
+            let ids: Vec<String> = (0..timestamps.len()).map(|i| format!("m{i}")).collect();
+            let objects: Vec<String> = (0..timestamps.len()).map(|i| format!("o{i}")).collect();
+            let batch: Vec<(&str, u64, &str, &str, &str, &str)> = timestamps
+                .iter()
+                .enumerate()
+                .map(|(i, ts)| ("k", *ts, ids[i].as_str(), "e", "p", objects[i].as_str()))
+                .collect();
+
+            let statuses = store.register_fact_versions_batch("e", &batch).unwrap();
+
+            let chain = fact_chain(&store, "k");
+            proptest::prop_assert_eq!(chain.len(), timestamps.len());
+            proptest::prop_assert_eq!(chain.iter().filter(|c| c.1 == "current").count(), 1);
+            let head = chain.last().unwrap();
+            proptest::prop_assert_eq!(head.1.as_str(), "current");
+            proptest::prop_assert_eq!(head.2, *timestamps.iter().max().unwrap());
+            for pair in chain.windows(2) {
+                proptest::prop_assert_eq!(pair[0].3, Some(pair[1].2));
+                proptest::prop_assert!(pair[0].2 <= pair[1].2);
+            }
+
+            // Every superseded row points at the chain's FINAL head, not at
+            // whichever row happened to be current partway through the batch.
+            for status in &statuses {
+                if let FactVersionStatus::Stale { current: (_, id) } = status {
+                    proptest::prop_assert_eq!(id.as_str(), head.0.as_str());
+                }
+            }
+        }
+    }
+
     #[test]
     fn link_cluster_counts_bidirectional_link_once() {
         let temp = tempdir().unwrap();
