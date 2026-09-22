@@ -61,6 +61,10 @@ esac
 # intervals land near zero afterwards, since those are the only ones where a
 # second and third seed change the verdict.
 RUNS="${RUNS_OVERRIDE:-$RUNS}"
+# Writers serialise on SQLite's single write lock, and detached consolidation
+# writes alongside them. On slower storage two concurrent ingesters can exceed
+# the busy timeout and fail the batch outright.
+CONCURRENCY="${CONCURRENCY_OVERRIDE:-$CONCURRENCY}"
 
 if [[ -z "${MATRIX:-}" ]]; then
     echo "MATRIX is empty; see the header of $0" >&2

@@ -17,7 +17,15 @@ pub(crate) type GraphEdgeBatch<'a> = [GraphEdgeEntry<'a>];
 
 const PRAGMA_CACHE_SIZE: i64 = -32_768;
 const PRAGMA_MMAP_SIZE: i64 = 1_073_741_824;
-const PRAGMA_BUSY_TIMEOUT: i64 = 10000;
+/// How long a writer waits for SQLite's single write lock before giving up.
+///
+/// Every write path opens an Immediate transaction, so writers serialise, and
+/// consolidation runs detached from the request that scheduled it -- meaning
+/// background writes contend with foreground ingest. Ten seconds was enough
+/// until a box whose storage stage ran at ~2.2s per batch started returning
+/// "database is locked" mid-ingest and failed the whole run.
+/// `TELLODB_BUSY_TIMEOUT_MS` overrides it.
+const DEFAULT_BUSY_TIMEOUT_MS: i64 = 60_000;
 const PRAGMA_PAGE_SIZE: i64 = 8192;
 const PRAGMA_WAL_AUTOCHECKPOINT: i64 = 2000;
 const STATEMENT_CACHE_CAPACITY: usize = 512;
@@ -129,6 +137,11 @@ impl TenantStore {
             "normal" => "NORMAL",
             value => anyhow::bail!("unknown TELLODB_DURABILITY {value:?} (full, normal)"),
         };
+        let busy_timeout = std::env::var("TELLODB_BUSY_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<i64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_BUSY_TIMEOUT_MS);
         let manager = SqliteConnectionManager::file(path).with_init(move |conn| {
             // The store uses ~70 distinct cached statements plus IN-list
             // queries; with rusqlite's default capacity of 16 they were
@@ -142,7 +155,7 @@ impl TenantStore {
                      PRAGMA temp_store = MEMORY;
                      PRAGMA cache_size = {PRAGMA_CACHE_SIZE};
                      PRAGMA mmap_size = {PRAGMA_MMAP_SIZE};
-                     PRAGMA busy_timeout = {PRAGMA_BUSY_TIMEOUT};
+                     PRAGMA busy_timeout = {busy_timeout};
                      PRAGMA wal_autocheckpoint = {PRAGMA_WAL_AUTOCHECKPOINT};",
             ))
         });
