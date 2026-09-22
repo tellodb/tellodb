@@ -394,6 +394,41 @@ impl TenantStore {
         Ok(statuses)
     }
 
+    /// Marks the newest version of a fact current and clears its supersession
+    /// pointers. Used only to repair a chain that ended up with no current row
+    /// at all, which the ordering rules are supposed to prevent.
+    fn promote_newest_to_current(
+        tx: &rusqlite::Transaction<'_>,
+        fact_key: &str,
+        entity_id: &str,
+    ) -> Result<()> {
+        let newest: Option<String> = tx
+            .query_row(
+                "SELECT memory_id FROM fact_versions
+                 WHERE fact_key = ?1 AND entity_id = ?2
+                 ORDER BY timestamp_ms DESC, recorded_at_ms DESC, rowid DESC
+                 LIMIT 1",
+                params![fact_key, entity_id],
+                |row| row.get(0),
+            )
+            .ok();
+        if let Some(memory_id) = newest {
+            tracing::warn!(
+                fact_key,
+                entity_id,
+                memory_id = %memory_id,
+                "fact chain had no current version after a batch; promoting the newest"
+            );
+            tx.execute(
+                "UPDATE fact_versions
+                 SET status = 'current', valid_to_ms = NULL, superseded_by = NULL
+                 WHERE fact_key = ?1 AND entity_id = ?2 AND memory_id = ?3",
+                params![fact_key, entity_id, memory_id],
+            )?;
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_lines)]
     pub(crate) fn register_fact_versions_tx(
         tx: &rusqlite::Transaction<'_>,
@@ -533,15 +568,24 @@ impl TenantStore {
         }
 
         for (index, fact_key, entity_id) in deferred_stale {
-            let current = current_fact_version(tx, &fact_key, &entity_id)?
-                .map(|(id, timestamp)| (timestamp, id))
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "fact chain for {fact_key} (entity {entity_id}) has no current version \
-                         after the batch settled"
-                    )
-                })?;
-            statuses[index] = FactVersionStatus::Stale { current };
+            let current = match current_fact_version(tx, &fact_key, &entity_id)? {
+                Some(found) => found,
+                None => {
+                    // Every row in the chain came out stale. The newest version
+                    // is the current one by definition, so promote it rather
+                    // than failing the whole ingest batch -- a real LongMemEval
+                    // corpus reaches this state, and refusing the write loses
+                    // the memory over a bookkeeping disagreement.
+                    Self::promote_newest_to_current(tx, &fact_key, &entity_id)?;
+                    current_fact_version(tx, &fact_key, &entity_id)?.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "fact chain for {fact_key} (entity {entity_id}) has no versions at \
+                             all, yet a version in this batch was marked superseded"
+                        )
+                    })?
+                }
+            };
+            statuses[index] = FactVersionStatus::Stale { current: (current.1, current.0) };
         }
 
         Ok(statuses)
