@@ -129,6 +129,48 @@ mod tests {
         TenantDatabaseManager::new(paths, VectorConfig::new(3))
     }
 
+    /// "One tenant, one file" is a claim the project makes about its on-disk
+    /// shape, and it is the sort of claim that quietly stops being true the
+    /// first time something persists an index or a cache beside the database.
+    /// SQLite's own -wal and -shm are part of the database, not sidecars, and
+    /// they disappear on a clean checkpoint.
+    #[test]
+    fn a_tenant_directory_holds_nothing_but_its_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let mgr = manager(temp.path());
+        let store = mgr.get_tenant("alice").unwrap();
+
+        // Exercise the vector index, which is the thing most likely to want a
+        // file of its own, then force a checkpoint the way a clean shutdown
+        // would.
+        store
+            .vectors()
+            .unwrap()
+            .insert_batch("alice", &[(1, vec![1.0, 0.0, 0.0]), (2, vec![0.0, 1.0, 0.0])])
+            .unwrap();
+        store.set_memory_links_batch(&[("a".into(), "b".into(), "derived_from".into())]).unwrap();
+        store.checkpoint().unwrap();
+
+        let dir = temp.path().join("tenants").join("alice");
+        let mut found: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        found.sort();
+
+        let unexpected: Vec<&String> = found
+            .iter()
+            .filter(|name| {
+                !matches!(name.as_str(), "tellodb.db" | "tellodb.db-wal" | "tellodb.db-shm")
+            })
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "tenant directory gained a sidecar: {unexpected:?} (all entries: {found:?})"
+        );
+        assert!(found.iter().any(|n| n == "tellodb.db"), "no database at all: {found:?}");
+    }
+
     #[test]
     fn rejects_path_traversal_tenant_ids() {
         let temp = tempfile::tempdir().unwrap();
