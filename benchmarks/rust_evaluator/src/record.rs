@@ -620,6 +620,64 @@ pub fn paired_delta_clustered_ci(
     ))
 }
 
+/// Per-question scores for an arm, averaged over every seed recorded beside
+/// the given file.
+///
+/// Each arm writes one record per seed into its own directory. Reading a
+/// single one of them makes the whole comparison hostage to that seed: on the
+/// LoCoMo ablation the baseline's first seed came in a point low, and arms
+/// were credited with significant gains they did not have. Averaging first
+/// means the paired delta is between arms rather than between seeds.
+///
+/// Returns the scores and how many seeds went into them, so a table can say
+/// what it rests on.
+fn arm_question_scores(
+    representative: &str,
+) -> Result<(BTreeMap<String, (f64, f64, String)>, usize)> {
+    let dir = Path::new(representative)
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("record path has no directory: {representative}"))?;
+    let mut records: Vec<PathBuf> = fs::read_dir(dir)
+        .with_context(|| format!("reading arm directory {}", dir.display()))?
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| {
+            path.extension().is_some_and(|ext| ext == "json")
+                && path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(|c: char| c.is_ascii_digit()))
+        })
+        .collect();
+    records.sort();
+    if records.is_empty() {
+        records.push(PathBuf::from(representative));
+    }
+
+    let mut totals: BTreeMap<String, (f64, f64, String, usize)> = BTreeMap::new();
+    for path in &records {
+        let text =
+            fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let record: Value =
+            serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        for (question, (hit, ndcg, cluster)) in question_scores(&record) {
+            let entry = totals.entry(question).or_insert((0.0, 0.0, cluster, 0));
+            entry.0 += hit;
+            entry.1 += ndcg;
+            entry.3 += 1;
+        }
+    }
+
+    let seeds = records.len();
+    let averaged = totals
+        .into_iter()
+        .map(|(question, (hit, ndcg, cluster, n))| {
+            let n = n.max(1) as f64;
+            (question, (hit / n, ndcg / n, cluster))
+        })
+        .collect();
+    Ok((averaged, seeds))
+}
+
 fn question_scores(record: &Value) -> BTreeMap<String, (f64, f64, String)> {
     record["questions"]
         .as_array()
@@ -669,7 +727,7 @@ pub fn ablation_report(baseline: &str, runs: &[String]) -> Result<String> {
         serde_json::from_str(&text).with_context(|| format!("parsing {path}"))
     };
     let base = load(baseline)?;
-    let base_scores = question_scores(&base);
+    let (base_scores, base_seeds) = arm_question_scores(baseline)?;
     let clustered = base["dataset"]["kind"].as_str() == Some("locomo");
     let ingest = |r: &Value, key: &str| r["metrics"]["ingest"][key].as_f64();
     let p95 = |r: &Value| r["metrics"]["latency_ms"]["query_client"]["p95"].as_f64();
@@ -718,7 +776,7 @@ pub fn ablation_report(baseline: &str, runs: &[String]) -> Result<String> {
     let mut arms: Vec<Arm> = Vec::new();
     for path in runs {
         let run = load(path)?;
-        let scores = question_scores(&run);
+        let (scores, _) = arm_question_scores(path)?;
         let (mut a_hit, mut b_hit, mut a_ndcg, mut b_ndcg, mut clusters) =
             (vec![], vec![], vec![], vec![], vec![]);
         for (qid, (hit, ndcg, cluster)) in &base_scores {
@@ -764,10 +822,12 @@ pub fn ablation_report(baseline: &str, runs: &[String]) -> Result<String> {
     let ndcg_adjusted = holm_adjust(&arms.iter().map(|a| raw(a.ndcg)).collect::<Vec<_>>());
 
     out.push_str(&format!(
-        "Deltas are paired over questions against `baseline`. p-values are \
+        "Deltas are paired over questions against `baseline`, with each arm's \
+         per-question scores averaged over its {} seed(s) first. p-values are \
          two-sided percentile bootstrap, Holm-Bonferroni corrected across the \
          {} arms separately for each metric; \"keep\" means an adjusted p below \
          0.05 on either metric.\n\n",
+        base_seeds,
         arms.len()
     ));
     out.push_str(

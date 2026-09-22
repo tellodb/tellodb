@@ -214,6 +214,13 @@ while IFS= read -r line; do
     echo "============================================================"
     echo "Configuration: ${line}"
     echo "============================================================"
+    # Every arm starts from the same cache state. The embedding cache lives
+    # outside the per-arm data dir, so without this the first arm pays cold
+    # embedding cost and every later arm inherits it warm -- which showed up
+    # as a baseline ingesting at 33 mem/s against a "pruned" arm at 1377,
+    # a 41x difference that was mostly cache warmth, not the ablation.
+    rm -f "$TELLODB_EMBEDDING_CACHE_PATH" "$TELLODB_EMBEDDING_CACHE_PATH"-wal \
+          "$TELLODB_EMBEDDING_CACHE_PATH"-shm
     start_engine "$label" "$RUNS_DIR/engine_${label}.log" "${parts[@]:1}"
     for dataset in "${DATASET_LIST[@]}"; do
         echo "--- ${label} / ${dataset} ---"
