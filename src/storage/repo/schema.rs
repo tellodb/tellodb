@@ -30,8 +30,11 @@ impl TenantStore {
             );
             CREATE INDEX IF NOT EXISTS idx_memories_entity ON memories(entity_id);
             CREATE INDEX IF NOT EXISTS idx_memories_memory_id ON memories(memory_id);
-            CREATE INDEX IF NOT EXISTS idx_memories_recorded_at ON memories(recorded_at_ms);
-            CREATE INDEX IF NOT EXISTS idx_memories_expiry ON memories(expires_at_ms);
+            -- Indexes on recorded_at_ms and expires_at_ms belong to migrate(),
+            -- not here. This batch runs first, so on a database written before
+            -- those columns existed the CREATE INDEX fails and the migration
+            -- that would have added them never runs. migrate() creates both
+            -- once the columns are in place.
 
             -- Memory cards
             CREATE TABLE IF NOT EXISTS memory_cards (

@@ -501,6 +501,122 @@ mod tests {
         assert_eq!(autocheckpoint, 2_000);
     }
 
+    /// Builds a `memories` table as it stood before the columns named in
+    /// `missing` existed, stamps an old `user_version`, and inserts one row --
+    /// so opening it exercises the real `has_column` migration path rather
+    /// than a table that already has everything.
+    #[cfg(test)]
+    fn aged_fixture(path: &std::path::Path, user_version: i64, missing: &[&str]) {
+        let all: Vec<(&str, &str)> = vec![
+            ("content_hash", "content_hash TEXT NOT NULL DEFAULT ''"),
+            ("session_id", "session_id TEXT NOT NULL DEFAULT ''"),
+            ("turn_index", "turn_index INTEGER NOT NULL DEFAULT 0"),
+            ("role", "role TEXT NOT NULL DEFAULT ''"),
+            ("parent_memory_id", "parent_memory_id TEXT"),
+            ("indexed", "indexed INTEGER NOT NULL DEFAULT 0"),
+            ("recorded_at_ms", "recorded_at_ms INTEGER NOT NULL DEFAULT 0"),
+            ("expires_at_ms", "expires_at_ms INTEGER"),
+        ];
+        let columns: Vec<&str> =
+            all.iter().filter(|(name, _)| !missing.contains(name)).map(|(_, ddl)| *ddl).collect();
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE memories (
+                 rowid INTEGER PRIMARY KEY AUTOINCREMENT,
+                 memory_id TEXT NOT NULL UNIQUE,
+                 entity_id TEXT NOT NULL,
+                 content TEXT NOT NULL,
+                 kind TEXT NOT NULL,
+                 created_at_ms INTEGER NOT NULL{}{}
+             );
+             PRAGMA user_version = {user_version};",
+            if columns.is_empty() { "" } else { ", " },
+            columns.join(", ")
+        ))
+        .unwrap();
+        conn.execute(
+            "INSERT INTO memories (memory_id, entity_id, content, kind, created_at_ms)
+             VALUES ('legacy::s1::0', 'legacy', 'a memory written by an older build', 'fact', 100)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+    }
+
+    #[test]
+    fn databases_from_older_schema_versions_still_open() {
+        // Each entry is a shape the store actually shipped: the columns listed
+        // did not exist yet at that user_version.
+        let generations: [(i64, &[&str]); 4] = [
+            (
+                1,
+                &[
+                    "content_hash",
+                    "session_id",
+                    "turn_index",
+                    "role",
+                    "parent_memory_id",
+                    "indexed",
+                    "recorded_at_ms",
+                    "expires_at_ms",
+                ],
+            ),
+            (3, &["content_hash", "indexed", "recorded_at_ms", "expires_at_ms"]),
+            (4, &["content_hash", "recorded_at_ms", "expires_at_ms"]),
+            (6, &["expires_at_ms"]),
+        ];
+
+        for (version, missing) in generations {
+            let temp = tempdir().unwrap();
+            let path = temp.path().join("tenant.db");
+            aged_fixture(&path, version, missing);
+
+            let store = TenantStore::new(&path)
+                .unwrap_or_else(|e| panic!("v{version} database must open: {e}"));
+            let conn = store.get_conn().unwrap();
+
+            let migrated: i64 =
+                conn.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
+            assert_eq!(migrated, SCHEMA_VERSION, "v{version} did not reach current schema");
+
+            // Every column the migration was supposed to add is present...
+            for column in missing {
+                let present: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name = ?1",
+                        params![column],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(present, 1, "v{version} migration did not add {column}");
+            }
+
+            // ...and the row written by the older build is still readable.
+            let content: String = conn
+                .query_row(
+                    "SELECT content FROM memories WHERE memory_id = 'legacy::s1::0'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(content, "a memory written by an older build", "v{version} lost data");
+        }
+    }
+
+    #[test]
+    fn migrating_an_old_database_twice_is_a_no_op() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("tenant.db");
+        aged_fixture(&path, 3, &["content_hash", "indexed", "recorded_at_ms", "expires_at_ms"]);
+
+        drop(TenantStore::new(&path).unwrap());
+        let store = TenantStore::new(&path).expect("reopening a migrated database must work");
+        let conn = store.get_conn().unwrap();
+        let rows: i64 =
+            conn.query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0)).unwrap();
+        assert_eq!(rows, 1, "second open duplicated or dropped rows");
+    }
+
     #[test]
     fn newer_schema_versions_are_rejected() {
         let temp = tempdir().unwrap();
