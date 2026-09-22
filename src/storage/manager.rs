@@ -171,6 +171,87 @@ mod tests {
         assert!(found.iter().any(|n| n == "tellodb.db"), "no database at all: {found:?}");
     }
 
+    /// E7 -- what one tenant's write storm does to another tenant's reads.
+    ///
+    /// Isolation here is structural: one SQLite file per tenant, so tenant B's
+    /// writers hold a lock tenant A's readers never ask for. That is an
+    /// argument, not a measurement, and it is worth measuring because writers
+    /// inside a single tenant demonstrably do interfere -- two concurrent
+    /// ingesters on one file drove the storage stage from 400ms to 2.2s and
+    /// eventually returned "database is locked".
+    ///
+    /// Run it on demand; it is timing-sensitive and does not belong in CI:
+    ///   cargo test --lib tenant_tail_latency -- --ignored --nocapture
+    #[test]
+    #[ignore = "timing measurement, run on demand"]
+    fn tenant_tail_latency_under_a_neighbours_write_storm() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        fn percentile(sorted: &[u128], p: f64) -> u128 {
+            if sorted.is_empty() {
+                return 0;
+            }
+            let index = ((sorted.len() as f64 - 1.0) * p).round() as usize;
+            sorted[index]
+        }
+
+        println!(
+            "{:>8} {:>10} {:>10} {:>10} {:>12}",
+            "tenants", "p50 us", "p95 us", "p99 us", "reads"
+        );
+        for neighbours in [0usize, 1, 4, 16] {
+            let temp = tempfile::tempdir().unwrap();
+            let mgr = Arc::new(manager(temp.path()));
+            let reader = mgr.get_tenant("reader").unwrap();
+            reader
+                .set_memory_links_batch(&[("seed".into(), "target".into(), "derived_from".into())])
+                .unwrap();
+
+            let stop = Arc::new(AtomicBool::new(false));
+            let mut writers = Vec::new();
+            for n in 0..neighbours {
+                let mgr = Arc::clone(&mgr);
+                let stop = Arc::clone(&stop);
+                writers.push(std::thread::spawn(move || {
+                    let store = mgr.get_tenant(&format!("writer{n}")).unwrap();
+                    let mut i = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        let links: Vec<(String, String, String)> = (0..64)
+                            .map(|k| {
+                                (format!("a{i}_{k}"), format!("b{i}_{k}"), "derived_from".into())
+                            })
+                            .collect();
+                        let _ = store.set_memory_links_batch(&links);
+                        i += 1;
+                    }
+                }));
+            }
+
+            let mut samples = Vec::with_capacity(400);
+            for _ in 0..400 {
+                let started = Instant::now();
+                reader.get_link_cluster_scores("seed", 1).unwrap();
+                samples.push(started.elapsed().as_micros());
+            }
+            stop.store(true, Ordering::Relaxed);
+            for writer in writers {
+                let _ = writer.join();
+            }
+
+            samples.sort_unstable();
+            println!(
+                "{:>8} {:>10} {:>10} {:>10} {:>12}",
+                neighbours + 1,
+                percentile(&samples, 0.50),
+                percentile(&samples, 0.95),
+                percentile(&samples, 0.99),
+                samples.len()
+            );
+        }
+    }
+
     #[test]
     fn rejects_path_traversal_tenant_ids() {
         let temp = tempfile::tempdir().unwrap();
