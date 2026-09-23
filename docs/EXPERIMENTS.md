@@ -441,3 +441,11 @@ Do **not** change these defaults without a paired dev-split delta first.
 9. **Freeze the engine.** After this point no code changes except correctness
    fixes, or the ablation must be re-run.
 10. **Unseal the test split once.** Log commit, date, operator. Regenerate Table 1.
+
+## Related work found 2026-09-23 (web search)
+- FluctlightDB (arXiv 2608.12365): embedded Rust engine for agent memory — closest prior art to our "engine" thesis. Differentiate: we contribute DB guarantees (crash/isolation tests) + structure-level cost-adjusted ablation; they don't ablate structures.
+- Memanto (2604.22085): 5-stage *progressive* ablation of retrieval knobs (limits, thresholds, prompts) — not structure-level, not significance-tested.
+- EverMemOS-style ablations (MemScenes/MemCells): component removal, single seed, no CIs.
+- SwiftMem (2601.08160), MemForest (2605.23986): latency/build-rate focus; cite for cost axis.
+- Agent Zero Memory (2608.29606): 95.6 LME / 93.6 LoCoMo end-to-end QA; retrieval-channel ablation only.
+- DimMem (2605.15759), AtomMem (2606.19847), ByteRover (2604.01599): structure-rich memory designs; none report multi-seed, Holm-corrected, cost-adjusted structure ablation.
