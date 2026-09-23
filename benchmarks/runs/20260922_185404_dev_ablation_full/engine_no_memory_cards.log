@@ -579,3 +579,6 @@
 [2m2026-09-23T04:48:54.144980Z[0m [32m INFO[0m ThreadId(22) [2mort::logging[0m[2m:[0m [2m/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ort-2.0.0-rc.12/src/logging.rs[0m[2m:[0m[2m128:[0m Extended allocation by 1073741824 bytes.
 [2m2026-09-23T04:48:54.144991Z[0m [32m INFO[0m ThreadId(22) [2mort::logging[0m[2m:[0m [2m/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ort-2.0.0-rc.12/src/logging.rs[0m[2m:[0m[2m128:[0m Total allocated bytes: 3757047808
 [2m2026-09-23T04:48:54.144996Z[0m [32m INFO[0m ThreadId(22) [2mort::logging[0m[2m:[0m [2m/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ort-2.0.0-rc.12/src/logging.rs[0m[2m:[0m[2m128:[0m Allocated memory at 0x7cfc92000000 to 0x7cfcd2000000
+[2m2026-09-23T04:56:14.313295Z[0m [32m INFO[0m ThreadId(03) [2mtellodb[0m[2m:[0m [2msrc/main.rs[0m[2m:[0m[2m299:[0m Shutdown signal received (SIGTERM)
+[2m2026-09-23T04:56:14.313342Z[0m [32m INFO[0m ThreadId(03) [2mtellodb[0m[2m:[0m [2msrc/main.rs[0m[2m:[0m[2m303:[0m Shutting down...
+[2m2026-09-23T04:56:14.344343Z[0m [32m INFO[0m ThreadId(01) [2mtellodb[0m[2m:[0m [2msrc/main.rs[0m[2m:[0m[2m264:[0m Checkpointing tenant databases...
