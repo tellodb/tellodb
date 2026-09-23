@@ -449,3 +449,40 @@ Do **not** change these defaults without a paired dev-split delta first.
 - SwiftMem (2601.08160), MemForest (2605.23986): latency/build-rate focus; cite for cost axis.
 - Agent Zero Memory (2608.29606): 95.6 LME / 93.6 LoCoMo end-to-end QA; retrieval-channel ablation only.
 - DimMem (2605.15759), AtomMem (2606.19847), ByteRover (2604.01599): structure-rich memory designs; none report multi-seed, Holm-corrected, cost-adjusted structure ablation.
+
+## Status 2026-09-23 — experiments stopped by user
+All runs stopped on the GPU box; all run dirs pulled into benchmarks/runs/ and committed.
+
+### LoCoMo family ablation (runs/20260922_185547_dev_groups, 3 seeds, n=432)
+Families: companions={gist,keywords,relation_companions}; links={retrospective_links,derived_links,graph_edges};
+routing={session_router,preferences}; facts={facts,predicate_canon,semantic_dedup,consolidation}; misc={chunks,metrics}.
+| arm | Δrecall | p_adj | ΔnDCG | p_adj | Δbytes |
+|---|---|---|---|---|---|
+| g_links | −6.6 | <0.001 | −6.3 | <0.001 | −6% |
+| g_companions | −0.8 | 1.0 | −0.7 | 1.0 | −13% |
+| g_routing | −0.9 | 1.0 | +1.6 | 1.0 | −30% |
+| g_facts | 0.0 | 1.0 | +1.2 | 1.0 | −6% |
+| g_misc | 0.0 | 1.0 | 0.0 | 1.0 | 0 |
+| pruned_all | −7.3 | <0.001 | −6.7 | <0.001 | −48% |
+Family effects ~sum to pruned loss; nearly all of it is the links family.
+
+### LoCoMo links decomposition (runs/20260923_040524_dev_links, 3 seeds, n=432)
+| arm (members kept) | Δrecall | ΔnDCG (p_adj) |
+|---|---|---|
+| only_graph_edges | −0.9 | −0.9 (<0.001) |
+| only_derived | −2.9 (p=0.54) | +1.0 (<0.001) |
+| only_retrospective | −6.6 (<0.001) | −6.3 (<0.001) |
+| no_retrospective | 0.0 | 0.0 |
+| no_derived | −0.9 | −0.9 (<0.001) |
+| no_graph_edges | −2.9 (p=0.54) | +1.0 (<0.001) |
+| g_links (none) | −6.6 (<0.001) | −6.3 (<0.001) |
+Finding: retrospective_links is inert (identical results with/without). graph_edges and derived_links are
+substitutes — either alone recovers most of the loss, removing both costs −6.6. This is the mechanism behind
+"one-at-a-time ablation is not a pruning recipe".
+
+### LongMemEval ablation_full (runs/20260922_185404_dev_ablation_full, 1 seed)
+Completed: baseline, pruned_all, g_links, g_companions, g_facts, g_routing, g_misc. no_memory_cards partial (unusable).
+Not run: 17 single-structure arms. Report not yet generated for these arms (run rust_evaluator ablation-report on the dir).
+
+### Caveats
+Latency/throughput columns from 2026-09-22/23 box runs are contaminated (3 concurrent jobs); quality metrics are fine.
