@@ -11,6 +11,8 @@
 # run_ablation.sh and run_rerank_sweep.sh build MATRIX for common studies.
 # The embedding cache is shared across configurations, so only texts that a
 # configuration newly produces are embedded.
+# WORK_ROOT selects the scratch parent (defaults to disk-backed user cache).
+# BASELINE_RUNS_DIR reuses a completed baseline from a previous run directory.
 set -euo pipefail
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
@@ -41,7 +43,7 @@ case "$TIER" in
     PROFILE=fastrelease
     LIMIT=500
     SYNTH_LIMIT=100000
-    CONCURRENCY=2
+    CONCURRENCY=1
     TELLODB_THREADS="${TELLODB_THREADS:-8}"
     TELLODB_RERANK="${TELLODB_RERANK:-auto}"
     # Attention memory scales with batch x seq^2, and each embed executor
@@ -96,8 +98,12 @@ ENGINE_URL="http://127.0.0.1:${ENGINE_PORT}"
 ENGINE_API_KEY="${TELLODB_API_KEY:-XXX1111AAA}"
 
 RUNS_DIR="${REPO_ROOT}/benchmarks/runs/$(date +%Y%m%d_%H%M%S)_${TIER}_${NAME}"
-WORK_DIR="$(mktemp -d /tmp/tellodb_ablation.XXXXXX)"
+WORK_ROOT="${WORK_ROOT:-$HOME/.cache/tellodb/benchmark-work}"
+mkdir -p "$WORK_ROOT"
+WORK_DIR="$(mktemp -d "$WORK_ROOT/tellodb_ablation.XXXXXX")"
 mkdir -p "$RUNS_DIR"
+echo "Run directory: $RUNS_DIR"
+echo "Working directory: $WORK_DIR (ingest concurrency: $CONCURRENCY)"
 ENGINE_PID=""
 
 stop_engine() {
@@ -112,6 +118,24 @@ cleanup() {
     rm -rf "$WORK_DIR"
 }
 trap cleanup EXIT INT TERM
+
+# Copy only baseline records; preserve the source run and its failure logs.
+# Reuse is explicit because engine settings must match the original run.
+if [[ -n "${BASELINE_RUNS_DIR:-}" ]]; then
+    IFS=, read -ra baseline_datasets <<< "$DATASETS"
+    for dataset in "${baseline_datasets[@]}"; do
+        shopt -s nullglob
+        records=("$BASELINE_RUNS_DIR/$dataset/baseline/"[0-9]*.json)
+        shopt -u nullglob
+        if [[ "${#records[@]}" -ne "$RUNS" ]]; then
+            echo "Expected $RUNS baseline records for $dataset in $BASELINE_RUNS_DIR" >&2
+            exit 1
+        fi
+        mkdir -p "$RUNS_DIR/$dataset/baseline"
+        cp "${records[@]}" "$RUNS_DIR/$dataset/baseline/"
+    done
+    printf '%s\n' "$BASELINE_RUNS_DIR" > "$RUNS_DIR/BASELINE_SOURCE.txt"
+fi
 
 # ort's CUDA execution provider is gated behind the gpu-cuda feature; without it
 # ORT falls back to CPU silently. Ask for it whenever a GPU is actually present.
@@ -222,6 +246,10 @@ while IFS= read -r line; do
     read -ra parts <<< "$line"
     label="${parts[0]}"
     LABELS+=("$label")
+    if [[ "$label" == baseline && -n "${BASELINE_RUNS_DIR:-}" ]]; then
+        echo "Reusing baseline from $BASELINE_RUNS_DIR"
+        continue
+    fi
     echo "============================================================"
     echo "Configuration: ${line}"
     echo "============================================================"
@@ -238,6 +266,8 @@ while IFS= read -r line; do
         run_dataset "$dataset" "$RUNS_DIR/$dataset/$label"
     done
     stop_engine
+    # Finished arms retain their evaluation records, not their large databases.
+    rm -rf "$WORK_DIR/data_${label}"
 done <<< "$MATRIX"
 
 REPORT="$RUNS_DIR/REPORT.md"
@@ -245,6 +275,10 @@ REPORT="$RUNS_DIR/REPORT.md"
     echo "# ${NAME} (${TIER}, $(date -u +%Y-%m-%dT%H:%MZ))"
     echo
     echo "Embed text: ${TELLODB_EMBED_TEXT} (window ${TELLODB_CONTEXT_WINDOW}), client context: ${CLIENT_CONTEXT}, timestamps: ${TIMESTAMPS}."
+    echo "Ingest concurrency: ${CONCURRENCY}."
+    if [[ -n "${BASELINE_RUNS_DIR:-}" ]]; then
+        echo "Baseline reused from ${BASELINE_RUNS_DIR}; its original configuration is recorded in the baseline JSON files."
+    fi
     echo
     echo "Configurations:"
     echo '```'
