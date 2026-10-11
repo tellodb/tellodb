@@ -47,12 +47,25 @@ pub fn execute_query_pipeline(
     limit: usize,
     enable_neural_rerank: bool,
 ) -> EngineResult<(Vec<QueryResult>, QueryDiagnostics)> {
+    let _profile = crate::profiling::Timer::new("query.mod.execute_query_pipeline");
     let mut pipeline = QueryPipelineState::new(payload, state, tenant, limit, enable_neural_rerank);
+    tracing::debug!(target: "tellodb::profile", event = "query_input",
+        query_bytes = pipeline.payload.textual_query.len(), limit,
+        entity_scoped = pipeline.payload.entity_id.is_some(),
+        point_in_time = pipeline.payload.point_in_time_ms.is_some(), enable_neural_rerank);
     plan::plan_phase(&mut pipeline);
     route::route_phase(&mut pipeline);
     retrieve::retrieval_phase(&mut pipeline);
+    tracing::debug!(target: "tellodb::profile", event = "retrieval_candidates",
+        ann = pipeline.candidates.primary_hnsw_raw.len(),
+        semantic = pipeline.candidates.semantic_ranked_lists.iter().map(|(_, list)| list.len()).sum::<usize>(),
+        fts = pipeline.candidates.fts_ranked_lists.iter().map(|(_, list)| list.len()).sum::<usize>(),
+        cards = pipeline.candidates.card_ranked_items.len(),
+        routed_sessions = pipeline.route.session_scores.len(),
+        scoped_ann_attempts = pipeline.diag.scoped_ann_attempts);
     rerank::rerank_phase(&mut pipeline);
     fuse::fusion_phase(&mut pipeline);
+    let fused_count = pipeline.fused.items.len();
 
     let hydrate_start = Instant::now();
     score::score_hydrate(&mut pipeline)?;
@@ -63,6 +76,22 @@ pub fn execute_query_pipeline(
     pipeline.diag.score_loop_us = loop_start.elapsed().as_micros() as u64;
 
     let results = respond::score_build_response(&mut pipeline, evidence_cards)?;
+    tracing::debug!(target: "tellodb::profile", event = "query_output",
+        results = results.len(), fused_candidates = fused_count,
+        hydrated = pipeline.scoring.observations.len(), invalidated = pipeline.scoring.invalidated_facts.len(),
+        intent = ?pipeline.plan.intent, rerank_reason = ?pipeline.diag.rerank_reason,
+        confidence_bp = pipeline.diag.evidence_confidence_bp,
+        abstain_recommended = pipeline.diag.abstain_recommended,
+        total_us = pipeline.total_start.elapsed().as_micros() as u64);
+    if tracing::enabled!(target: "tellodb::profile", tracing::Level::DEBUG) {
+        for (rank, result) in results.iter().enumerate() {
+            tracing::debug!(target: "tellodb::profile", event = "ranked_result", rank = rank + 1,
+                memory_id = %result.memory_id, session_id = %result.session_id,
+                score = result.similarity, origin = ?result.origin,
+                conflict = result.conflict_flag.unwrap_or(false), superseded = result.superseded_by.is_some(),
+                proof_verified = result.evidence.as_ref().map(|proof| proof.verified));
+        }
+    }
     Ok((results, std::mem::take(&mut pipeline.data.diag)))
 }
 
@@ -239,12 +268,16 @@ impl QueryPipelineState {
         limit: usize,
         enable_neural_rerank: bool,
     ) -> Self {
+        let _profile = crate::profiling::Timer::new("query.mod.new");
         let ambiguity_threshold = state
             .ranking_config
             .ambiguity_delta_threshold
             .unwrap_or_else(|| ScoringWeights::default().ambiguity_delta_threshold);
         let now_ms = payload.point_in_time_ms.or(payload.reference_time_ms).unwrap_or_else(|| {
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_else(|error| crate::profiling::fallback("mod.optional_lookup", error))
+                .as_millis() as u64
         });
         Self {
             payload,

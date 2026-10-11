@@ -9,6 +9,7 @@ use rayon::prelude::*;
 fn merge_fused_items(
     fused: impl IntoIterator<Item = (String, u64, f32)>,
 ) -> HashMap<String, (u64, f32)> {
+    let _profile = crate::profiling::Timer::new("query.fuse.merge_fused_items");
     let mut fused_map: HashMap<String, (u64, f32)> = HashMap::new();
     for (mid, ts, score) in fused {
         let entry = fused_map.entry(mid).or_insert((ts, 0.0));
@@ -39,6 +40,7 @@ const GRAPH_SCORE_SATURATION_K: f32 = 2.0;
 const FUSED_HYDRATION_FLOOR: usize = 200;
 
 fn calibrate_graph_scores(scores: &mut HashMap<String, f32>) {
+    let _profile = crate::profiling::Timer::new("query.fuse.calibrate_graph_scores");
     for score in scores.values_mut() {
         *score = *score / (*score + GRAPH_SCORE_SATURATION_K);
     }
@@ -57,6 +59,8 @@ fn accumulate_seed_scores_deterministically(
     graph_scores: &mut HashMap<String, f32>,
     all_linked: &mut Vec<String>,
 ) {
+    let _profile =
+        crate::profiling::Timer::new("query.fuse.accumulate_seed_scores_deterministically");
     let mut contributions: Vec<(usize, String, f32)> = scores_by_seed
         .into_iter()
         .enumerate()
@@ -70,6 +74,7 @@ fn accumulate_seed_scores_deterministically(
 }
 
 fn sort_fused_items(items: &mut [(String, u64, f32)]) {
+    let _profile = crate::profiling::Timer::new("query.fuse.sort_fused_items");
     items.sort_by(|a, b| {
         b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(&b.0))
     });
@@ -77,6 +82,7 @@ fn sort_fused_items(items: &mut [(String, u64, f32)]) {
 
 #[allow(clippy::too_many_lines)]
 pub(crate) fn fusion_phase(s: &mut QueryPipelineState) {
+    let _profile = crate::profiling::Timer::new("query.fuse.fusion_phase");
     let stage_start = Instant::now();
     // Nothing downstream of this phase reads `s.candidates` again, so take
     // these lists instead of cloning them into the fusion input.
@@ -101,7 +107,10 @@ pub(crate) fn fusion_phase(s: &mut QueryPipelineState) {
         });
         let mut neural_items = Vec::new();
         let mids: Vec<String> = scored_items.iter().map(|(mid, _)| mid.clone()).collect();
-        let lookup = s.tenant.lookup_by_memory_ids_batch(&mids).unwrap_or_default();
+        let lookup = s
+            .tenant
+            .lookup_by_memory_ids_batch(&mids)
+            .unwrap_or_else(|error| crate::profiling::fallback("fuse.optional_lookup", error));
         for (mid, _) in scored_items {
             if let Some(&(ts, _)) = lookup.get(&mid) {
                 neural_items.push(RankedItem { memory_id: mid, timestamp: ts });
@@ -113,8 +122,10 @@ pub(crate) fn fusion_phase(s: &mut QueryPipelineState) {
     (s.diag.fuse_ms, s.diag.fuse_us) = elapsed_ms_and_us(stage_start);
 
     if s.payload.reference_time_ms.is_none() {
-        s.now_ms =
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        s.now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_else(|error| crate::profiling::fallback("fuse.optional_lookup", error))
+            .as_millis() as u64;
     }
     let mut fused_map = merge_fused_items(fused);
 
@@ -166,7 +177,9 @@ pub(crate) fn fusion_phase(s: &mut QueryPipelineState) {
             .map(|seed_mid| {
                 s.tenant
                     .get_link_cluster_scores(seed_mid, s.state.config.retrieval.graph_max_depth)
-                    .unwrap_or_default()
+                    .unwrap_or_else(|error| {
+                        crate::profiling::fallback("fuse.optional_lookup", error)
+                    })
             })
             .collect()
     } else {

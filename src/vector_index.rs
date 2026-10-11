@@ -127,6 +127,7 @@ pub enum Quantization {
 
 impl Quantization {
     pub fn parse(name: &str) -> Result<Self> {
+        let _profile = crate::profiling::Timer::new("vector_index.parse");
         Ok(match name.trim().to_ascii_lowercase().as_str() {
             "" | "f32" => Quantization::F32,
             "f16" => Quantization::F16,
@@ -137,6 +138,7 @@ impl Quantization {
     }
 
     pub fn name(self) -> &'static str {
+        let _profile = crate::profiling::Timer::new("vector_index.name");
         match self {
             Quantization::F32 => "f32",
             Quantization::F16 => "f16",
@@ -147,6 +149,7 @@ impl Quantization {
 
     /// In-memory bytes per vector in a flat segment.
     pub fn bytes_per_vector(self, dimensions: usize) -> usize {
+        let _profile = crate::profiling::Timer::new("vector_index.bytes_per_vector");
         match self {
             Quantization::F32 => 4 * dimensions,
             Quantization::F16 => 2 * dimensions,
@@ -181,6 +184,7 @@ pub struct VectorConfig {
 
 impl VectorConfig {
     pub fn new(dimensions: usize) -> Self {
+        let _profile = crate::profiling::Timer::new("vector_index.new");
         Self {
             dimensions,
             quantization: Quantization::F32,
@@ -203,6 +207,7 @@ impl VectorConfig {
         expansion_add: Option<usize>,
         expansion_search: Option<usize>,
     ) -> Result<Self> {
+        let _profile = crate::profiling::Timer::new("vector_index.from_values");
         let defaults = Self::new(dimensions);
         Ok(Self {
             dimensions,
@@ -230,6 +235,7 @@ fn normalized(vector: &[f32]) -> Vec<f32> {
 /// Dot product written so the compiler vectorizes it (eight independent
 /// accumulators; a single running float sum cannot be reordered).
 pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
+    let _profile = crate::profiling::Timer::new("vector_index.dot_f32");
     let mut acc = [0.0f32; 8];
     let chunks_a = a.chunks_exact(8);
     let chunks_b = b.chunks_exact(8);
@@ -358,6 +364,7 @@ impl FlatSegment {
 
     /// Top `k` rows by (estimated) similarity, best first.
     fn scan(&self, query: &[f32], k: usize) -> Vec<(u64, f32)> {
+        let _profile = crate::profiling::Timer::new("vector_index.scan");
         if self.ids.is_empty() || k == 0 {
             return Vec::new();
         }
@@ -495,15 +502,18 @@ pub struct VectorIndex {
 
 impl VectorIndex {
     pub fn new(config: VectorConfig, source: Arc<dyn VectorSource>) -> Self {
+        let _profile = crate::profiling::Timer::new("vector_index.new");
         Self { config, source, slots: RwLock::new(HashMap::new()) }
     }
 
     /// An index whose vectors live only in memory.
     pub fn in_memory(config: VectorConfig) -> Self {
+        let _profile = crate::profiling::Timer::new("vector_index.in_memory");
         Self::new(config, Arc::new(MemoryVectorSource::default()))
     }
 
     pub fn config(&self) -> &VectorConfig {
+        let _profile = crate::profiling::Timer::new("vector_index.config");
         &self.config
     }
 
@@ -515,6 +525,7 @@ impl VectorIndex {
     }
 
     fn build_segment(&self, rows: &[(u64, Vec<f32>)]) -> Result<Segment> {
+        let _profile = crate::profiling::Timer::new("vector_index.build_segment");
         if rows.len() > self.config.flat_threshold {
             return Ok(Segment::Hnsw(HnswSegment::build(&self.config, rows)?));
         }
@@ -539,12 +550,19 @@ impl VectorIndex {
 
     /// Runs `f` on the entity's segment, loading it from the source first.
     fn with_segment<T>(&self, entity_id: &str, f: impl FnOnce(&Segment) -> Result<T>) -> Result<T> {
+        let _profile = crate::profiling::Timer::new("vector_index.with_segment");
         let slot = self.slot(entity_id);
-        let guard = slot.segment.upgradable_read();
+        let guard = {
+            let _wait = crate::profiling::Timer::new("vector_index.segment_read_lock_wait");
+            slot.segment.upgradable_read()
+        };
         if let Some(segment) = guard.as_ref() {
             return f(segment);
         }
-        let mut write = RwLockUpgradableReadGuard::upgrade(guard);
+        let mut write = {
+            let _wait = crate::profiling::Timer::new("vector_index.segment_upgrade_wait");
+            RwLockUpgradableReadGuard::upgrade(guard)
+        };
         if write.is_none() {
             let rows = self
                 .source
@@ -557,6 +575,7 @@ impl VectorIndex {
     }
 
     pub fn len(&self, entity_id: Option<&str>) -> Result<usize> {
+        let _profile = crate::profiling::Timer::new("vector_index.len");
         match entity_id {
             Some(e) => self.with_segment(e, |s| Ok(s.len())),
             None => self
@@ -569,6 +588,7 @@ impl VectorIndex {
 
     /// Approximate in-memory bytes of the loaded segments.
     pub fn loaded_bytes(&self) -> usize {
+        let _profile = crate::profiling::Timer::new("vector_index.loaded_bytes");
         let slots: Vec<Arc<Slot>> = self.slots.read().values().cloned().collect();
         slots
             .iter()
@@ -582,12 +602,14 @@ impl VectorIndex {
     }
 
     pub fn insert(&self, entity_id: &str, id: u64, vector: &[f32]) -> Result<()> {
+        let _profile = crate::profiling::Timer::new("vector_index.insert");
         self.insert_batch(entity_id, &[(id, vector.to_vec())])
     }
 
     /// Adds or replaces vectors. Call after the vectors are durable in the
     /// source: an entity that is not loaded yet picks them up when it loads.
     pub fn insert_batch(&self, entity_id: &str, items: &[(u64, Vec<f32>)]) -> Result<()> {
+        let _profile = crate::profiling::Timer::new("vector_index.insert_batch");
         if items.is_empty() {
             return Ok(());
         }
@@ -627,6 +649,7 @@ impl VectorIndex {
         query: &[f32],
         limit: usize,
     ) -> Result<Vec<(u64, f32)>> {
+        let _profile = crate::profiling::Timer::new("vector_index.search");
         self.check_dimensions(query)?;
         if limit == 0 {
             return Ok(Vec::new());
@@ -665,6 +688,7 @@ impl VectorIndex {
 
     /// Removes a vector; returns how many were removed from loaded segments.
     pub fn remove(&self, entity_id: &str, id: u64) -> Result<usize> {
+        let _profile = crate::profiling::Timer::new("vector_index.remove");
         self.source.record_remove(entity_id, id);
         let slot = self.slot(entity_id);
         let mut guard = slot.segment.write();
@@ -680,6 +704,7 @@ impl VectorIndex {
     /// Drops loaded segments (one entity, or all). Call after the source rows
     /// are gone; segments reload from the source on next use.
     pub fn clear(&self, entity_id: Option<&str>) -> Result<()> {
+        let _profile = crate::profiling::Timer::new("vector_index.clear");
         self.source.record_clear(entity_id);
         let mut slots = self.slots.write();
         match entity_id {

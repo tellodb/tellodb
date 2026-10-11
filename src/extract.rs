@@ -142,6 +142,7 @@ pub struct EncoderExtractor {
 
 impl EncoderExtractor {
     pub fn from_config(config: &ExtractorConfig) -> Result<Self> {
+        let _profile = crate::profiling::Timer::new("extract.from_config");
         let dir = config.model_dir.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "TELLODB_EXTRACTOR=encoder needs TELLODB_EXTRACTOR_MODEL_DIR pointing at a \
@@ -221,6 +222,7 @@ impl Extractor for EncoderExtractor {
 static EXTRACTOR: OnceLock<Arc<dyn Extractor>> = OnceLock::new();
 
 pub fn init(config: &ExtractorConfig, heuristics: Profile) -> Result<Arc<dyn Extractor>> {
+    let _profile = crate::profiling::Timer::new("extract.init");
     let extractor: Arc<dyn Extractor> = match config.kind.trim() {
         "" | "rules" => Arc::new(RuleExtractor { heuristics, ..RuleExtractor::default() }),
         "encoder" => Arc::new(EncoderExtractor::from_config(config)?),
@@ -232,6 +234,7 @@ pub fn init(config: &ExtractorConfig, heuristics: Profile) -> Result<Arc<dyn Ext
 /// The process-wide extractor, defaulting to rules until `init_from_env` runs
 /// (unit tests and library callers that never configured one).
 pub fn extractor() -> Arc<dyn Extractor> {
+    let _profile = crate::profiling::Timer::new("extract.extractor");
     EXTRACTOR.get_or_init(|| Arc::new(RuleExtractor::default())).clone()
 }
 

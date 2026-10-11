@@ -14,6 +14,7 @@ use super::{
 // anything treats list order as rank order, and again right before
 // returning.
 fn sort_results_by_similarity_desc(results: &mut [QueryResult]) {
+    let _profile = crate::profiling::Timer::new("query.respond.sort_results_by_similarity_desc");
     results.sort_by(|a, b| {
         b.similarity
             .partial_cmp(&a.similarity)
@@ -32,6 +33,7 @@ fn build_proof_packet(
     verify_evidence: bool,
     evidence_radius: u32,
 ) -> ProofPacket {
+    let _profile = crate::profiling::Timer::new("query.respond.build_proof_packet");
     let mut source_turns = Vec::new();
     if evidence_radius > 0 && !card.source_session_id.is_empty() {
         let center = card.source_turn_index as u32;
@@ -189,6 +191,7 @@ pub(crate) fn score_build_response(
     s: &mut QueryPipelineState,
     mut evidence_cards: Vec<EvidenceCard>,
 ) -> EngineResult<Vec<QueryResult>> {
+    let _profile = crate::profiling::Timer::new("query.respond.score_build_response");
     let stage_start = Instant::now();
 
     // Pre-synthesized Phase 1: direct fact lookup.

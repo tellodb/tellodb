@@ -7,6 +7,7 @@ const NEURAL_BATCH: usize = 32;
 
 impl RerankDecision {
     pub(crate) fn applies(self) -> bool {
+        let _profile = crate::profiling::Timer::new("query.rerank.applies");
         matches!(
             self,
             RerankDecision::HeuristicApplied
@@ -18,17 +19,20 @@ impl RerankDecision {
 }
 
 pub(crate) fn rerank_policy_name(config: &crate::config::Config) -> &'static str {
+    let _profile = crate::profiling::Timer::new("query.rerank.rerank_policy_name");
     config.rerank.policy.name()
 }
 
 /// Relative similarity gap between the top-1 and top-5 ANN hits below which
 /// the gate reranks (`TELLODB_RERANK_MARGIN`, default 0.05).
 pub(crate) fn rerank_margin(config: &crate::config::Config) -> f32 {
+    let _profile = crate::profiling::Timer::new("query.rerank.rerank_margin");
     config.rerank.margin
 }
 
 /// Candidates sent to the cross-encoder (`TELLODB_RERANK_TOP`, default 25).
 pub(crate) fn rerank_top(config: &crate::config::Config) -> usize {
+    let _profile = crate::profiling::Timer::new("query.rerank.rerank_top");
     config.rerank.top
 }
 
@@ -36,6 +40,7 @@ pub(crate) fn rerank_top(config: &crate::config::Config) -> usize {
 /// `margin` (relative) of the fifth (or last) hit. `hnsw_raw` holds
 /// `(vector_id, cosine distance)` sorted by distance.
 pub(crate) fn rerank_gate_uncertain(hnsw_raw: &[(u64, f32)], margin: f32) -> bool {
+    let _profile = crate::profiling::Timer::new("query.rerank.rerank_gate_uncertain");
     let kth_index = hnsw_raw.len().min(5).checked_sub(1);
     let (Some(first), Some(kth)) = (hnsw_raw.first(), kth_index.and_then(|i| hnsw_raw.get(i)))
     else {
@@ -54,6 +59,7 @@ pub(crate) fn should_apply_neural_rerank(
     hnsw_raw: &[(u64, f32)],
     requested: bool,
 ) -> bool {
+    let _profile = crate::profiling::Timer::new("query.rerank.should_apply_neural_rerank");
     if hnsw_raw.len() < 2 {
         return false;
     }
@@ -82,7 +88,9 @@ pub(crate) fn should_apply_neural_rerank(
     (top - second).abs() < 0.05 || (top - fifth).abs() < 0.10
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn rerank_phase(s: &mut QueryPipelineState) {
+    let _profile = crate::profiling::Timer::new("query.rerank.rerank_phase");
     s.candidates.neural_scores = HashMap::new();
     if !s.state.config.lanes.enabled(Lane::Rerank) {
         s.diag.rerank_reason = RerankDecision::Disabled;
@@ -133,6 +141,9 @@ pub(crate) fn rerank_phase(s: &mut QueryPipelineState) {
         }
     };
     s.diag.rerank_reason = decision;
+    tracing::debug!(target: "tellodb::profile", event = "rerank_decision",
+        reason = ?decision, candidates = s.candidates.primary_hnsw_raw.len(),
+        applies = decision.applies(), auto_rerank);
     if decision.applies() {
         let stage_start = Instant::now();
         let neural_top = s.state.config.rerank.top;
@@ -153,13 +164,19 @@ pub(crate) fn rerank_phase(s: &mut QueryPipelineState) {
             .into_iter()
             .filter(|mid: &String| rerank_seen.insert(mid.clone()))
             .collect();
-        let lookup = s.tenant.lookup_by_memory_ids_batch(&active_seeds).unwrap_or_default();
+        let lookup = s
+            .tenant
+            .lookup_by_memory_ids_batch(&active_seeds)
+            .unwrap_or_else(|error| crate::profiling::fallback("rerank.optional_lookup", error));
         let obs_keys: Vec<(u64, String)> = active_seeds
             .iter()
             .filter_map(|mid: &String| lookup.get(mid).map(|(ts, _)| (*ts, mid.clone())))
             .take(neural_top)
             .collect();
-        let observations = s.tenant.get_observations_batch(&obs_keys).unwrap_or_default();
+        let observations = s
+            .tenant
+            .get_observations_batch(&obs_keys)
+            .unwrap_or_else(|error| crate::profiling::fallback("rerank.optional_lookup", error));
         let mut rerank_items = Vec::new();
         let mut rerank_texts = Vec::new();
         for mid in active_seeds {
@@ -171,11 +188,14 @@ pub(crate) fn rerank_phase(s: &mut QueryPipelineState) {
         for (item_chunk, text_chunk) in
             rerank_items.chunks(NEURAL_BATCH).zip(rerank_texts.chunks(NEURAL_BATCH))
         {
-            let scores = s
-                .state
-                .semantic
-                .predict_scores_batch(&s.query_text, text_chunk)
-                .unwrap_or_else(|_| vec![0.0; item_chunk.len()]);
+            let scores =
+                s.state.semantic.predict_scores_batch(&s.query_text, text_chunk).unwrap_or_else(
+                    |error| {
+                        tracing::warn!(target: "tellodb::profile", event = "quality_fallback",
+                        stage = "rerank.predict", error = ?error, candidates = item_chunk.len());
+                        vec![0.0; item_chunk.len()]
+                    },
+                );
             for (mid, score) in item_chunk.iter().cloned().zip(scores.into_iter()) {
                 s.candidates.neural_scores.insert(mid, score);
             }

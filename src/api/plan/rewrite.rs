@@ -3,6 +3,7 @@ use crate::core::text::{normalize_alpha_tokens, singularize_token};
 
 #[allow(clippy::too_many_lines)]
 pub fn rewrite_query_for_retrieval(query: &str) -> String {
+    let _profile = crate::profiling::Timer::new("api.plan.rewrite.rewrite_query_for_retrieval");
     let q = query.trim();
     let ql = q.to_lowercase();
 
@@ -121,6 +122,7 @@ pub fn rewrite_query_for_retrieval(query: &str) -> String {
 }
 
 pub fn build_hyde_query(query: &str, plan: &QueryPlan) -> Option<String> {
+    let _profile = crate::profiling::Timer::new("api.plan.rewrite.build_hyde_query");
     let lower = query.to_ascii_lowercase();
     let q = query.trim().trim_end_matches('?');
     let possessive_subject = extract_possessive_subject_phrase(q, &plan.subject_entities);

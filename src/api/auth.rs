@@ -22,6 +22,7 @@ pub struct AuthConfig {
 
 impl AuthConfig {
     pub fn from_config(config: &crate::config::Config) -> anyhow::Result<Self> {
+        let _profile = crate::profiling::Timer::new("api.auth.from_config");
         let api_key = match config.server.api_key.clone() {
             Some(key) => key,
             None if cfg!(debug_assertions) => {
@@ -39,12 +40,14 @@ impl AuthConfig {
     /// Server auth from `TELLODB_API_KEY`, with the legacy name accepted during migration. Debug
     /// builds fall back to the test key; release builds require a key.
     pub fn from_env() -> anyhow::Result<Self> {
+        let _profile = crate::profiling::Timer::new("api.auth.from_env");
         Self::from_config(&crate::config::Config::from_env()?)
     }
 
     /// For in-process use (embedded API, CLI, stdio MCP), where no request
     /// ever carries a key: a random key nobody knows.
     pub fn embedded() -> Self {
+        let _profile = crate::profiling::Timer::new("api.auth.embedded");
         let mut key = String::with_capacity(64);
         for _ in 0..4 {
             let _ = write!(key, "{:016x}", rand::random::<u64>());
@@ -53,11 +56,13 @@ impl AuthConfig {
     }
 
     pub fn is_required(&self) -> bool {
+        let _profile = crate::profiling::Timer::new("api.auth.is_required");
         self.api_key.is_some()
     }
 }
 
 pub fn request_api_key(headers: &HeaderMap) -> Option<&str> {
+    let _profile = crate::profiling::Timer::new("api.auth.request_api_key");
     if let Some(value) = headers.get("x-api-key").and_then(|value| value.to_str().ok()) {
         let trimmed = value.trim();
         if !trimmed.is_empty() {
@@ -77,6 +82,7 @@ pub fn request_api_key(headers: &HeaderMap) -> Option<&str> {
 }
 
 pub fn request_bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let _profile = crate::profiling::Timer::new("api.auth.request_bearer_token");
     let value = headers.get(AUTHORIZATION)?.to_str().ok()?;
     let (scheme, token) = value.split_once(' ')?;
     if !scheme.eq_ignore_ascii_case("bearer") {
@@ -91,6 +97,7 @@ pub fn request_bearer_token(headers: &HeaderMap) -> Option<&str> {
 }
 
 pub fn parse_cors_allow_origins(raw: Option<&str>) -> Vec<HeaderValue> {
+    let _profile = crate::profiling::Timer::new("api.auth.parse_cors_allow_origins");
     let configured = raw.map(str::trim).filter(|v| !v.is_empty()).unwrap_or("https://tellodb.com");
 
     let mut origins = configured
@@ -113,6 +120,7 @@ pub fn parse_cors_allow_origins(raw: Option<&str>) -> Vec<HeaderValue> {
 }
 
 pub fn build_cors_layer(origins: &[String]) -> CorsLayer {
+    let _profile = crate::profiling::Timer::new("api.auth.build_cors_layer");
     let configured = (!origins.is_empty()).then(|| origins.join(","));
     CorsLayer::new()
         .allow_origin(parse_cors_allow_origins(configured.as_deref()))
@@ -131,6 +139,7 @@ pub enum RequestPrincipal {
 }
 
 pub fn principal_user_id(principal: &RequestPrincipal) -> Option<&str> {
+    let _profile = crate::profiling::Timer::new("api.auth.principal_user_id");
     match principal {
         RequestPrincipal::UserApiKey(auth) => Some(auth.user_id.as_str()),
         RequestPrincipal::GlobalApiKey => None,
@@ -138,6 +147,7 @@ pub fn principal_user_id(principal: &RequestPrincipal) -> Option<&str> {
 }
 
 pub fn authorize_global_api_key(headers: &HeaderMap, auth: &AuthConfig) -> Result<(), StatusCode> {
+    let _profile = crate::profiling::Timer::new("api.auth.authorize_global_api_key");
     let Some(expected) = auth.api_key.as_deref() else {
         return Ok(());
     };
@@ -165,6 +175,7 @@ pub fn authorize_request(
     headers: &HeaderMap,
     state: &EngineState,
 ) -> Result<RequestPrincipal, StatusCode> {
+    let _profile = crate::profiling::Timer::new("api.auth.authorize_request");
     if authorize_global_api_key(headers, &state.auth).is_ok() {
         return Ok(RequestPrincipal::GlobalApiKey);
     }
@@ -193,6 +204,7 @@ pub fn authorize_request(
 /// only `[A-Za-z0-9_]`. Reject anything that does not, so a bug or future
 /// migration that lets an attacker-controlled value flow into SQL still fails.
 pub fn is_valid_user_id(user_id: &str) -> bool {
+    let _profile = crate::profiling::Timer::new("api.auth.is_valid_user_id");
     let len = user_id.len();
     if !(8..=128).contains(&len) {
         return false;
@@ -259,11 +271,13 @@ pub struct RateLimiter {
 
 impl RateLimiter {
     pub fn new() -> Self {
+        let _profile = crate::profiling::Timer::new("api.auth.new");
         Self { buckets: Mutex::new(HashMap::new()) }
     }
 
     /// Returns true if the request is allowed for `key` (per-key limits).
     pub fn allow(&self, key: &str) -> bool {
+        let _profile = crate::profiling::Timer::new("api.auth.allow");
         self.allow_with(key, RPS_PER_KEY, BURST_PER_KEY)
     }
 
@@ -280,10 +294,12 @@ impl RateLimiter {
     }
 
     pub fn len(&self) -> usize {
+        let _profile = crate::profiling::Timer::new("api.auth.len");
         self.buckets.lock().len()
     }
 
     pub fn is_empty(&self) -> bool {
+        let _profile = crate::profiling::Timer::new("api.auth.is_empty");
         self.len() == 0
     }
 }
@@ -301,6 +317,7 @@ pub fn client_address(
     peer: Option<std::net::SocketAddr>,
     trust_proxy: bool,
 ) -> String {
+    let _profile = crate::profiling::Timer::new("api.auth.client_address");
     if trust_proxy {
         if let Some(forwarded) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
             if let Some(first) =
@@ -318,6 +335,7 @@ pub fn check_rate_limit(
     headers: &HeaderMap,
     peer: Option<std::net::SocketAddr>,
 ) -> Result<(), StatusCode> {
+    let _profile = crate::profiling::Timer::new("api.auth.check_rate_limit");
     let provided = request_api_key(headers);
     if authorize_global_api_key(headers, &state.auth).is_ok() && state.auth.is_required() {
         return Ok(());
@@ -342,6 +360,7 @@ pub fn check_auth_rate_limit(
     headers: &HeaderMap,
     peer: Option<std::net::SocketAddr>,
 ) -> EngineResult<()> {
+    let _profile = crate::profiling::Timer::new("api.auth.check_auth_rate_limit");
     check_auth_rate_limit_with_limiter(
         &state.rate_limiter,
         headers,
@@ -371,6 +390,7 @@ pub fn record_usage_for_principal(
     principal: &RequestPrincipal,
     endpoint: &str,
 ) {
+    let _profile = crate::profiling::Timer::new("api.auth.record_usage_for_principal");
     if let RequestPrincipal::UserApiKey(auth) = principal {
         if let Err(err) = state.platform_write_tx.try_send(PlatformWriteOp::Usage {
             user_id: auth.user_id.clone(),
@@ -391,6 +411,7 @@ pub fn session_user_from_headers(
     state: &EngineState,
     headers: &HeaderMap,
 ) -> EngineResult<PublicUser> {
+    let _profile = crate::profiling::Timer::new("api.auth.session_user_from_headers");
     let token = request_bearer_token(headers).ok_or(EngineError::Unauthorized)?;
     match state.platform.resolve_session(token) {
         Ok(Some(user)) => Ok(user),

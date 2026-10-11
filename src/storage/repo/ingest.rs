@@ -94,8 +94,16 @@ pub(crate) fn fail_next_fact_write_for_test() {
 
 impl TenantStore {
     pub fn commit_ingest(&self, batches: &IngestBatches) -> Result<CommitOutcome> {
+        let _profile = crate::profiling::Timer::new("storage.repo.ingest.commit_ingest");
         let mut conn = self.get_conn()?;
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = {
+            let _wait = crate::profiling::Timer::new("sqlite.begin_immediate_wait");
+            conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?
+        };
+        tracing::debug!(target: "tellodb::profile", event = "sqlite_ingest_batch",
+            observations = batches.observations.len(), cards = batches.memory_card_batch.len(),
+            facts = batches.fact_batch.len(), routers = batches.session_router_updates.len(),
+            links = batches.memory_links_batch.len(), neighbour_updates = batches.neighbour_embedding_updates.len());
         let vector_ids = insert_observations_tx(&tx, &batches.observations)?;
         insert_cards_tx(&tx, &batches.memory_card_batch)?;
         // Router FTS docs are written durably inside merge_router_records_tx
@@ -139,7 +147,10 @@ impl TenantStore {
         update_card_latest_tx(&tx, &latest_updates)?;
 
         insert_card_edges_tx(&tx, &batches.memory_card_batch, &fact_batch)?;
-        tx.commit()?;
+        {
+            let _commit = crate::profiling::Timer::new("sqlite.transaction_commit");
+            tx.commit()?;
+        }
 
         let mut vector_batch: HashMap<String, Vec<(u64, Vec<f32>)>> = HashMap::new();
         for ((_, _, observation), vector_id) in batches.observations.iter().zip(&vector_ids) {
@@ -174,6 +185,7 @@ impl TenantStore {
     }
 
     pub fn mark_indexed(&self, memory_ids: &[String]) -> Result<()> {
+        let _profile = crate::profiling::Timer::new("storage.repo.ingest.mark_indexed");
         if memory_ids.is_empty() {
             return Ok(());
         }
@@ -191,6 +203,7 @@ impl TenantStore {
     }
 
     pub fn reindex_unindexed(&self, limit: usize) -> Result<usize> {
+        let _profile = crate::profiling::Timer::new("storage.repo.ingest.reindex_unindexed");
         if limit == 0 {
             return Ok(0);
         }
@@ -227,6 +240,7 @@ impl TenantStore {
     }
 
     pub fn reindex_memory_ids(&self, memory_ids: &[String]) -> Result<usize> {
+        let _profile = crate::profiling::Timer::new("storage.repo.ingest.reindex_memory_ids");
         if memory_ids.is_empty() {
             return Ok(0);
         }
@@ -260,6 +274,7 @@ impl TenantStore {
     }
 
     fn reindex_rows(&self, rows: &[PendingIndexRow]) -> Result<usize> {
+        let _profile = crate::profiling::Timer::new("storage.repo.ingest.reindex_rows");
         if rows.is_empty() {
             return Ok(0);
         }
@@ -340,6 +355,7 @@ pub(crate) fn insert_observations_tx(
     tx: &Transaction<'_>,
     items: &[(u64, String, AgentObservation)],
 ) -> Result<Vec<Option<u64>>> {
+    let _profile = crate::profiling::Timer::new("storage.repo.ingest.insert_observations_tx");
     let recorded_at = unix_timestamp_ms()?;
     let mut rowids = Vec::with_capacity(items.len());
     let mut select_stmt = tx.prepare_cached("SELECT rowid FROM memories WHERE memory_id = ?1")?;
@@ -416,6 +432,7 @@ pub(crate) fn insert_observations_tx(
 }
 
 fn insert_cards_tx(tx: &Transaction<'_>, cards: &[MemoryCard]) -> Result<()> {
+    let _profile = crate::profiling::Timer::new("storage.repo.ingest.insert_cards_tx");
     let mut stmt = tx.prepare_cached(
         "INSERT OR REPLACE INTO memory_cards (
             card_id, entity_id, user_id, source_memory_id, source_session_id,
@@ -463,6 +480,7 @@ fn insert_metrics_tx(
     memory_ids: &[String],
     metrics: &[IngestMetric],
 ) -> Result<()> {
+    let _profile = crate::profiling::Timer::new("storage.repo.ingest.insert_metrics_tx");
     let mut delete = tx.prepare_cached("DELETE FROM metrics WHERE memory_id = ?1")?;
     let mut insert = tx.prepare_cached(
         "INSERT INTO metrics
@@ -494,6 +512,8 @@ fn insert_consolidation_tasks_tx(
     tx: &Transaction<'_>,
     tasks: &[IngestConsolidationTask],
 ) -> Result<()> {
+    let _profile =
+        crate::profiling::Timer::new("storage.repo.ingest.insert_consolidation_tasks_tx");
     let mut insert = tx.prepare_cached(
         "INSERT OR REPLACE INTO consolidation_queue
             (memory_id, entity_id, timestamp_ms, textual_content)
@@ -514,6 +534,8 @@ fn update_neighbour_embeddings_tx(
     tx: &Transaction<'_>,
     updates: &[(String, Vec<f32>)],
 ) -> Result<Vec<NeighbourVector>> {
+    let _profile =
+        crate::profiling::Timer::new("storage.repo.ingest.update_neighbour_embeddings_tx");
     let mut applied = Vec::new();
     let mut select =
         tx.prepare_cached("SELECT vector_id, entity_id FROM vector_lookup WHERE memory_id = ?1")?;
@@ -539,6 +561,7 @@ pub(super) fn merge_router_records_tx(
     tx: &Transaction<'_>,
     updates: &[SessionRouterRecord],
 ) -> Result<Vec<SessionRouterRecord>> {
+    let _profile = crate::profiling::Timer::new("storage.repo.ingest.merge_router_records_tx");
     let mut merged_records = Vec::with_capacity(updates.len());
     let mut select_stmt = tx.prepare_cached(
         "SELECT record_json FROM session_router WHERE session_id = ?1 AND entity_id = ?2",
@@ -640,6 +663,7 @@ fn insert_preferences_tx(
     tx: &Transaction<'_>,
     preferences: &HashMap<String, Vec<(String, f32)>>,
 ) -> Result<()> {
+    let _profile = crate::profiling::Timer::new("storage.repo.ingest.insert_preferences_tx");
     let mut stmt = tx.prepare_cached(
         "INSERT OR REPLACE INTO preferences (entity_id, memory_id, strength)
          VALUES (?1, ?2, ?3)",
@@ -653,6 +677,7 @@ fn insert_preferences_tx(
 }
 
 fn insert_memory_links_tx(tx: &Transaction<'_>, links: &[(String, String, String)]) -> Result<()> {
+    let _profile = crate::profiling::Timer::new("storage.repo.ingest.insert_memory_links_tx");
     let mut stmt = tx.prepare_cached(
         "INSERT OR IGNORE INTO memory_links
             (source_memory_id, target_memory_id, link_type)
@@ -668,6 +693,7 @@ fn register_facts_tx(
     tx: &Transaction<'_>,
     facts: &[IngestFactRegistration],
 ) -> Result<Vec<(String, bool, u64)>> {
+    let _profile = crate::profiling::Timer::new("storage.repo.ingest.register_facts_tx");
     if facts.is_empty() {
         return Ok(Vec::new());
     }
@@ -760,6 +786,7 @@ fn register_facts_tx(
 }
 
 fn update_card_latest_tx(tx: &Transaction<'_>, updates: &[(String, bool, u64)]) -> Result<()> {
+    let _profile = crate::profiling::Timer::new("storage.repo.ingest.update_card_latest_tx");
     let mut stmt = tx.prepare_cached(
         "UPDATE memory_cards SET is_latest = ?1, updated_at_ms = ?2 WHERE card_id = ?3",
     )?;
@@ -774,6 +801,7 @@ fn insert_card_edges_tx(
     cards: &[MemoryCard],
     facts: &[IngestFactRegistration],
 ) -> Result<()> {
+    let _profile = crate::profiling::Timer::new("storage.repo.ingest.insert_card_edges_tx");
     let mut stmt = tx.prepare_cached(
         "INSERT OR IGNORE INTO edges
             (edge_id, source, target, edge_type, label, status, timestamp_ms, memory_id)
@@ -817,6 +845,7 @@ fn insert_card_edges_tx(
 }
 
 fn insert_graph_entries_tx(tx: &Transaction<'_>, entries: &[IngestGraphEdge]) -> Result<()> {
+    let _profile = crate::profiling::Timer::new("storage.repo.ingest.insert_graph_entries_tx");
     let mut stmt = tx.prepare_cached(
         "INSERT OR REPLACE INTO edges
             (edge_id, source, target, edge_type, label, status, ref_source, ref_target, timestamp_ms, memory_id, weight)

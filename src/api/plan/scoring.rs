@@ -17,6 +17,7 @@ use crate::ml::QueryIntentClassifier;
 use crate::storage::MemoryKind;
 
 pub fn build_query_adaptive_profile(_query: &str, plan: &QueryPlan) -> QueryAdaptiveProfile {
+    let _profile = crate::profiling::Timer::new("api.plan.scoring.build_query_adaptive_profile");
     let lexical_density = (plan.lexical_terms.len() as f32 / 10.0).clamp(0.0, 1.0);
     let has_numeric_cues =
         matches!(plan.intent, QueryIntent::NumericAggregation | QueryIntent::TemporalAggregation);
@@ -61,6 +62,7 @@ pub fn fuse_four_signals(
     graph: f32,
     weights: &FourSignalWeights,
 ) -> f32 {
+    let _profile = crate::profiling::Timer::new("api.plan.scoring.fuse_four_signals");
     semantic * weights.semantic
         + temporal * weights.temporal
         + confidence * weights.confidence
@@ -74,6 +76,7 @@ pub fn compute_evidence_confidence<S: BuildHasher>(
     scorables: &HashMap<String, ScorableObservation, S>,
 ) -> f32 {
     use super::builder::build_query_plan;
+    let _profile = crate::profiling::Timer::new("api.plan.scoring.compute_evidence_confidence");
     let lexical = build_query_plan(query, classifier);
     if results.is_empty() {
         return 0.0;
@@ -100,6 +103,7 @@ pub fn compute_evidence_confidence<S: BuildHasher>(
 }
 
 pub fn routed_session_from_memory_id(memory_id: &str) -> Option<String> {
+    let _profile = crate::profiling::Timer::new("api.plan.scoring.routed_session_from_memory_id");
     MemoryId::parse(memory_id)
         .ok()
         .filter(crate::core::memory_id::MemoryId::is_structured)
@@ -107,6 +111,7 @@ pub fn routed_session_from_memory_id(memory_id: &str) -> Option<String> {
 }
 
 pub fn extract_numeric_tokens(text: &str) -> Vec<f32> {
+    let _profile = crate::profiling::Timer::new("api.plan.scoring.extract_numeric_tokens");
     let mut values = Vec::new();
     let mut current = String::new();
     for ch in text.chars() {
@@ -128,6 +133,7 @@ pub fn extract_numeric_tokens(text: &str) -> Vec<f32> {
 }
 
 pub fn numeric_signal_bonus(lower: &str, nums: &[f32], intent: QueryIntent) -> f32 {
+    let _profile = crate::profiling::Timer::new("api.plan.scoring.numeric_signal_bonus");
     if !matches!(intent, QueryIntent::NumericAggregation | QueryIntent::TemporalAggregation) {
         return 0.0;
     }
@@ -154,6 +160,7 @@ pub fn temporal_consistency_adjustment(
     now_ms: u64,
     intent: QueryIntent,
 ) -> f32 {
+    let _profile = crate::profiling::Timer::new("api.plan.scoring.temporal_consistency_adjustment");
     let age_days = (now_ms.saturating_sub(created_at_ms)) as f32 / (1000.0 * 86_400.0);
     let temporal_query = matches!(intent, QueryIntent::TemporalAggregation);
     let numeric_query = matches!(intent, QueryIntent::NumericAggregation);
@@ -176,6 +183,7 @@ pub fn temporal_consistency_adjustment(
 }
 
 pub fn kind_query_bonus(kind: MemoryKind, plan: &QueryPlan, obs: &ScorableObservation) -> f32 {
+    let _profile = crate::profiling::Timer::new("api.plan.scoring.kind_query_bonus");
     let mut bonus = if plan.prefer_distilled {
         match kind {
             MemoryKind::Fact => 0.12,
@@ -214,6 +222,7 @@ pub fn kind_query_bonus(kind: MemoryKind, plan: &QueryPlan, obs: &ScorableObserv
 }
 
 pub fn lexical_hit_count(obs: &ScorableObservation, plan: &QueryPlan) -> usize {
+    let _profile = crate::profiling::Timer::new("api.plan.scoring.lexical_hit_count");
     if plan.lexical_terms.is_empty() {
         return 0;
     }
@@ -221,6 +230,7 @@ pub fn lexical_hit_count(obs: &ScorableObservation, plan: &QueryPlan) -> usize {
 }
 
 pub fn lexical_overlap_bonus(obs: &ScorableObservation, plan: &QueryPlan) -> f32 {
+    let _profile = crate::profiling::Timer::new("api.plan.scoring.lexical_overlap_bonus");
     if plan.lexical_terms.is_empty() {
         return 0.0;
     }
@@ -230,6 +240,7 @@ pub fn lexical_overlap_bonus(obs: &ScorableObservation, plan: &QueryPlan) -> f32
 }
 
 pub fn entity_hit_count(obs: &ScorableObservation, plan: &QueryPlan) -> usize {
+    let _profile = crate::profiling::Timer::new("api.plan.scoring.entity_hit_count");
     if plan.subject_entities.is_empty() {
         return 0;
     }
@@ -243,6 +254,7 @@ pub fn entity_hit_count(obs: &ScorableObservation, plan: &QueryPlan) -> usize {
 }
 
 pub fn entity_coverage_bonus(obs: &ScorableObservation, plan: &QueryPlan) -> f32 {
+    let _profile = crate::profiling::Timer::new("api.plan.scoring.entity_coverage_bonus");
     if plan.subject_entities.is_empty() {
         return 0.0;
     }
@@ -265,6 +277,7 @@ pub fn entity_coverage_bonus(obs: &ScorableObservation, plan: &QueryPlan) -> f32
 }
 
 pub fn facet_match_mask(obs: &ScorableObservation, plan: &QueryPlan) -> u64 {
+    let _profile = crate::profiling::Timer::new("api.plan.scoring.facet_match_mask");
     if plan.coverage_facets.is_empty() {
         return 0;
     }
@@ -295,6 +308,7 @@ pub fn facet_match_mask(obs: &ScorableObservation, plan: &QueryPlan) -> u64 {
 }
 
 pub fn temporal_hit_count(obs: &ScorableObservation, plan: &QueryPlan) -> usize {
+    let _profile = crate::profiling::Timer::new("api.plan.scoring.temporal_hit_count");
     if plan.temporal_terms.is_empty() {
         return 0;
     }
@@ -303,6 +317,7 @@ pub fn temporal_hit_count(obs: &ScorableObservation, plan: &QueryPlan) -> usize 
 
 pub fn ordinal_signal_bonus(kind: MemoryKind, obs: &ScorableObservation, plan: &QueryPlan) -> f32 {
     use super::intent::ordinal_word;
+    let _profile = crate::profiling::Timer::new("api.plan.scoring.ordinal_signal_bonus");
 
     let Some(rank) = plan.ordinal_rank else {
         return 0.0;
@@ -344,6 +359,7 @@ pub fn ordinal_signal_bonus(kind: MemoryKind, obs: &ScorableObservation, plan: &
 }
 
 pub fn query_variant_weight(index: usize, modality: QueryModality, intent: QueryIntent) -> f32 {
+    let _profile = crate::profiling::Timer::new("api.plan.scoring.query_variant_weight");
     let base = match index {
         0 => 1.0,
         1 => 0.74,
@@ -369,6 +385,7 @@ pub fn query_variant_weight(index: usize, modality: QueryModality, intent: Query
 }
 
 pub fn adaptive_rrf_k(plan: &QueryPlan) -> usize {
+    let _profile = crate::profiling::Timer::new("api.plan.scoring.adaptive_rrf_k");
     if plan.cross_entity || plan.ordinal_rank.is_some() {
         45
     } else {
@@ -383,6 +400,7 @@ pub fn adaptive_rrf_k(plan: &QueryPlan) -> usize {
 
 #[allow(clippy::too_many_lines)]
 pub fn session_coverage_bonus(items: &[EvidenceCard], plan: &QueryPlan) -> f32 {
+    let _profile = crate::profiling::Timer::new("api.plan.scoring.session_coverage_bonus");
     if items.is_empty() {
         return 0.0;
     }
@@ -508,6 +526,7 @@ pub fn weighted_reciprocal_rank_fusion(
     ranked_lists: Vec<(f32, Vec<RankedItem>)>,
     k: usize,
 ) -> Vec<(String, u64, f32)> {
+    let _profile = crate::profiling::Timer::new("api.plan.scoring.weighted_reciprocal_rank_fusion");
     let mut rrf_scores: HashMap<String, (u64, f32)> = HashMap::new();
 
     for (weight, list) in ranked_lists {
@@ -533,6 +552,7 @@ pub fn weighted_reciprocal_rank_fusion(
 }
 
 pub fn kind_priority(kind: MemoryKind, prefer_distilled: bool) -> u8 {
+    let _profile = crate::profiling::Timer::new("api.plan.scoring.kind_priority");
     if prefer_distilled {
         match kind {
             MemoryKind::Fact => 4,
@@ -553,6 +573,7 @@ pub fn kind_priority(kind: MemoryKind, prefer_distilled: bool) -> u8 {
 }
 
 pub fn session_requirement_mask(items: &[EvidenceCard], plan: &QueryPlan) -> u64 {
+    let _profile = crate::profiling::Timer::new("api.plan.scoring.session_requirement_mask");
     if plan.requirements.is_empty() {
         return 0;
     }
@@ -617,6 +638,8 @@ pub fn reorder_session_items_for_requirements(
     items: &[EvidenceCard],
     plan: &QueryPlan,
 ) -> Vec<EvidenceCard> {
+    let _profile =
+        crate::profiling::Timer::new("api.plan.scoring.reorder_session_items_for_requirements");
     if plan.requirements.is_empty() {
         return items.to_vec();
     }
@@ -655,6 +678,8 @@ pub fn select_candidates_with_session_head(
     prefer_distilled: bool,
     prefer_episodic: bool,
 ) -> Vec<EvidenceCard> {
+    let _profile =
+        crate::profiling::Timer::new("api.plan.scoring.select_candidates_with_session_head");
     if limit == 0 || candidates.is_empty() {
         return Vec::new();
     }
@@ -940,6 +965,7 @@ pub fn build_observation_block(
     mem_scenes: &[String],
     top_chunks: &[String],
 ) -> String {
+    let _profile = crate::profiling::Timer::new("api.plan.scoring.build_observation_block");
     let mut block = String::from("## [TELLODB MEMORY CONTEXT]\n");
 
     if let Some(profile) = profile_json {
@@ -970,6 +996,7 @@ pub fn build_observation_block(
 }
 
 pub fn is_coverage_style_query(query: &str) -> bool {
+    let _profile = crate::profiling::Timer::new("api.plan.scoring.is_coverage_style_query");
     let lower = query.to_ascii_lowercase();
     let starts = [
         "what items",
@@ -1042,6 +1069,7 @@ pub fn is_coverage_style_query(query: &str) -> bool {
 }
 
 pub fn query_prefers_distilled(query: &str) -> bool {
+    let _profile = crate::profiling::Timer::new("api.plan.scoring.query_prefers_distilled");
     let lower = query.to_ascii_lowercase();
     let tokens = normalize_alpha_tokens(query);
 
@@ -1070,6 +1098,7 @@ pub fn query_prefers_distilled(query: &str) -> bool {
 }
 
 pub fn query_prefers_episodic(query: &str) -> bool {
+    let _profile = crate::profiling::Timer::new("api.plan.scoring.query_prefers_episodic");
     let lower = query.to_ascii_lowercase();
     let tokens = normalize_alpha_tokens(query);
 
@@ -1091,6 +1120,7 @@ pub fn query_prefers_episodic(query: &str) -> bool {
 }
 
 pub fn extract_subject_entities(query: &str) -> Vec<String> {
+    let _profile = crate::profiling::Timer::new("api.plan.scoring.extract_subject_entities");
     let stop = [
         "what", "when", "where", "who", "why", "how", "which", "would", "could", "should", "did",
         "does", "is", "are", "was", "were", "can", "will", "might", "likely", "both", "and", "or",

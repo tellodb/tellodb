@@ -2,6 +2,7 @@ use super::prelude::*;
 
 impl TenantStore {
     pub fn ingest_cards(&self, cards: &[MemoryCard]) -> Result<()> {
+        let _profile = crate::profiling::Timer::new("storage.repo.cards.ingest_cards");
         let mut conn = self.get_conn()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         {
@@ -54,6 +55,7 @@ impl TenantStore {
     }
 
     pub fn get_memory_card(&self, card_id: &str) -> Result<Option<MemoryCard>> {
+        let _profile = crate::profiling::Timer::new("storage.repo.cards.get_memory_card");
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT card_id, entity_id, user_id, source_memory_id, source_session_id,
@@ -72,6 +74,8 @@ impl TenantStore {
     }
 
     pub fn set_memory_card_latest_batch(&self, updates: &[(String, bool, u64)]) -> Result<()> {
+        let _profile =
+            crate::profiling::Timer::new("storage.repo.cards.set_memory_card_latest_batch");
         let mut conn = self.get_conn()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         {
@@ -91,6 +95,7 @@ impl TenantStore {
         &self,
         query: &MemoryCardSearchInput<'_>,
     ) -> Result<Vec<MemoryCardSearchHit>> {
+        let _profile = crate::profiling::Timer::new("storage.repo.cards.search_memory_cards");
         if query.limit == 0 {
             return Ok(Vec::new());
         }
@@ -221,6 +226,7 @@ impl TenantStore {
     }
 
     pub fn get_memory_card_by_source(&self, source_memory_id: &str) -> Result<Option<MemoryCard>> {
+        let _profile = crate::profiling::Timer::new("storage.repo.cards.get_memory_card_by_source");
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT card_id, entity_id, user_id, source_memory_id, source_session_id,
@@ -243,6 +249,7 @@ impl TenantStore {
         &self,
         card_ids: &[String],
     ) -> Result<std::collections::HashMap<String, MemoryCard>> {
+        let _profile = crate::profiling::Timer::new("storage.repo.cards.get_memory_cards_batch");
         if card_ids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }

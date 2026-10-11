@@ -21,6 +21,7 @@ pub(crate) struct ScopedAnnState {
 type AnnWorkerResult = (usize, Vec<String>, Vec<RankedItem>, Vec<(u64, f32)>, u64, u64);
 
 fn scoped_semantic_start(config: &crate::config::RetrievalConfig, max_top: usize) -> usize {
+    let _profile = crate::profiling::Timer::new("query.retrieve.scoped_semantic_start");
     config.scoped_semantic_start.min(max_top)
 }
 
@@ -29,10 +30,12 @@ fn scoped_semantic_min_hits(
     limit: usize,
     max_top: usize,
 ) -> usize {
+    let _profile = crate::profiling::Timer::new("query.retrieve.scoped_semantic_min_hits");
     config.scoped_min_hits.unwrap_or_else(|| limit.saturating_mul(2).max(24)).min(max_top)
 }
 
 fn should_stop_scoped_ann(config: &crate::config::RetrievalConfig, state: &ScopedAnnState) -> bool {
+    let _profile = crate::profiling::Timer::new("query.retrieve.should_stop_scoped_ann");
     if state.current_top >= state.max_top || state.attempt >= config.scoped_stop_max_attempts {
         return true;
     }
@@ -58,6 +61,7 @@ fn should_stop_scoped_ann(config: &crate::config::RetrievalConfig, state: &Scope
 }
 
 pub(crate) fn retrieval_phase(s: &mut QueryPipelineState) {
+    let _profile = crate::profiling::Timer::new("query.retrieve.retrieval_phase");
     retrieval_ann(s);
     retrieval_fts(s);
     retrieval_cards(s);
@@ -65,6 +69,7 @@ pub(crate) fn retrieval_phase(s: &mut QueryPipelineState) {
 
 #[allow(clippy::too_many_lines)]
 fn retrieval_ann(s: &mut QueryPipelineState) {
+    let _profile = crate::profiling::Timer::new("query.retrieve.retrieval_ann");
     if !s.state.config.lanes.enabled(Lane::Vector) {
         return;
     }
@@ -122,7 +127,7 @@ fn retrieval_ann(s: &mut QueryPipelineState) {
                 let embedding = embedding.clone();
                 let eid = eid.clone();
                 let retrieval_config = retrieval_config.clone();
-                let handle = sc.spawn(move || {
+                let handle = crate::profiling::spawn_scoped(sc, move || {
                     let mut hnsw_hits = Vec::new();
                     let mut variant_rerank_seed_ids = Vec::new();
                     let mut local_cache: HashMap<u64, Option<(u64, String)>> = HashMap::new();
@@ -253,7 +258,9 @@ fn retrieval_ann(s: &mut QueryPipelineState) {
                             let looked_ids: Vec<String> =
                                 looked.iter().flatten().map(|(_, m)| m.clone()).collect();
                             let identity =
-                                tenant.memory_identity_batch(&looked_ids).unwrap_or_default();
+                                tenant.memory_identity_batch(&looked_ids).unwrap_or_else(|error| {
+                                    crate::profiling::fallback("retrieve.optional_lookup", error)
+                                });
                             for (rank, (_vid, dist)) in hnsw_raw.iter().enumerate() {
                                 if let Some((ts, mem_id)) = looked[rank].clone() {
                                     // Post-ANN similarity floor: drop zero/near-zero hits
@@ -322,6 +329,7 @@ fn retrieval_ann(s: &mut QueryPipelineState) {
 }
 
 fn retrieval_fts(s: &mut QueryPipelineState) {
+    let _profile = crate::profiling::Timer::new("query.retrieve.retrieval_fts");
     if !s.state.config.lanes.enabled(Lane::Fts) {
         return;
     }
@@ -343,7 +351,7 @@ fn retrieval_fts(s: &mut QueryPipelineState) {
             for (idx, fts_query) in fts_queries_to_run.into_iter().enumerate() {
                 let tenant = tenant_clone.clone();
                 let eid = eid.clone();
-                handles.push(sc.spawn(move || {
+                handles.push(crate::profiling::spawn_scoped(sc, move || {
                     let hits = tenant
                         .fts_search_at(
                             fts_query.as_str(),
@@ -377,8 +385,10 @@ fn retrieval_fts(s: &mut QueryPipelineState) {
             fts_memory_ids_to_lookup.push(mid.clone());
         }
     }
-    let fts_lookup =
-        s.tenant.lookup_by_memory_ids_batch(&fts_memory_ids_to_lookup).unwrap_or_default();
+    let fts_lookup = s
+        .tenant
+        .lookup_by_memory_ids_batch(&fts_memory_ids_to_lookup)
+        .unwrap_or_else(|error| crate::profiling::fallback("retrieve.optional_lookup", error));
     for (idx, hits) in fts_results_per_query.into_iter().enumerate() {
         let mut ranked_hits = Vec::new();
         for (mid, _) in hits {
@@ -397,6 +407,7 @@ fn retrieval_fts(s: &mut QueryPipelineState) {
 }
 
 fn retrieval_cards(s: &mut QueryPipelineState) {
+    let _profile = crate::profiling::Timer::new("query.retrieve.retrieval_cards");
     let stage_start = Instant::now();
     let mut card_ranked_items = Vec::new();
     let entity_scope = s.payload.entity_id.as_ref().filter(|_| {
@@ -419,7 +430,7 @@ fn retrieval_cards(s: &mut QueryPipelineState) {
                 now_ms: s.now_ms,
                 limit: s.budget.card_limit,
             })
-            .unwrap_or_default();
+            .unwrap_or_else(|error| crate::profiling::fallback("retrieve.optional_lookup", error));
         s.diag.memory_card_hits = card_hits.len() as u64;
         for hit in card_hits {
             card_ranked_items.push(RankedItem { memory_id: hit.card_id, timestamp: hit.timestamp });

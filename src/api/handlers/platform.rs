@@ -22,6 +22,7 @@ pub async fn platform_signup_handler(
     peer: Option<Extension<ConnectInfo<std::net::SocketAddr>>>,
     Json(payload): Json<PlatformSignupPayload>,
 ) -> EngineResult<impl IntoResponse> {
+    let _profile = crate::profiling::Timer::new("api.handlers.platform.platform_signup_handler");
     auth::check_auth_rate_limit(
         &state,
         &headers,
@@ -53,6 +54,7 @@ pub async fn platform_login_handler(
     peer: Option<Extension<ConnectInfo<std::net::SocketAddr>>>,
     Json(payload): Json<PlatformLoginPayload>,
 ) -> EngineResult<impl IntoResponse> {
+    let _profile = crate::profiling::Timer::new("api.handlers.platform.platform_login_handler");
     auth::check_auth_rate_limit(
         &state,
         &headers,
@@ -83,6 +85,7 @@ pub async fn platform_logout_handler(
     State(state): State<EngineState>,
     headers: HeaderMap,
 ) -> EngineResult<impl IntoResponse> {
+    let _profile = crate::profiling::Timer::new("api.handlers.platform.platform_logout_handler");
     let token = auth::request_bearer_token(&headers).ok_or(EngineError::Unauthorized)?;
     state.platform.delete_session(token).map_err(|error| {
         tracing::warn!(error = ?error, "platform logout failed");
@@ -95,6 +98,7 @@ pub async fn platform_me_handler(
     State(state): State<EngineState>,
     headers: HeaderMap,
 ) -> EngineResult<impl IntoResponse> {
+    let _profile = crate::profiling::Timer::new("api.handlers.platform.platform_me_handler");
     let user = session_user_from_headers(&state, &headers)?;
     Ok((StatusCode::OK, Json(user)))
 }
@@ -104,6 +108,8 @@ pub async fn platform_create_api_key_handler(
     headers: HeaderMap,
     Json(payload): Json<PlatformCreateApiKeyPayload>,
 ) -> EngineResult<impl IntoResponse> {
+    let _profile =
+        crate::profiling::Timer::new("api.handlers.platform.platform_create_api_key_handler");
     let user = session_user_from_headers(&state, &headers)?;
     let (api_key, key) =
         state.platform.create_api_key(&user.user_id, payload.name.as_str()).map_err(|err| {
@@ -117,6 +123,8 @@ pub async fn platform_list_api_keys_handler(
     State(state): State<EngineState>,
     headers: HeaderMap,
 ) -> EngineResult<impl IntoResponse> {
+    let _profile =
+        crate::profiling::Timer::new("api.handlers.platform.platform_list_api_keys_handler");
     let user = session_user_from_headers(&state, &headers)?;
     let api_keys = state.platform.list_api_keys(&user.user_id).map_err(|err| {
         tracing::warn!("platform list api keys failed: {:?}", err);
@@ -130,6 +138,8 @@ pub async fn platform_revoke_api_key_handler(
     headers: HeaderMap,
     Path(key_id): Path<String>,
 ) -> EngineResult<impl IntoResponse> {
+    let _profile =
+        crate::profiling::Timer::new("api.handlers.platform.platform_revoke_api_key_handler");
     let user = session_user_from_headers(&state, &headers)?;
     state.platform.revoke_api_key(&user.user_id, key_id.as_str()).map_err(|err| {
         let msg = err.to_string();
@@ -147,6 +157,7 @@ pub async fn platform_stats_handler(
     State(state): State<EngineState>,
     headers: HeaderMap,
 ) -> EngineResult<impl IntoResponse> {
+    let _profile = crate::profiling::Timer::new("api.handlers.platform.platform_stats_handler");
     let user = session_user_from_headers(&state, &headers)?;
     let usage = state.platform.usage_stats(&user.user_id).map_err(|err| {
         tracing::warn!("platform usage stats failed: {:?}", err);
@@ -159,6 +170,7 @@ pub async fn platform_profile_handler(
     State(state): State<EngineState>,
     headers: HeaderMap,
 ) -> EngineResult<impl IntoResponse> {
+    let _profile = crate::profiling::Timer::new("api.handlers.platform.platform_profile_handler");
     let user = session_user_from_headers(&state, &headers)?;
     let profile = state.platform.user_profile(&user.user_id).map_err(|err| {
         tracing::warn!("platform profile failed: {:?}", err);

@@ -5,6 +5,8 @@ impl TenantStore {
         &self,
         limit: usize,
     ) -> Result<Vec<super::ingest::IngestConsolidationTask>> {
+        let _profile =
+            crate::profiling::Timer::new("storage.repo.admin.pending_consolidation_tasks");
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT entity_id, memory_id, timestamp_ms, textual_content
@@ -22,6 +24,8 @@ impl TenantStore {
     }
 
     pub fn complete_consolidation_task(&self, memory_id: &str) -> Result<()> {
+        let _profile =
+            crate::profiling::Timer::new("storage.repo.admin.complete_consolidation_task");
         let conn = self.get_conn()?;
         conn.execute("DELETE FROM consolidation_queue WHERE memory_id = ?1", params![memory_id])?;
         Ok(())
@@ -32,6 +36,8 @@ impl TenantStore {
         memory_id: &str,
         limit: usize,
     ) -> Result<Vec<crate::lifecycle::DeletionTombstone>> {
+        let _profile =
+            crate::profiling::Timer::new("storage.repo.admin.get_deletion_tombstones_for_target");
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT tombstone_json FROM deletion_tombstones WHERE target_memory_id = ?1 LIMIT ?2",
@@ -51,6 +57,7 @@ impl TenantStore {
     }
 
     pub fn clear_all(&self) -> Result<()> {
+        let _profile = crate::profiling::Timer::new("storage.repo.admin.clear_all");
         let mut conn = self.get_conn()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let tables: Vec<String> = {
@@ -73,6 +80,7 @@ impl TenantStore {
     }
 
     pub fn db_stats(&self) -> Result<crate::storage::types::CoreClusterStats> {
+        let _profile = crate::profiling::Timer::new("storage.repo.admin.db_stats");
         let conn = self.get_conn()?;
 
         let memory_count: i64 =
@@ -106,6 +114,7 @@ impl TenantStore {
     }
 
     pub fn detailed_db_stats(&self) -> Result<crate::api::types::StorageStatsResponse> {
+        let _profile = crate::profiling::Timer::new("storage.repo.admin.detailed_db_stats");
         let conn = self.get_conn()?;
         let count = |table: &str| -> i64 {
             conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
@@ -135,6 +144,7 @@ impl TenantStore {
     }
 
     pub fn expire_records(&self, now_ms: u64) -> Result<usize> {
+        let _profile = crate::profiling::Timer::new("storage.repo.admin.expire_records");
         let mut conn = self.get_conn()?;
         let mut updates = Vec::new();
         {
@@ -183,6 +193,7 @@ impl TenantStore {
     }
 
     pub fn purge_expired_memories(&self, now_ms: u64, limit: usize) -> Result<usize> {
+        let _profile = crate::profiling::Timer::new("storage.repo.admin.purge_expired_memories");
         let expired = {
             let conn = self.get_conn()?;
             let mut stmt = conn.prepare_cached(

@@ -111,6 +111,7 @@ pub struct MetricExtractor {
 impl MetricExtractor {
     #[allow(clippy::too_many_lines)]
     pub fn new() -> Self {
+        let _profile = crate::profiling::Timer::new("analytics.new");
         let dimensions = vec![
             Dimension {
                 label: "money",
@@ -240,6 +241,7 @@ impl MetricExtractor {
     /// never counted twice (e.g. "about 5 miles" once, not as distance and as
     /// an approximate value).
     pub fn extract(&self, text: &str) -> Vec<ExtractedMetric> {
+        let _profile = crate::profiling::Timer::new("analytics.extract");
         let mut accepted: Vec<(usize, usize, ExtractedMetric)> = Vec::new();
         let overlaps = |accepted: &[(usize, usize, ExtractedMetric)], s: usize, e: usize| {
             accepted.iter().any(|(as_, ae, _)| s < *ae && *as_ < e)
@@ -345,10 +347,12 @@ pub struct MetricVault {
 
 impl MetricVault {
     pub fn new(tenant_manager: Arc<TenantDatabaseManager>) -> Self {
+        let _profile = crate::profiling::Timer::new("analytics.new");
         Self { tenant_manager, extractor: MetricExtractor::new() }
     }
 
     pub fn extractor(&self) -> &MetricExtractor {
+        let _profile = crate::profiling::Timer::new("analytics.extractor");
         &self.extractor
     }
 
@@ -362,6 +366,7 @@ impl MetricVault {
         timestamp_ms: u64,
         text: &str,
     ) -> Result<usize> {
+        let _profile = crate::profiling::Timer::new("analytics.record_memory");
         let metrics = self.extractor.extract(text);
         let mut conn = tenant.get_conn()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -400,6 +405,7 @@ impl MetricVault {
         start_ms: u64,
         end_ms: u64,
     ) -> Result<AggregateResult> {
+        let _profile = crate::profiling::Timer::new("analytics.aggregate_range");
         let tenant = self.tenant(tenant_id)?;
         let conn = tenant.get_conn()?;
         let row = conn.query_row(
@@ -426,6 +432,7 @@ impl MetricVault {
         end_ms: u64,
         bucket: TemporalBucket,
     ) -> Result<Vec<BucketedAggregate>> {
+        let _profile = crate::profiling::Timer::new("analytics.aggregate_bucketed");
         let bucket_ms = bucket.duration_ms() as i64;
         let aligned_start = (clamp_ms(start_ms) / bucket_ms) * bucket_ms;
         let tenant = self.tenant(tenant_id)?;

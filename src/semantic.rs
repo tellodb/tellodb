@@ -47,6 +47,7 @@ impl ComputePermits {
     }
 
     fn acquire(&self) -> PermitGuard<'_> {
+        let _profile = crate::profiling::Timer::new("semantic.acquire");
         let mut available = self.available.lock();
         while *available == 0 {
             self.released.wait(&mut available);
@@ -78,6 +79,7 @@ pub struct EmbeddingCache {
 
 impl EmbeddingCache {
     pub fn new(path: Option<PathBuf>, enabled: bool) -> Self {
+        let _profile = crate::profiling::Timer::new("semantic.new");
         let conn = if enabled { path.and_then(|path| Self::open(&path)) } else { None };
         Self { conn: conn.map(Mutex::new), hits: AtomicU64::new(0), misses: AtomicU64::new(0) }
     }
@@ -113,6 +115,7 @@ impl EmbeddingCache {
     }
 
     pub fn is_enabled(&self) -> bool {
+        let _profile = crate::profiling::Timer::new("semantic.is_enabled");
         self.conn.is_some()
     }
 
@@ -123,10 +126,14 @@ impl EmbeddingCache {
         hashes: &[[u8; 32]],
         dim: usize,
     ) -> Vec<Option<Vec<f32>>> {
+        let _profile = crate::profiling::Timer::new("semantic.cache_get_many");
         let Some(conn) = self.conn.as_ref() else {
             return vec![None; hashes.len()];
         };
-        let conn = conn.lock();
+        let conn = {
+            let _wait = crate::profiling::Timer::new("semantic.cache_read_lock_wait");
+            conn.lock()
+        };
         let lookup = || -> rusqlite::Result<Vec<Option<Vec<f32>>>> {
             let mut stmt = conn.prepare_cached(
                 "SELECT embedding FROM embeddings WHERE model_key = ?1 AND text_hash = ?2",
@@ -155,10 +162,14 @@ impl EmbeddingCache {
     }
 
     pub fn put_many(&self, model_key: &str, items: &[([u8; 32], &[f32])]) {
+        let _profile = crate::profiling::Timer::new("semantic.cache_put_many");
         let Some(conn) = self.conn.as_ref() else {
             return;
         };
-        let mut conn = conn.lock();
+        let mut conn = {
+            let _wait = crate::profiling::Timer::new("semantic.cache_write_lock_wait");
+            conn.lock()
+        };
         let mut write = || -> rusqlite::Result<()> {
             let tx = conn.transaction()?;
             {
@@ -181,14 +192,17 @@ impl EmbeddingCache {
     }
 
     pub fn hits(&self) -> u64 {
+        let _profile = crate::profiling::Timer::new("semantic.hits");
         self.hits.load(Ordering::Relaxed)
     }
 
     pub fn misses(&self) -> u64 {
+        let _profile = crate::profiling::Timer::new("semantic.misses");
         self.misses.load(Ordering::Relaxed)
     }
 
     pub fn clear(&self) {
+        let _profile = crate::profiling::Timer::new("semantic.clear");
         if let Some(conn) = self.conn.as_ref() {
             if let Err(err) = conn.lock().execute("DELETE FROM embeddings", []) {
                 tracing::warn!(error = %err, "embedding cache clear failed");
@@ -200,6 +214,7 @@ impl EmbeddingCache {
 }
 
 pub fn parse_embedding_model(id: &str) -> Result<EmbeddingModel> {
+    let _profile = crate::profiling::Timer::new("semantic.parse_embedding_model");
     if let Ok(model) = EmbeddingModel::try_from(id.to_string()) {
         return Ok(model);
     }
@@ -329,6 +344,7 @@ pub(crate) fn execution_providers_for(
     use_gpu: bool,
     use_coreml: bool,
 ) -> Vec<ort::execution_providers::ExecutionProviderDispatch> {
+    let _profile = crate::profiling::Timer::new("semantic.execution_providers_for");
     let mut eps: Vec<ort::execution_providers::ExecutionProviderDispatch> = Vec::new();
     if use_gpu {
         eps.push(CUDA::default().into());
@@ -342,6 +358,7 @@ pub(crate) fn execution_providers_for(
 
 /// The device selected during model initialization, as `(use_gpu, use_coreml)`.
 pub(crate) fn selected_device() -> (bool, bool) {
+    let _profile = crate::profiling::Timer::new("semantic.selected_device");
     DEVICE_FLAGS.get().copied().unwrap_or((false, false))
 }
 
@@ -397,6 +414,7 @@ pub struct SemanticInference {
 
 impl SemanticInference {
     pub async fn new() -> Result<Self> {
+        let _profile = crate::profiling::Timer::new("semantic.new");
         let config = Config::from_env()?;
         let cache_path = config.embedding.cache_path.clone().or_else(|| {
             crate::runtime_paths::RuntimePaths::from_env()
@@ -407,6 +425,7 @@ impl SemanticInference {
     }
 
     pub async fn with_cache_path(cache_path: Option<PathBuf>) -> Result<Self> {
+        let _profile = crate::profiling::Timer::new("semantic.with_cache_path");
         let config = Config::from_env()?;
         Self::with_config(cache_path, &config.embedding, &config.rerank).await
     }
@@ -417,6 +436,7 @@ impl SemanticInference {
         embedding: &EmbeddingConfig,
         rerank: &RerankConfig,
     ) -> Result<Self> {
+        let _profile = crate::profiling::Timer::new("semantic.with_config");
         let embedding_model_id = embedding.model_id.clone();
         if cfg!(debug_assertions) && embedding_model_id.trim().eq_ignore_ascii_case("test") {
             return Ok(Self::test_stub(cache_path, embedding));
@@ -572,36 +592,44 @@ impl SemanticInference {
     }
 
     pub fn is_rerank_enabled(&self) -> bool {
+        let _profile = crate::profiling::Timer::new("semantic.is_rerank_enabled");
         !self.rerankers.is_empty()
     }
 
     /// The loaded reranker model id, or `off`.
     pub fn rerank_mode(&self) -> &'static str {
+        let _profile = crate::profiling::Timer::new("semantic.rerank_mode");
         self.rerank_model_id.unwrap_or("off")
     }
 
     pub fn embed_cache_hits(&self) -> u64 {
+        let _profile = crate::profiling::Timer::new("semantic.embed_cache_hits");
         self.cache.hits()
     }
 
     pub fn embed_cache_misses(&self) -> u64 {
+        let _profile = crate::profiling::Timer::new("semantic.embed_cache_misses");
         self.cache.misses()
     }
 
     pub fn clear_embedding_cache(&self) {
+        let _profile = crate::profiling::Timer::new("semantic.clear_embedding_cache");
         self.cache.clear();
     }
 
     pub fn generate_embedding(&self, text: &str) -> Result<Vec<f32>> {
+        let _profile = crate::profiling::Timer::new("semantic.generate_embedding");
         self.embed_texts(&[text])?.pop().context("embedding model returned no vector")
     }
 
     pub fn generate_query_embedding(&self, text: &str) -> Result<Vec<f32>> {
+        let _profile = crate::profiling::Timer::new("semantic.generate_query_embedding");
         self.embed_queries(&[text])?.pop().context("embedding model returned no vector")
     }
 
     /// Embeds search queries, applying the model's query instruction.
     pub fn embed_queries(&self, queries: &[&str]) -> Result<Vec<Vec<f32>>> {
+        let _profile = crate::profiling::Timer::new("semantic.embed_queries");
         if self.query_instruction.is_empty() {
             return self.embed_texts(queries);
         }
@@ -612,6 +640,7 @@ impl SemanticInference {
     }
 
     pub fn query_instruction(&self) -> &str {
+        let _profile = crate::profiling::Timer::new("semantic.query_instruction");
         &self.query_instruction
     }
 
@@ -619,6 +648,7 @@ impl SemanticInference {
     /// sorted by length and embedded in batches of `embed_batch`, spread over
     /// the executors. Every returned vector has `embedding_dim` finite values.
     pub fn embed_texts(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        let _profile = crate::profiling::Timer::new("semantic.embed_texts");
         if texts.is_empty() {
             return Ok(Vec::new());
         }
@@ -627,6 +657,11 @@ impl SemanticInference {
         let mut results = self.cache.get_many(&self.cache_model_key, &hashes, self.embedding_dim);
 
         let mut missing: Vec<usize> = (0..texts.len()).filter(|&i| results[i].is_none()).collect();
+        tracing::debug!(target: "tellodb::profile", event = "embedding_batch",
+            texts = texts.len(), cache_hits = texts.len() - missing.len(),
+            cache_misses = missing.len(), batch_size = self.embed_batch,
+            device = self.device_label, executors = self.executors.len(),
+            input_bytes = texts.iter().map(|text| text.len()).sum::<usize>());
         if missing.is_empty() {
             return Ok(results.into_iter().flatten().collect());
         }
@@ -647,7 +682,11 @@ impl SemanticInference {
                 std::thread::scope(|scope| {
                     let handles: Vec<_> = batches
                         .iter()
-                        .map(|batch| scope.spawn(move || self.embed_on_executor(texts, batch)))
+                        .map(|batch| {
+                            crate::profiling::spawn_scoped(scope, move || {
+                                self.embed_on_executor(texts, batch)
+                            })
+                        })
                         .collect();
                     handles
                         .into_iter()
@@ -679,10 +718,22 @@ impl SemanticInference {
     }
 
     fn embed_on_executor(&self, texts: &[&str], batch: &[usize]) -> Result<Vec<Vec<f32>>> {
-        let _permit = self.embed_permits.acquire();
+        let _profile = crate::profiling::Timer::new("semantic.embed_on_executor");
+        let _permit = {
+            let _wait = crate::profiling::Timer::new("semantic.embed_permit_wait");
+            self.embed_permits.acquire()
+        };
         let idx = self.next_executor.fetch_add(1, Ordering::Relaxed) % self.executors.len();
         let inputs: Vec<&str> = batch.iter().map(|&i| texts[i]).collect();
-        let vectors = self.executors[idx].lock().embed(&inputs, Some(inputs.len()))?;
+        let mut executor = {
+            let _wait = crate::profiling::Timer::new("semantic.embed_executor_lock_wait");
+            self.executors[idx].lock()
+        };
+        let inference = crate::profiling::Timer::new("semantic.embed_inference");
+        let vectors = executor.embed(&inputs, Some(inputs.len()))?;
+        drop(inference);
+        tracing::debug!(target: "tellodb::profile", event = "embedding_output",
+            executor = idx, inputs = inputs.len(), vectors = vectors.len(), dimension = self.embedding_dim);
         if vectors.len() != inputs.len() {
             anyhow::bail!(
                 "embedding model returned {} vectors for {} texts",
@@ -705,8 +756,9 @@ impl SemanticInference {
 
     /// `embed_texts` on the blocking pool, for async callers.
     pub async fn embed_texts_async(self: &Arc<Self>, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+        let _profile = crate::profiling::Timer::new("semantic.embed_texts_async");
         let this = Arc::clone(self);
-        tokio::task::spawn_blocking(move || {
+        crate::profiling::spawn_blocking(move || {
             let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
             this.embed_texts(&refs)
         })
@@ -715,36 +767,44 @@ impl SemanticInference {
     }
 
     pub fn embedding_dim(&self) -> usize {
+        let _profile = crate::profiling::Timer::new("semantic.embedding_dim");
         self.embedding_dim
     }
 
     pub fn embed_max_tokens(&self) -> usize {
+        let _profile = crate::profiling::Timer::new("semantic.embed_max_tokens");
         self.max_tokens
     }
 
     pub fn embed_batch_size(&self) -> usize {
+        let _profile = crate::profiling::Timer::new("semantic.embed_batch_size");
         self.embed_batch
     }
 
     pub fn embedding_model_id(&self) -> &str {
+        let _profile = crate::profiling::Timer::new("semantic.embedding_model_id");
         &self.embedding_model_id
     }
 
     pub fn device_label(&self) -> &str {
+        let _profile = crate::profiling::Timer::new("semantic.device_label");
         self.device_label
     }
 
     /// Device of the initialised models ("CPU" before initialisation).
     pub fn device_label_static() -> &'static str {
+        let _profile = crate::profiling::Timer::new("semantic.device_label_static");
         DEVICE_LABEL.get().copied().unwrap_or("CPU")
     }
 
     pub fn executor_count(&self) -> usize {
+        let _profile = crate::profiling::Timer::new("semantic.executor_count");
         self.executors.len()
     }
 
     #[allow(dead_code)]
     pub fn extract_entities(&self, _text: &str) -> Result<Vec<(String, String)>> {
+        let _profile = crate::profiling::Timer::new("semantic.extract_entities");
         Ok(Vec::new())
     }
 
@@ -756,6 +816,7 @@ impl SemanticInference {
     /// into roughly equal chunks and each chunk is run on a different
     /// executor in parallel via `std::thread::scope`.
     pub fn predict_scores_batch(&self, q: &str, texts: &[String]) -> Result<Vec<f32>> {
+        let _profile = crate::profiling::Timer::new("semantic.predict_scores_batch");
         if texts.is_empty() {
             return Ok(Vec::new());
         }
@@ -765,12 +826,17 @@ impl SemanticInference {
 
         let cache_key = rerank_cache_key(q, texts);
         if let Some(cached) = self.rerank_cache.lock().get(&cache_key) {
+            tracing::debug!(target: "tellodb::profile", event = "rerank_cache", hit = true, candidates = texts.len());
             return Ok((**cached).clone());
         }
+        tracing::debug!(target: "tellodb::profile", event = "rerank_cache", hit = false, candidates = texts.len());
 
         let n_exec = self.rerankers.len();
         let chunks = split_for_rerank(texts, n_exec);
-        let _permit = self.rerank_permits.acquire();
+        let _permit = {
+            let _wait = crate::profiling::Timer::new("semantic.rerank_permit_wait");
+            self.rerank_permits.acquire()
+        };
         let results: Vec<(usize, Vec<f32>)> = if chunks.len() == 1 {
             chunks
                 .into_iter()
@@ -783,7 +849,9 @@ impl SemanticInference {
                     .into_iter()
                     .enumerate()
                     .map(|(i, (offset, chunk))| {
-                        scope.spawn(move || Ok((offset, self.rerank_on_executor(i, q, &chunk)?)))
+                        crate::profiling::spawn_scoped(scope, move || {
+                            Ok((offset, self.rerank_on_executor(i, q, &chunk)?))
+                        })
                     })
                     .collect();
                 handles
@@ -812,10 +880,16 @@ impl SemanticInference {
         q: &str,
         texts: &[String],
     ) -> Result<Vec<f32>> {
+        let _profile = crate::profiling::Timer::new("semantic.rerank_on_executor");
         let rr = &self.rerankers[executor_idx % self.rerankers.len()];
-        let mut reranker = rr.lock();
+        let mut reranker = {
+            let _wait = crate::profiling::Timer::new("semantic.rerank_executor_lock_wait");
+            rr.lock()
+        };
         let doc_refs: Vec<&str> = texts.iter().map(std::string::String::as_str).collect();
+        let inference = crate::profiling::Timer::new("semantic.rerank_inference");
         let results = reranker.rerank(q, doc_refs, false, None)?;
+        drop(inference);
         let mut scores = vec![0.0f32; texts.len()];
         for res in results {
             if res.index < scores.len() {
@@ -1042,7 +1116,7 @@ mod tests {
         std::thread::scope(|scope| {
             for _ in 0..8 {
                 let (permits, active, peak) = (permits.clone(), active.clone(), peak.clone());
-                scope.spawn(move || {
+                crate::profiling::spawn_scoped(scope, move || {
                     let _guard = permits.acquire();
                     let now = active.fetch_add(1, Ordering::SeqCst) + 1;
                     peak.fetch_max(now, Ordering::SeqCst);

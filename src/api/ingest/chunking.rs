@@ -1,6 +1,7 @@
 use crate::api::types::IngestPayload;
 
 pub fn chunk_markdown(text: &str) -> Vec<String> {
+    let _profile = crate::profiling::Timer::new("api.ingest.chunking.chunk_markdown");
     let mut sections = Vec::new();
     let mut current = Vec::new();
     for line in text.lines() {
@@ -27,6 +28,7 @@ pub fn chunk_markdown(text: &str) -> Vec<String> {
 }
 
 pub fn chunk_code(text: &str) -> Vec<String> {
+    let _profile = crate::profiling::Timer::new("api.ingest.chunking.chunk_code");
     let boundary_prefixes = ["fn ", "pub fn ", "def ", "class ", "function ", "impl "];
     let mut blocks = Vec::new();
     let mut current = Vec::new();
@@ -55,6 +57,7 @@ pub fn chunk_code(text: &str) -> Vec<String> {
 }
 
 pub fn chunk_email(text: &str) -> Vec<String> {
+    let _profile = crate::profiling::Timer::new("api.ingest.chunking.chunk_email");
     let mut messages = Vec::new();
     let mut current = Vec::new();
     for line in text.lines() {
@@ -80,6 +83,7 @@ pub fn chunk_email(text: &str) -> Vec<String> {
 }
 
 pub fn chunk_table_like(text: &str) -> Vec<String> {
+    let _profile = crate::profiling::Timer::new("api.ingest.chunking.chunk_table_like");
     let lines = text.lines().map(std::string::ToString::to_string).collect::<Vec<_>>();
     if lines.len() <= 24 {
         return vec![text.to_string()];
@@ -88,6 +92,7 @@ pub fn chunk_table_like(text: &str) -> Vec<String> {
 }
 
 pub fn chunk_plain_or_chat(text: &str) -> Vec<String> {
+    let _profile = crate::profiling::Timer::new("api.ingest.chunking.chunk_plain_or_chat");
     let mut sentences = Vec::new();
     for sentence in text.split(['.', '!', '?', '\n']) {
         let s = sentence.trim();
@@ -119,6 +124,7 @@ pub fn chunk_plain_or_chat(text: &str) -> Vec<String> {
 }
 
 pub fn split_by_char_limit(lines: &[String], max_chars: usize) -> Vec<String> {
+    let _profile = crate::profiling::Timer::new("api.ingest.chunking.split_by_char_limit");
     let mut out = Vec::new();
     let mut current = String::new();
     for line in lines {
@@ -139,6 +145,7 @@ pub fn split_by_char_limit(lines: &[String], max_chars: usize) -> Vec<String> {
 }
 
 pub fn infer_content_type(payload: &IngestPayload) -> String {
+    let _profile = crate::profiling::Timer::new("api.ingest.chunking.infer_content_type");
     if let Some(ct) = payload.content_type.as_deref() {
         return ct.trim().to_ascii_lowercase();
     }
@@ -160,12 +167,15 @@ pub fn infer_content_type(payload: &IngestPayload) -> String {
 }
 
 pub fn build_chunk_memory_id(payload: &IngestPayload, idx: usize) -> String {
+    let _profile = crate::profiling::Timer::new("api.ingest.chunking.build_chunk_memory_id");
     // Chunks used to be numbered `turn*100 + idx`, which reused real turn ids
     // (chunk 1 of turn 0 overwrote turn 1).
     crate::core::memory_id::MemoryId::derived_from(&payload.memory_id, &format!("c{idx}"))
 }
 
 pub fn expand_payload_for_content_type(payload: &IngestPayload) -> Vec<IngestPayload> {
+    let _profile =
+        crate::profiling::Timer::new("api.ingest.chunking.expand_payload_for_content_type");
     let content_type = infer_content_type(payload);
     let chunks = match content_type.as_str() {
         "markdown" => chunk_markdown(&payload.textual_content),
@@ -196,6 +206,7 @@ mod moved_tests {
     use super::*;
 
     fn make_payload(text: &str) -> IngestPayload {
+        let _profile = crate::profiling::Timer::new("api.ingest.chunking.make_payload");
         IngestPayload {
             entity_id: "user".to_string(),
             memory_id: "user::session1::0".to_string(),

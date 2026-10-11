@@ -59,11 +59,13 @@ pub struct Memory {
 
 impl Memory {
     pub fn new(entity_id: impl Into<String>, text: impl Into<String>) -> Self {
+        let _profile = crate::profiling::Timer::new("db.new");
         Self { entity_id: entity_id.into(), text: text.into(), ..Default::default() }
     }
 
     #[must_use]
     pub fn session(mut self, session_id: impl Into<String>, turn_index: u32) -> Self {
+        let _profile = crate::profiling::Timer::new("db.session");
         self.session_id = Some(session_id.into());
         self.turn_index = Some(turn_index);
         self
@@ -71,12 +73,14 @@ impl Memory {
 
     #[must_use]
     pub fn role(mut self, role: impl Into<String>) -> Self {
+        let _profile = crate::profiling::Timer::new("db.role");
         self.role = Some(role.into());
         self
     }
 
     #[must_use]
     pub fn at(mut self, timestamp_ms: u64) -> Self {
+        let _profile = crate::profiling::Timer::new("db.at");
         self.timestamp_ms = Some(timestamp_ms);
         self
     }
@@ -132,6 +136,7 @@ impl Query {
     }
 
     pub fn new(text: impl Into<String>) -> Self {
+        let _profile = crate::profiling::Timer::new("db.new");
         Self {
             text: text.into(),
             entity_id: None,
@@ -145,24 +150,28 @@ impl Query {
 
     #[must_use]
     pub fn entity(mut self, entity_id: impl Into<String>) -> Self {
+        let _profile = crate::profiling::Timer::new("db.entity");
         self.entity_id = Some(entity_id.into());
         self
     }
 
     #[must_use]
     pub fn limit(mut self, limit: usize) -> Self {
+        let _profile = crate::profiling::Timer::new("db.limit");
         self.limit = limit;
         self
     }
 
     #[must_use]
     pub fn as_of(mut self, as_of_ms: u64) -> Self {
+        let _profile = crate::profiling::Timer::new("db.as_of");
         self.as_of_ms = Some(as_of_ms);
         self
     }
 
     #[must_use]
     pub fn known_as_of(mut self, known_as_of_ms: u64) -> Self {
+        let _profile = crate::profiling::Timer::new("db.known_as_of");
         self.known_as_of_ms = Some(known_as_of_ms);
         self
     }
@@ -203,20 +212,24 @@ pub struct Engine {
 impl Engine {
     /// Opens (or creates) a data directory and loads the models.
     pub async fn open(dir: impl AsRef<Path>) -> Result<Self> {
+        let _profile = crate::profiling::Timer::new("db.open");
         Self::open_tenant(dir, "default").await
     }
 
     pub async fn open_tenant(dir: impl AsRef<Path>, tenant_id: &str) -> Result<Self> {
+        let _profile = crate::profiling::Timer::new("db.open_tenant");
         Self::from_paths(&RuntimePaths::from_root(dir.as_ref().to_path_buf()), tenant_id).await
     }
 
     /// Wraps an engine state and tenant store that are already open (used by
     /// the HTTP MCP route, which authorizes the caller first).
     pub fn from_parts(state: EngineState, tenant: Arc<TenantStore>) -> Self {
+        let _profile = crate::profiling::Timer::new("db.from_parts");
         Self { state, tenant }
     }
 
     pub async fn from_paths(paths: &RuntimePaths, tenant_id: &str) -> Result<Self> {
+        let _profile = crate::profiling::Timer::new("db.from_paths");
         let config = crate::config::Config::from_env()?;
         let state =
             crate::engine::build_state(paths, crate::api::AuthConfig::embedded(), config).await?;
@@ -225,14 +238,17 @@ impl Engine {
     }
 
     pub fn state(&self) -> &EngineState {
+        let _profile = crate::profiling::Timer::new("db.state");
         &self.state
     }
 
     pub fn tenant(&self) -> &Arc<TenantStore> {
+        let _profile = crate::profiling::Timer::new("db.tenant");
         &self.tenant
     }
 
     pub async fn ingest(&self, memories: Vec<Memory>) -> EngineResult<IngestReport> {
+        let _profile = crate::profiling::Timer::new("db.ingest");
         let count = memories.len();
         let payloads: Vec<IngestPayload> = memories.into_iter().map(Memory::into_payload).collect();
         let (tasks, diag) = process_ingest_batch(&self.state, &self.tenant, payloads).await?;
@@ -246,6 +262,7 @@ impl Engine {
     }
 
     pub async fn query(&self, query: Query) -> EngineResult<Vec<Hit>> {
+        let _profile = crate::profiling::Timer::new("db.query");
         let limit = query.limit.clamp(1, 1_000);
         let payload = QueryPayload {
             textual_query: query.text,
@@ -261,7 +278,7 @@ impl Engine {
             reference_time_ms: query.reference_time_ms,
         };
         let (state, tenant, rerank) = (self.state.clone(), self.tenant.clone(), query.rerank);
-        let (results, _diag) = tokio::task::spawn_blocking(move || {
+        let (results, _diag) = crate::profiling::spawn_blocking(move || {
             execute_query_pipeline(payload, state, tenant, limit, rerank)
         })
         .await
@@ -285,6 +302,7 @@ impl Engine {
 
     /// One memory by id, if it exists.
     pub fn get_memory(&self, memory_id: &str) -> Result<Option<Hit>> {
+        let _profile = crate::profiling::Timer::new("db.get_memory");
         let Some((timestamp, _)) = self.tenant.lookup_by_memory_id(memory_id)? else {
             return Ok(None);
         };
@@ -306,6 +324,7 @@ impl Engine {
     /// Graph edges touching `node` (an entity or a subject), as
     /// `subject --[predicate]--> object` lines.
     pub fn explore_graph(&self, node: &str, limit: usize) -> Result<Vec<String>> {
+        let _profile = crate::profiling::Timer::new("db.explore_graph");
         Ok(self
             .tenant
             .graph_query_edges(node, None, crate::graph::Direction::Both, limit.clamp(1, 500))?
@@ -316,6 +335,7 @@ impl Engine {
 
     /// The current value of a fact such as `residence`, if one is known.
     pub fn current_fact(&self, entity_id: &str, fact_key: &str) -> Result<Option<String>> {
+        let _profile = crate::profiling::Timer::new("db.current_fact");
         self.tenant.get_current_fact_value(entity_id, fact_key)
     }
 
@@ -325,6 +345,7 @@ impl Engine {
         entity_id: &str,
         fact_key: &str,
     ) -> Result<Vec<crate::storage::FactHistoryEntry>> {
+        let _profile = crate::profiling::Timer::new("db.fact_history");
         self.tenant.fact_history(entity_id, fact_key)
     }
 
@@ -335,6 +356,7 @@ impl Engine {
         fact_key: &str,
         as_of_ms: u64,
     ) -> Result<Option<crate::storage::FactHistoryEntry>> {
+        let _profile = crate::profiling::Timer::new("db.fact_as_of");
         Ok(self.fact_history(entity_id, fact_key)?.into_iter().rev().find(|v| {
             v.valid_from_ms <= as_of_ms && v.valid_to_ms.map_or(true, |to| as_of_ms < to)
         }))
@@ -342,6 +364,7 @@ impl Engine {
 
     /// Flushes the write-ahead log into the database file.
     pub fn checkpoint(&self) -> Result<()> {
+        let _profile = crate::profiling::Timer::new("db.checkpoint");
         self.tenant.checkpoint()
     }
 }
@@ -355,6 +378,7 @@ pub struct Db {
 
 impl Db {
     pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
+        let _profile = crate::profiling::Timer::new("db.open");
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .thread_name("tellodb")
@@ -365,14 +389,17 @@ impl Db {
     }
 
     pub fn ingest(&self, memories: Vec<Memory>) -> Result<IngestReport> {
+        let _profile = crate::profiling::Timer::new("db.ingest");
         self.runtime.block_on(self.engine.ingest(memories)).map_err(anyhow::Error::from)
     }
 
     pub fn query(&self, query: Query) -> Result<Vec<Hit>> {
+        let _profile = crate::profiling::Timer::new("db.query");
         self.runtime.block_on(self.engine.query(query)).map_err(anyhow::Error::from)
     }
 
     pub fn current_fact(&self, entity_id: &str, fact_key: &str) -> Result<Option<String>> {
+        let _profile = crate::profiling::Timer::new("db.current_fact");
         self.engine.current_fact(entity_id, fact_key)
     }
 
@@ -381,10 +408,12 @@ impl Db {
         entity_id: &str,
         fact_key: &str,
     ) -> Result<Vec<crate::storage::FactHistoryEntry>> {
+        let _profile = crate::profiling::Timer::new("db.fact_history");
         self.engine.fact_history(entity_id, fact_key)
     }
 
     pub fn engine(&self) -> &Engine {
+        let _profile = crate::profiling::Timer::new("db.engine");
         &self.engine
     }
 }

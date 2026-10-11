@@ -10,6 +10,7 @@ use crate::heuristics::{benchmark_tuned_rules, Profile};
 use super::dialogue::strip_leading_bracketed_prefixes;
 
 pub fn is_numericish(token: &str) -> bool {
+    let _profile = crate::profiling::Timer::new("api.ingest.fact.is_numericish");
     !token.is_empty()
         && token.chars().all(|c| c.is_ascii_digit() || matches!(c, '$' | '.' | ',' | '%'))
 }
@@ -36,6 +37,7 @@ pub fn sanitize_key_parts(parts: &[&str]) -> Option<String> {
         "that",
         "this",
     ];
+    let _profile = crate::profiling::Timer::new("api.ingest.fact.sanitize_key_parts");
 
     let cleaned = parts
         .iter()
@@ -54,6 +56,7 @@ pub fn sanitize_key_parts(parts: &[&str]) -> Option<String> {
 }
 
 pub fn sanitize_key_parts_owned(parts: &[String]) -> Option<String> {
+    let _profile = crate::profiling::Timer::new("api.ingest.fact.sanitize_key_parts_owned");
     let borrowed = parts.iter().map(std::string::String::as_str).collect::<Vec<_>>();
     sanitize_key_parts(&borrowed)
 }
@@ -63,6 +66,7 @@ pub fn build_contextual_key(
     base: &[String],
     suffix: Option<&str>,
 ) -> Option<String> {
+    let _profile = crate::profiling::Timer::new("api.ingest.fact.build_contextual_key");
     let mut parts = Vec::new();
     parts.extend(context.iter().cloned());
     for (idx, token) in base.iter().enumerate() {
@@ -201,10 +205,12 @@ fn extract_identity_or_location_key(tokens: &[String]) -> Option<String> {
 }
 
 pub fn infer_fact_key(text: &str) -> Option<String> {
+    let _profile = crate::profiling::Timer::new("api.ingest.fact.infer_fact_key");
     infer_fact_key_with_profile(text, Profile::Generic)
 }
 
 pub fn infer_fact_key_with_profile(text: &str, profile: Profile) -> Option<String> {
+    let _profile = crate::profiling::Timer::new("api.ingest.fact.infer_fact_key_with_profile");
     let normalized =
         text.trim().strip_prefix("User fact:").unwrap_or(text).trim().to_ascii_lowercase();
     if normalized.is_empty() {
@@ -305,6 +311,7 @@ pub fn infer_fact_key_with_profile(text: &str, profile: Profile) -> Option<Strin
 }
 
 pub fn split_atomic_claims(text: &str) -> Vec<String> {
+    let _profile = crate::profiling::Timer::new("api.ingest.fact.split_atomic_claims");
     text.split(['.', '!', '?', ';'])
         .map(|part| normalize_fact_text(strip_leading_bracketed_prefixes(part)))
         .filter(|part| part.len() >= 12)
@@ -312,6 +319,7 @@ pub fn split_atomic_claims(text: &str) -> Vec<String> {
 }
 
 pub fn is_high_signal_atomic_claim(text: &str) -> bool {
+    let _profile = crate::profiling::Timer::new("api.ingest.fact.is_high_signal_atomic_claim");
     let lower = text.to_ascii_lowercase();
     let temporal = !extract_temporal_terms(text).is_empty();
     let named = !extract_named_phrases(&[text.to_string()]).is_empty();
@@ -366,6 +374,8 @@ pub fn is_high_signal_atomic_claim(text: &str) -> bool {
 
 /// Memory cards for the facts an extractor finds in `payload`.
 pub fn build_atomic_memory_card_payloads(payload: &IngestPayload) -> Vec<IngestPayload> {
+    let _profile =
+        crate::profiling::Timer::new("api.ingest.fact.build_atomic_memory_card_payloads");
     let extractor = crate::extract::extractor();
     let ctx = crate::extract::ExtractCtx {
         entity_id: &payload.entity_id,
@@ -416,6 +426,7 @@ pub fn preference_signal_strength(
     text: &str,
     relations: &[(String, String, String)],
 ) -> Option<f32> {
+    let _profile = crate::profiling::Timer::new("api.ingest.fact.preference_signal_strength");
     let lower = text.to_ascii_lowercase();
     let mut strength = 0.0f32;
 
@@ -455,6 +466,8 @@ pub fn preference_signal_strength(
 }
 
 pub fn extract_retrospective_reference_query(text: &str) -> Option<String> {
+    let _profile =
+        crate::profiling::Timer::new("api.ingest.fact.extract_retrospective_reference_query");
     let lower = text.to_ascii_lowercase();
     let patterns = [
         "remember when ",

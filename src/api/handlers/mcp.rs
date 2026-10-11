@@ -27,6 +27,7 @@ pub async fn mcp_handler(
     Extension(principal): Extension<RequestPrincipal>,
     Json(request): Json<Value>,
 ) -> Json<Value> {
+    let _profile = crate::profiling::Timer::new("api.handlers.mcp.mcp_handler");
     let id = request.get("id").cloned().unwrap_or(Value::Null);
     if request["jsonrpc"] != "2.0" {
         return rpc_error(&id, -32600, "Invalid JSON-RPC version");

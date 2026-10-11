@@ -13,6 +13,7 @@ use crate::fts::tokenize_for_similarity;
 use crate::heuristics::{benchmark_tuned_rules, Profile};
 
 pub fn build_keyword_query(query: &str) -> Option<String> {
+    let _profile = crate::profiling::Timer::new("api.plan.expansions.build_keyword_query");
     let generic_drop = [
         "what",
         "when",
@@ -95,6 +96,7 @@ pub fn build_query_expansion_terms(
     intent: QueryIntent,
     subject_entities: &[String],
 ) -> Vec<String> {
+    let _profile = crate::profiling::Timer::new("api.plan.expansions.build_query_expansion_terms");
     build_query_expansion_terms_with_profile_and_rules(
         query,
         slot_key,
@@ -112,6 +114,9 @@ pub fn build_query_expansion_terms_with_profile(
     subject_entities: &[String],
     profile: Profile,
 ) -> Vec<String> {
+    let _profile = crate::profiling::Timer::new(
+        "api.plan.expansions.build_query_expansion_terms_with_profile",
+    );
     build_query_expansion_terms_with_profile_and_rules(
         query,
         slot_key,
@@ -131,6 +136,9 @@ pub fn build_query_expansion_terms_with_profile_and_rules(
     profile: Profile,
     rules: &ExpansionRules,
 ) -> Vec<String> {
+    let _profile = crate::profiling::Timer::new(
+        "api.plan.expansions.build_query_expansion_terms_with_profile_and_rules",
+    );
     let lower = query.to_ascii_lowercase();
     let tokens = normalize_alpha_tokens(query)
         .into_iter()
@@ -363,6 +371,7 @@ pub fn build_query_expansion_terms_with_profile_and_rules(
 }
 
 pub fn build_expansion_query(entities: &[String], expansion_terms: &[String]) -> Option<String> {
+    let _profile = crate::profiling::Timer::new("api.plan.expansions.build_expansion_query");
     if expansion_terms.is_empty() {
         return None;
     }
@@ -377,6 +386,8 @@ pub fn build_hypothetical_semantic_queries(
     cross_entity: bool,
     intent: QueryIntent,
 ) -> Vec<String> {
+    let _profile =
+        crate::profiling::Timer::new("api.plan.expansions.build_hypothetical_semantic_queries");
     let mut expanded = Vec::new();
     let entity_span = if entities.is_empty() {
         "the people in this dialogue".to_string()
@@ -413,6 +424,8 @@ pub fn build_hypothetical_semantic_queries(
 }
 
 pub fn build_inference_semantic_hints(query: &str, entities: &[String]) -> Vec<String> {
+    let _profile =
+        crate::profiling::Timer::new("api.plan.expansions.build_inference_semantic_hints");
     let mut hints = Vec::new();
     hints.push(format!("{query} based on preferences values opinions personality behaviors"));
     for entity in entities {
@@ -422,6 +435,7 @@ pub fn build_inference_semantic_hints(query: &str, entities: &[String]) -> Vec<S
 }
 
 pub fn build_peripheral_fts_query(query: &str, entities: &[String]) -> Option<String> {
+    let _profile = crate::profiling::Timer::new("api.plan.expansions.build_peripheral_fts_query");
     let cue_tokens =
         ["nickname", "called", "named", "name", "child", "childhood", "as", "kid", "pet", "middle"];
     let tokens = normalize_alpha_tokens(query);
@@ -447,6 +461,7 @@ pub fn build_fact_slot_queries(
     entities: &[String],
     slot_key: &str,
 ) -> (Vec<String>, Vec<String>) {
+    let _profile = crate::profiling::Timer::new("api.plan.expansions.build_fact_slot_queries");
     let slot = humanize_slot_key(slot_key);
     let mut semantic =
         vec![format!("canonical fact {slot} {query}"), format!("fact about {slot} {query}")];
@@ -464,6 +479,8 @@ pub fn build_cross_entity_subqueries(
     query: &str,
     entities: &[String],
 ) -> (Vec<String>, Vec<String>) {
+    let _profile =
+        crate::profiling::Timer::new("api.plan.expansions.build_cross_entity_subqueries");
     if entities.len() < 2 {
         return (Vec::new(), Vec::new());
     }
@@ -485,6 +502,7 @@ pub fn build_cross_entity_subqueries(
 }
 
 pub fn build_purchase_queries(query: &str, entities: &[String]) -> (Vec<String>, Vec<String>) {
+    let _profile = crate::profiling::Timer::new("api.plan.expansions.build_purchase_queries");
     let mut semantic = vec![
         format!("{query} bought purchased acquired new item"),
         format!("purchase bought recently new item {query}"),
@@ -506,14 +524,18 @@ pub fn build_purchase_queries(query: &str, entities: &[String]) -> (Vec<String>,
 }
 
 pub fn humanize_slot_key(slot_key: &str) -> String {
+    let _profile = crate::profiling::Timer::new("api.plan.expansions.humanize_slot_key");
     slot_key.replace('_', " ")
 }
 
 pub fn infer_query_fact_key(query: &str) -> Option<String> {
+    let _profile = crate::profiling::Timer::new("api.plan.expansions.infer_query_fact_key");
     infer_query_fact_key_with_profile(query, Profile::Generic)
 }
 
 pub fn infer_query_fact_key_with_profile(query: &str, _profile: Profile) -> Option<String> {
+    let _profile =
+        crate::profiling::Timer::new("api.plan.expansions.infer_query_fact_key_with_profile");
     let lower = query.to_ascii_lowercase();
     let tokens = normalize_alpha_tokens(query);
 
@@ -583,6 +605,7 @@ pub fn infer_query_fact_key_with_profile(query: &str, _profile: Profile) -> Opti
 }
 
 pub fn is_purchase_query(query: &str) -> bool {
+    let _profile = crate::profiling::Timer::new("api.plan.expansions.is_purchase_query");
     let tokens = normalize_alpha_tokens(query);
     let lower = query.to_ascii_lowercase();
     has_token(&tokens, "buy")
@@ -597,6 +620,7 @@ pub fn is_purchase_query(query: &str) -> bool {
 }
 
 pub fn make_coverage_facet(text: &str, entities: Vec<String>) -> Option<CoverageFacet> {
+    let _profile = crate::profiling::Timer::new("api.plan.expansions.make_coverage_facet");
     let normalized = normalize_fact_text(text);
     if normalized.is_empty() {
         return None;
@@ -620,6 +644,7 @@ pub fn make_query_requirement(
     entities: Vec<String>,
     require_all_entities: bool,
 ) -> Option<QueryRequirement> {
+    let _profile = crate::profiling::Timer::new("api.plan.expansions.make_query_requirement");
     let normalized = normalize_fact_text(text);
     if normalized.is_empty() {
         return None;
@@ -648,6 +673,7 @@ pub fn build_coverage_facets(
     slot_key: Option<&str>,
     expansion_terms: &[String],
 ) -> Vec<CoverageFacet> {
+    let _profile = crate::profiling::Timer::new("api.plan.expansions.build_coverage_facets");
     let mut facets = Vec::new();
     let mut seen = HashSet::new();
     let mut push_facet = |facet: CoverageFacet| {
@@ -714,6 +740,7 @@ pub fn build_query_requirements(
     slot_key: Option<&str>,
     expansion_terms: &[String],
 ) -> Vec<QueryRequirement> {
+    let _profile = crate::profiling::Timer::new("api.plan.expansions.build_query_requirements");
     let mut requirements = Vec::new();
     let mut seen = HashSet::new();
     let requirement_focus_terms = extract_salient_terms(keyword_query.unwrap_or(query), 3);

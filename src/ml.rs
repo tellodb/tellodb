@@ -13,6 +13,7 @@ pub struct QueryIntentClassifier {
 
 impl QueryIntentClassifier {
     pub fn new(semantic: Arc<SemanticInference>) -> Result<Self> {
+        let _profile = crate::profiling::Timer::new("ml.new");
         let prototype_texts: &[(QueryIntent, &[&str])] = &[
             (
                 QueryIntent::NumericAggregation,
@@ -110,15 +111,18 @@ impl QueryIntentClassifier {
     #[allow(dead_code)]
     #[must_use]
     pub fn with_threshold(mut self, threshold: f32) -> Self {
+        let _profile = crate::profiling::Timer::new("ml.with_threshold");
         self.threshold = threshold;
         self
     }
 
     pub fn prototype_count(&self) -> usize {
+        let _profile = crate::profiling::Timer::new("ml.prototype_count");
         self.prototypes.len()
     }
 
     pub fn predict(&self, query: &str) -> Option<QueryIntent> {
+        let _profile = crate::profiling::Timer::new("ml.predict");
         let embedding = self.semantic.generate_query_embedding(query).ok()?;
 
         if embedding.iter().all(|&v| v == 0.0) {

@@ -21,6 +21,7 @@ pub enum ResolverTier {
 
 impl ResolverTier {
     pub fn confidence(&self) -> f32 {
+        let _profile = crate::profiling::Timer::new("storage.entity_resolver.confidence");
         match self {
             Self::Exact => 1.0,
             Self::Fuzzy(s) | Self::Embedding(s) => *s,
@@ -29,6 +30,7 @@ impl ResolverTier {
     }
 
     pub fn priority(&self) -> u8 {
+        let _profile = crate::profiling::Timer::new("storage.entity_resolver.priority");
         match self {
             Self::Exact => 4,
             Self::Fuzzy(_) => 3,
@@ -82,6 +84,7 @@ pub enum MergeStatus {
 
 impl MergeStatus {
     pub fn as_str(&self) -> &'static str {
+        let _profile = crate::profiling::Timer::new("storage.entity_resolver.as_str");
         match self {
             Self::Pending => "pending",
             Self::Accepted => "accepted",
@@ -91,6 +94,7 @@ impl MergeStatus {
 
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
+        let _profile = crate::profiling::Timer::new("storage.entity_resolver.from_str");
         match s {
             "accepted" => Self::Accepted,
             "rejected" => Self::Rejected,
@@ -119,6 +123,7 @@ fn soundex_code(c: char) -> char {
 /// then encodes subsequent letters into digit codes, collapsing
 /// adjacent identical codes and padding/truncating to 4 chars.
 pub fn soundex_key(name: &str) -> String {
+    let _profile = crate::profiling::Timer::new("storage.entity_resolver.soundex_key");
     let lower: String =
         name.chars().filter(char::is_ascii_alphabetic).map(|c| c.to_ascii_lowercase()).collect();
 
@@ -154,6 +159,7 @@ pub fn soundex_key(name: &str) -> String {
 /// Rewrites: PH→F, CK→K, KN→N, WR→R before computing the Soundex key.
 /// This makes "Phillip" and "Filip" collide, which pure Soundex misses.
 pub fn phonetic_key(name: &str) -> String {
+    let _profile = crate::profiling::Timer::new("storage.entity_resolver.phonetic_key");
     let lower = name.to_ascii_lowercase();
     let mut transformed = String::with_capacity(lower.len());
 
@@ -195,6 +201,7 @@ pub fn resolve_name(
     name_embedding: Option<&[f32]>,
     config: &ResolutionConfig,
 ) -> EntityResolution {
+    let _profile = crate::profiling::Timer::new("storage.entity_resolver.resolve_name");
     let trimmed = name.trim();
     if trimmed.len() < 2 {
         return EntityResolution { matched_name: None, tier: ResolverTier::Exact };

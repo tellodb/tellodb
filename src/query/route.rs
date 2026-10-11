@@ -14,6 +14,8 @@ pub(crate) fn collect_edge_cluster_scores_for_seeds(
 ) -> (Vec<HashMap<String, f32>>, u64) {
     const NEIGHBORS_PER_NODE: usize = 50;
     const DEPTH_DECAY: f32 = 0.6;
+    let _profile =
+        crate::profiling::Timer::new("query.route.collect_edge_cluster_scores_for_seeds");
 
     let mut neighbours: HashMap<String, Vec<(String, f32, String)>> = HashMap::new();
     let mut accumulated: Vec<HashMap<String, f32>> = vec![HashMap::new(); seeds.len()];
@@ -77,6 +79,7 @@ pub(crate) fn intent_weight_for_edge(
     intent: Option<crate::api::plan::types::QueryIntent>,
 ) -> f32 {
     use crate::api::plan::types::QueryIntent;
+    let _profile = crate::profiling::Timer::new("query.route.intent_weight_for_edge");
     match intent {
         Some(QueryIntent::Inference | QueryIntent::Recommendation) => {
             if matches!(edge_type, EdgeType::CausedBy | EdgeType::LeadsTo | EdgeType::Prefers) {
@@ -98,6 +101,7 @@ pub(crate) fn intent_weight_for_edge(
 
 #[allow(clippy::too_many_lines)]
 pub(crate) fn route_phase(s: &mut QueryPipelineState) {
+    let _profile = crate::profiling::Timer::new("query.route.route_phase");
     // `route_start` was captured once in `QueryPipelineState::new`, before
     // `plan_phase` runs, so the `route_ms` computed at the end of this
     // function silently included all of `planning_ms`. Reset it here so the
@@ -129,7 +133,7 @@ pub(crate) fn route_phase(s: &mut QueryPipelineState) {
         for (probe_idx, probe_query) in route_probe_queries.iter().enumerate() {
             let tenant = tenant_for_probes.clone();
             let eid = eid_for_probes.clone();
-            handles.push(sc.spawn(move || {
+            handles.push(crate::profiling::spawn_scoped(sc, move || {
                 let hits = tenant
                     .fts_search(probe_query.as_str(), hit_limit, eid.as_deref())
                     .unwrap_or_else(|err| {

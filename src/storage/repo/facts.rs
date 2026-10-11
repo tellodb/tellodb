@@ -8,6 +8,7 @@ type FactPosition = (String, u64, u64, i64, String);
 /// Repeated triples are harmless: `IN (...)` is a set-membership test, so a
 /// duplicated triple cannot make a row match (and thus appear) twice.
 fn padded_triples(chunk: &[(String, String, String)]) -> Vec<(String, String, String)> {
+    let _profile = crate::profiling::Timer::new("storage.repo.facts.padded_triples");
     let Some(last) = chunk.last().cloned() else {
         return Vec::new();
     };
@@ -25,6 +26,7 @@ fn fact_neighbour(
     ordering: &str,
     timestamp: u64,
 ) -> Result<Option<FactPosition>> {
+    let _profile = crate::profiling::Timer::new("storage.repo.facts.fact_neighbour");
     let sql = format!(
         "SELECT memory_id, timestamp_ms, recorded_at_ms, rowid, COALESCE(object, '')
          FROM fact_versions
@@ -51,6 +53,7 @@ fn fact_version(
     fact_key: &str,
     memory_id: &str,
 ) -> Result<FactPosition> {
+    let _profile = crate::profiling::Timer::new("storage.repo.facts.fact_version");
     Ok(tx.query_row(
         "SELECT memory_id, timestamp_ms, recorded_at_ms, rowid, COALESCE(object, '')
          FROM fact_versions WHERE fact_key = ?1 AND memory_id = ?2",
@@ -72,6 +75,7 @@ fn current_fact_version(
     fact_key: &str,
     entity_id: &str,
 ) -> Result<Option<(String, u64)>> {
+    let _profile = crate::profiling::Timer::new("storage.repo.facts.current_fact_version");
     match tx.query_row(
         "SELECT memory_id, timestamp_ms FROM fact_versions
          WHERE fact_key = ?1 AND entity_id = ?2 AND status = 'current'
@@ -94,6 +98,7 @@ fn ordered_fact_neighbour(
     rowid: i64,
     predecessor: bool,
 ) -> Result<Option<FactPosition>> {
+    let _profile = crate::profiling::Timer::new("storage.repo.facts.ordered_fact_neighbour");
     let (comparison, ordering) = if predecessor { ("<", "DESC") } else { (">", "ASC") };
     let sql = format!(
         "SELECT memory_id, timestamp_ms, recorded_at_ms, rowid, COALESCE(object, '')
@@ -129,6 +134,8 @@ impl TenantStore {
         &self,
         memory_ids: &[String],
     ) -> Result<HashMap<String, FactVersionRow>> {
+        let _profile =
+            crate::profiling::Timer::new("storage.repo.facts.fact_versions_for_memories");
         if memory_ids.is_empty() {
             return Ok(HashMap::new());
         }
@@ -256,6 +263,7 @@ impl TenantStore {
     }
 
     pub fn fact_history(&self, entity_id: &str, fact_key: &str) -> Result<Vec<FactHistoryEntry>> {
+        let _profile = crate::profiling::Timer::new("storage.repo.facts.fact_history");
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT v.memory_id,
@@ -314,6 +322,7 @@ impl TenantStore {
         predicates: &[(String, Vec<f32>)],
         tau: f32,
     ) -> Result<HashMap<String, String>> {
+        let _profile = crate::profiling::Timer::new("storage.repo.facts.canonicalize_predicates");
         if predicates.is_empty() {
             return Ok(HashMap::new());
         }
@@ -330,6 +339,8 @@ impl TenantStore {
         predicates: &[(String, Vec<f32>)],
         tau: f32,
     ) -> Result<HashMap<String, String>> {
+        let _profile =
+            crate::profiling::Timer::new("storage.repo.facts.canonicalize_predicates_tx");
         let mut assigned = HashMap::with_capacity(predicates.len());
         let mut known = tx.prepare_cached(
             "SELECT canonical FROM predicate_canon WHERE entity_id = ?1 AND predicate = ?2",
@@ -382,6 +393,8 @@ impl TenantStore {
         entity_id: &str,
         registrations: &[(&str, u64, &str, &str, &str, &str)],
     ) -> Result<Vec<FactVersionStatus>> {
+        let _profile =
+            crate::profiling::Timer::new("storage.repo.facts.register_fact_versions_batch");
         let mut conn = self.get_conn()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let statuses = Self::register_fact_versions_tx(
@@ -402,6 +415,7 @@ impl TenantStore {
         fact_key: &str,
         entity_id: &str,
     ) -> Result<()> {
+        let _profile = crate::profiling::Timer::new("storage.repo.facts.promote_newest_to_current");
         let newest: Option<String> = tx
             .query_row(
                 "SELECT memory_id FROM fact_versions
@@ -436,6 +450,7 @@ impl TenantStore {
         registrations: &[(&str, u64, &str, &str, &str, &str)],
         recorded_at: u64,
     ) -> Result<Vec<FactVersionStatus>> {
+        let _profile = crate::profiling::Timer::new("storage.repo.facts.register_fact_versions_tx");
         let mut statuses = Vec::with_capacity(registrations.len());
         // Stale entries whose `current` pointer is resolved after the loop.
         let mut deferred_stale: Vec<(usize, String, String)> = Vec::new();
@@ -596,6 +611,7 @@ impl TenantStore {
         entity_id: &str,
         fact_key: &str,
     ) -> Result<Option<String>> {
+        let _profile = crate::profiling::Timer::new("storage.repo.facts.get_current_fact_value");
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT object FROM fact_versions
@@ -615,6 +631,7 @@ impl TenantStore {
         &self,
         memory_ids: &[String],
     ) -> Result<std::collections::HashSet<String>> {
+        let _profile = crate::profiling::Timer::new("storage.repo.facts.invalidated_set");
         self.invalidated_among(memory_ids, "status = 'stale'", None)
     }
 
@@ -623,6 +640,7 @@ impl TenantStore {
         point_in_time_ms: u64,
         memory_ids: &[String],
     ) -> Result<std::collections::HashSet<String>> {
+        let _profile = crate::profiling::Timer::new("storage.repo.facts.invalidated_set_at_time");
         self.invalidated_among(
             memory_ids,
             "((valid_to_ms IS NOT NULL AND valid_to_ms <= ?1) OR COALESCE(valid_from_ms, 0) > ?1)",
@@ -636,6 +654,7 @@ impl TenantStore {
         condition: &str,
         point_in_time_ms: Option<u64>,
     ) -> Result<std::collections::HashSet<String>> {
+        let _profile = crate::profiling::Timer::new("storage.repo.facts.invalidated_among");
         let mut set = std::collections::HashSet::new();
         if memory_ids.is_empty() {
             return Ok(set);

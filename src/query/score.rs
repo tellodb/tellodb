@@ -8,16 +8,19 @@ use super::{
 };
 
 fn timed<T>(f: impl FnOnce() -> anyhow::Result<T>) -> (anyhow::Result<T>, Duration) {
+    let _profile = crate::profiling::Timer::new("query.score.timed");
     let start = Instant::now();
     let out = f();
     (out, start.elapsed())
 }
 
 fn join<T>(name: &'static str, result: std::thread::Result<T>) -> EngineResult<T> {
+    let _profile = crate::profiling::Timer::new("query.score.join");
     result.map_err(|_panic| EngineError::internal(format!("hydrate stage panicked: {name}")))
 }
 
 pub(crate) fn score_hydrate(s: &mut QueryPipelineState) -> EngineResult<()> {
+    let _profile = crate::profiling::Timer::new("query.score.score_hydrate");
     let observation_keys: Vec<(u64, String)> =
         s.fused.items.iter().map(|(mid, ts, _)| (*ts, mid.clone())).collect();
     let observation_memory_ids: Vec<String> =
@@ -26,10 +29,13 @@ pub(crate) fn score_hydrate(s: &mut QueryPipelineState) -> EngineResult<()> {
     let tenant = s.tenant.as_ref();
 
     let (obs, cards, invalid) = std::thread::scope(|scope| {
-        let obs = scope.spawn(|| timed(|| tenant.get_observations_batch(&observation_keys)));
-        let cards =
-            scope.spawn(|| timed(|| tenant.get_memory_cards_batch(&observation_memory_ids)));
-        let invalid = scope.spawn(|| {
+        let obs = crate::profiling::spawn_scoped(scope, || {
+            timed(|| tenant.get_observations_batch(&observation_keys))
+        });
+        let cards = crate::profiling::spawn_scoped(scope, || {
+            timed(|| tenant.get_memory_cards_batch(&observation_memory_ids))
+        });
+        let invalid = crate::profiling::spawn_scoped(scope, || {
             timed(|| match pit {
                 Some(pit_ms) => tenant.invalidated_set_at_time(pit_ms, &observation_memory_ids),
                 None => tenant.invalidated_set(&observation_memory_ids),
@@ -84,6 +90,7 @@ pub(crate) fn score_hydrate(s: &mut QueryPipelineState) -> EngineResult<()> {
 
 #[allow(clippy::too_many_lines)]
 pub(crate) fn score_loop(s: &mut QueryPipelineState) -> Vec<EvidenceCard> {
+    let _profile = crate::profiling::Timer::new("query.score.score_loop");
     let loop_start = Instant::now();
     let mut scored = Vec::new();
     let primary_qembed = &s.primary_qembed;
@@ -104,6 +111,7 @@ pub(crate) fn score_loop(s: &mut QueryPipelineState) -> Vec<EvidenceCard> {
             continue;
         }
         let Some(obs) = observations.get(mid) else {
+            tracing::debug!(target: "tellodb::profile", event = "candidate_filtered", memory_id = %mid, reason = "missing_observation");
             continue;
         };
         let is_stale_fact = (obs.kind == MemoryKind::Fact
@@ -113,10 +121,12 @@ pub(crate) fn score_loop(s: &mut QueryPipelineState) -> Vec<EvidenceCard> {
         let created_at_ms = if obs.created_at_ms > 0 { obs.created_at_ms } else { *ts };
         if let Some(pit) = s.payload.point_in_time_ms {
             if created_at_ms > pit {
+                tracing::debug!(target: "tellodb::profile", event = "candidate_filtered", memory_id = %mid, reason = "future_event");
                 continue;
             }
         }
         if s.payload.known_as_of_ms.is_some_and(|known| obs.recorded_at_ms > known) {
+            tracing::debug!(target: "tellodb::profile", event = "candidate_filtered", memory_id = %mid, reason = "future_record");
             continue;
         }
         let Some(scorable) = scorables.get(mid) else {
@@ -154,6 +164,7 @@ pub(crate) fn score_loop(s: &mut QueryPipelineState) -> Vec<EvidenceCard> {
             );
         let Some(lifecycle_adjustment) = lifecycle_rank_adjustment(&lifecycle, obs.kind, now_ms)
         else {
+            tracing::debug!(target: "tellodb::profile", event = "candidate_filtered", memory_id = %mid, reason = "lifecycle");
             continue;
         };
         let mut fs = apply_decay_with_policy(base_score, created_at_ms, obs.kind, now_ms);
@@ -249,6 +260,10 @@ pub(crate) fn score_loop(s: &mut QueryPipelineState) -> Vec<EvidenceCard> {
             (mid.clone(), obs.session_id.clone())
         };
 
+        tracing::debug!(target: "tellodb::profile", event = "candidate_score", memory_id = %mid,
+            rrf_score, base_score, final_score = fs, lifecycle_adjustment, graph_score,
+            entity_hits, lexical_hits, temporal_hits, facet_mask,
+            stale = is_stale_fact, superseded = superseded_card, kind = obs.kind.as_str());
         scored.push(EvidenceCard {
             claim_text: obs.textual_content.clone(),
             source_memory_id,
@@ -291,6 +306,7 @@ pub(crate) fn score_loop(s: &mut QueryPipelineState) -> Vec<EvidenceCard> {
 /// relevant facts win without promoting recent unrelated memories
 /// (`TELLODB_LATEST_RECENCY_WEIGHT`, default 0.35).
 pub(crate) fn apply_latest_preference(scored: &mut [EvidenceCard], weight: f32) {
+    let _profile = crate::profiling::Timer::new("query.score.apply_latest_preference");
     let (Some(oldest), Some(newest)) = (
         scored.iter().map(|c| c.created_at_ms).min(),
         scored.iter().map(|c| c.created_at_ms).max(),
@@ -318,6 +334,7 @@ pub(crate) fn apply_latest_preference(scored: &mut [EvidenceCard], weight: f32) 
 pub(crate) fn describe_stale_fact(
     version: &crate::storage::FactVersionRow,
 ) -> Option<crate::api::types::WhyStale> {
+    let _profile = crate::profiling::Timer::new("query.score.describe_stale_fact");
     if version.is_current {
         return None;
     }

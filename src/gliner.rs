@@ -80,6 +80,7 @@ impl GlinerModel {
     /// ONNX file (`onnx/model_int8.onnx`, else `onnx/model.onnx`, else
     /// `model.onnx`). Runs on the device selected by the server configuration.
     pub fn load(dir: &Path) -> Result<Self> {
+        let _profile = crate::profiling::Timer::new("gliner.load");
         let config_path = dir.join("gliner_config.json");
         let config: GlinerConfig = serde_json::from_slice(
             &std::fs::read(&config_path)
@@ -158,6 +159,7 @@ impl GlinerModel {
     }
 
     pub fn max_types(&self) -> usize {
+        let _profile = crate::profiling::Timer::new("gliner.max_types");
         self.max_types
     }
 
@@ -181,6 +183,7 @@ impl GlinerModel {
         labels: &[String],
         threshold: f32,
     ) -> Result<Vec<SpanPrediction>> {
+        let _profile = crate::profiling::Timer::new("gliner.predict");
         if labels.is_empty() || text.trim().is_empty() {
             return Ok(Vec::new());
         }

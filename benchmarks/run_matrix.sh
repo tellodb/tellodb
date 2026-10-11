@@ -105,6 +105,14 @@ mkdir -p "$RUNS_DIR"
 echo "Run directory: $RUNS_DIR"
 echo "Working directory: $WORK_DIR (ingest concurrency: $CONCURRENCY)"
 ENGINE_PID=""
+SAMPLER_PID=""
+
+if [[ "${PROFILE_LOGS:-0}" == 1 ]]; then
+    export TELLODB_LOG_FORMAT=json
+    export RUST_LOG="${RUST_LOG:-warn,tellodb=debug,tellodb::profile=debug,ort=warn}"
+    printf 'TELLODB_LOG_FORMAT=%s\nRUST_LOG=%s\nWORK_ROOT=%s\nCONCURRENCY=%s\nRUNS=%s\n' \
+        "$TELLODB_LOG_FORMAT" "$RUST_LOG" "$WORK_ROOT" "$CONCURRENCY" "$RUNS" > "$RUNS_DIR/PROFILE_CONFIG.txt"
+fi
 
 stop_engine() {
     if [[ -n "$ENGINE_PID" ]] && kill -0 "$ENGINE_PID" 2>/dev/null; then
@@ -112,12 +120,30 @@ stop_engine() {
         wait "$ENGINE_PID" 2>/dev/null || true
     fi
     ENGINE_PID=""
+    if [[ -n "$SAMPLER_PID" ]]; then
+        kill "$SAMPLER_PID" 2>/dev/null || true
+        wait "$SAMPLER_PID" 2>/dev/null || true
+        SAMPLER_PID=""
+    fi
 }
 cleanup() {
     stop_engine
+    if [[ "${PROFILE_LOGS:-0}" == 1 ]]; then
+        for log in "$RUNS_DIR"/engine_*.log; do
+            [[ -f "$log" ]] || continue
+            label="${log##*/engine_}"
+            label="${label%.log}"
+            if [[ ! -f "$RUNS_DIR/PROFILE_${label}.md" ]]; then
+                python3 "$SCRIPT_DIR/profile_logs.py" summarize "$log" \
+                    "$RUNS_DIR/PROFILE_${label}.md" || true
+            fi
+        done
+    fi
     rm -rf "$WORK_DIR"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # Copy only baseline records; preserve the source run and its failure logs.
 # Reuse is explicit because engine settings must match the original run.
@@ -185,6 +211,11 @@ start_engine() {
         "$@" \
         "$ENGINE_BIN" >"$log" 2>&1 &
     ENGINE_PID=$!
+    if [[ "${PROFILE_LOGS:-0}" == 1 ]]; then
+        python3 "$SCRIPT_DIR/profile_logs.py" sample --pid "$ENGINE_PID" \
+            --work-dir "$WORK_DIR" --output "$RUNS_DIR/resources_${label}.jsonl" &
+        SAMPLER_PID=$!
+    fi
     for _ in $(seq 1 120); do
         if curl -sf "${ENGINE_URL}/healthz" >/dev/null 2>&1; then
             assert_cuda_live "$log"
@@ -266,6 +297,10 @@ while IFS= read -r line; do
         run_dataset "$dataset" "$RUNS_DIR/$dataset/$label"
     done
     stop_engine
+    if [[ "${PROFILE_LOGS:-0}" == 1 ]]; then
+        python3 "$SCRIPT_DIR/profile_logs.py" summarize "$RUNS_DIR/engine_${label}.log" \
+            "$RUNS_DIR/PROFILE_${label}.md"
+    fi
     # Finished arms retain their evaluation records, not their large databases.
     rm -rf "$WORK_DIR/data_${label}"
 done <<< "$MATRIX"

@@ -26,6 +26,7 @@ fn current_core_profile(
     entity_id: &str,
     point_in_time_ms: Option<u64>,
 ) -> EngineResult<Option<String>> {
+    let _profile = crate::profiling::Timer::new("api.handlers.query.current_core_profile");
     let Some(raw) = tenant.get_core_profile(entity_id)? else {
         return Ok(None);
     };
@@ -62,6 +63,8 @@ fn build_entity_observation_block(
     results: &[QueryResult],
     point_in_time_ms: Option<u64>,
 ) -> EngineResult<String> {
+    let _profile =
+        crate::profiling::Timer::new("api.handlers.query.build_entity_observation_block");
     let profile = current_core_profile(tenant, entity_id, point_in_time_ms)?
         .map(|p| clip_profile_to_budget(&p, 8));
 
@@ -83,6 +86,7 @@ pub async fn query_handler(
     Extension(principal): Extension<RequestPrincipal>,
     Json(payload): Json<QueryPayload>,
 ) -> Result<impl IntoResponse, EngineError> {
+    let _profile = crate::profiling::Timer::new("api.handlers.query.query_handler");
     let tenant_id = principal_user_id(&principal).unwrap_or("default");
     let tenant = state.tenant_store(tenant_id)?;
     let profile_query_text = payload.textual_query.clone();
@@ -99,7 +103,7 @@ pub async fn query_handler(
     let (mut results, diagnostics, obs_block) = {
         let state_for_query = state.clone();
         let tenant = tenant.clone();
-        tokio::task::spawn_blocking(move || {
+        crate::profiling::spawn_blocking(move || {
             let (results, diagnostics) = execute_query_pipeline(
                 payload,
                 state_for_query,
@@ -294,6 +298,7 @@ pub async fn query_handler(
 }
 
 fn scoped_graph_node_id(requested: Option<String>) -> EngineResult<String> {
+    let _profile = crate::profiling::Timer::new("api.handlers.query.scoped_graph_node_id");
     let node_id = match requested {
         Some(id) if !id.trim().is_empty() => id.trim().to_string(),
         None | Some(_) => return Err(EngineError::bad_request("graph node is required")),
@@ -306,6 +311,7 @@ pub async fn graph_query_handler(
     Extension(principal): Extension<RequestPrincipal>,
     Json(payload): Json<GraphQueryPayload>,
 ) -> Result<impl IntoResponse, EngineError> {
+    let _profile = crate::profiling::Timer::new("api.handlers.query.graph_query_handler");
     // If subject is provided, use it. If not, use the requested user_id.
     let subject = if payload.subject.trim().is_empty() {
         scoped_graph_node_id(payload.user_id)?
@@ -316,7 +322,7 @@ pub async fn graph_query_handler(
     let tenant_id = crate::api::auth::principal_user_id(&principal).unwrap_or("default");
     let tenant = state.tenant_store(tenant_id)?;
     let tenant_clone = tenant.clone();
-    let results = tokio::task::spawn_blocking(move || {
+    let results = crate::profiling::spawn_blocking(move || {
         tenant_clone.graph_query_edges(
             &subject,
             payload.edge_type.as_deref(),
@@ -335,6 +341,7 @@ pub async fn graph_walk_handler(
     Extension(principal): Extension<RequestPrincipal>,
     Json(payload): Json<GraphWalkPayload>,
 ) -> Result<impl IntoResponse, EngineError> {
+    let _profile = crate::profiling::Timer::new("api.handlers.query.graph_walk_handler");
     let node = if payload.node.trim().is_empty() {
         scoped_graph_node_id(payload.user_id)?
     } else {
@@ -344,7 +351,7 @@ pub async fn graph_walk_handler(
     let tenant_id = crate::api::auth::principal_user_id(&principal).unwrap_or("default");
     let tenant = state.tenant_store(tenant_id)?;
     let tenant_clone = tenant.clone();
-    let results = tokio::task::spawn_blocking(move || {
+    let results = crate::profiling::spawn_blocking(move || {
         // TODO: actually implement depth/breadth walk. For now, pass first edge_type.
         let edge_type =
             payload.edge_types.as_ref().and_then(|et| et.first().map(std::string::String::as_str));
@@ -366,6 +373,7 @@ pub async fn graph_export_handler(
     Extension(principal): Extension<RequestPrincipal>,
     Json(payload): Json<GraphExportPayload>,
 ) -> Result<impl IntoResponse, EngineError> {
+    let _profile = crate::profiling::Timer::new("api.handlers.query.graph_export_handler");
     let seed = if payload.seed.trim().is_empty() {
         scoped_graph_node_id(payload.user_id)?
     } else {
@@ -375,7 +383,7 @@ pub async fn graph_export_handler(
     let tenant_id = crate::api::auth::principal_user_id(&principal).unwrap_or("default");
     let tenant = state.tenant_store(tenant_id)?;
     let tenant_clone = tenant.clone();
-    let results = tokio::task::spawn_blocking(move || {
+    let results = crate::profiling::spawn_blocking(move || {
         // TODO: implement export walk using breadth/depth. For now fallback to query edges.
         let edge_type =
             payload.edge_types.as_ref().and_then(|et| et.first().map(std::string::String::as_str));
@@ -397,6 +405,7 @@ pub async fn analytics_query_handler(
     Extension(principal): Extension<RequestPrincipal>,
     Json(payload): Json<AnalyticsQueryPayload>,
 ) -> Result<impl IntoResponse, EngineError> {
+    let _profile = crate::profiling::Timer::new("api.handlers.query.analytics_query_handler");
     let user_id = crate::api::auth::principal_user_id(&principal).unwrap_or("default");
     let s = payload.start_timestamp_ms.unwrap_or(0);
     let e = payload.end_timestamp_ms.unwrap_or(u64::MAX);

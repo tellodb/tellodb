@@ -71,6 +71,7 @@ pub(crate) const FTS_MIN_TERM_LEN: usize = 1;
 pub(crate) const SEARCH_MIN_TERM_LEN: usize = 2;
 
 pub(crate) fn unix_timestamp_ms() -> Result<i64> {
+    let _profile = crate::profiling::Timer::new("storage.tenant.unix_timestamp_ms");
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system clock is before Unix epoch")
@@ -92,6 +93,7 @@ pub struct TenantStore {
 /// lives in its own indexed column, so `entity_tok:<tok>` restricts the scan
 /// to one entity inside the index instead of filtering after the match.
 pub(crate) fn fts_entity_tok(entity_id: &str) -> String {
+    let _profile = crate::profiling::Timer::new("storage.tenant.fts_entity_tok");
     let mut out = String::with_capacity(1 + entity_id.len() * 2);
     out.push('e');
     for byte in entity_id.as_bytes() {
@@ -105,6 +107,7 @@ pub(crate) fn fts_entity_tok(entity_id: &str) -> String {
 /// An unescaped `"` closes the phrase early and makes the whole MATCH
 /// expression invalid, which the callers turn into an empty lane.
 pub(crate) fn fts_quote(term: impl AsRef<str>) -> String {
+    let _profile = crate::profiling::Timer::new("storage.tenant.fts_quote");
     format!("\"{}\"", term.as_ref().replace('"', "\"\""))
 }
 
@@ -113,6 +116,7 @@ pub(crate) fn fts_quote(term: impl AsRef<str>) -> String {
 /// deriving it from the key makes re-ingest replace instead of duplicate and
 /// makes deletes an O(log n) rowid lookup.
 pub(crate) fn fts_rowid(key: &str) -> i64 {
+    let _profile = crate::profiling::Timer::new("storage.tenant.fts_rowid");
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for byte in key.as_bytes() {
         hash ^= u64::from(*byte);
@@ -127,6 +131,7 @@ pub(crate) const SCHEMA_VERSION: i64 = 7;
 
 impl TenantStore {
     pub fn new(path: &Path) -> Result<Self> {
+        let _profile = crate::profiling::Timer::new("storage.tenant.new");
         let synchronous = match std::env::var("TELLODB_DURABILITY")
             .unwrap_or_else(|_| "full".to_string())
             .trim()
@@ -172,20 +177,24 @@ impl TenantStore {
     }
 
     pub fn attach_vectors(&self, index: crate::vector_index::VectorIndex) -> Result<()> {
+        let _profile = crate::profiling::Timer::new("storage.tenant.attach_vectors");
         self.vectors
             .set(index)
             .map_err(|_existing_index| anyhow::anyhow!("vector index already attached"))
     }
 
     pub fn vectors(&self) -> Result<&crate::vector_index::VectorIndex> {
+        let _profile = crate::profiling::Timer::new("storage.tenant.vectors");
         self.vectors.get().context("tenant has no vector index attached")
     }
 
     pub fn vector_source(&self) -> std::sync::Arc<dyn crate::vector_index::VectorSource> {
+        let _profile = crate::profiling::Timer::new("storage.tenant.vector_source");
         std::sync::Arc::new(SqliteVectorSource { pool: self.pool.clone() })
     }
 
     pub fn stored_vector_counts(&self) -> Result<(usize, usize)> {
+        let _profile = crate::profiling::Timer::new("storage.tenant.stored_vector_counts");
         let conn = self.get_conn()?;
         Ok(conn.query_row(
             "SELECT COUNT(embedding), COUNT(*) - COUNT(embedding) FROM vector_lookup",
@@ -195,10 +204,12 @@ impl TenantStore {
     }
 
     pub fn get_conn(&self) -> Result<r2d2::PooledConnection<SqliteConnectionManager>> {
+        let _profile = crate::profiling::Timer::new("storage.tenant.get_conn");
         self.pool.get().context("Failed to get connection from pool")
     }
 
     pub fn checkpoint(&self) -> Result<()> {
+        let _profile = crate::profiling::Timer::new("storage.tenant.checkpoint");
         let conn = self.get_conn()?;
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         Ok(())
@@ -208,6 +219,7 @@ impl TenantStore {
         &self,
         items: impl IntoIterator<Item = (u64, &'a str, &'a AgentObservation)>,
     ) -> Result<Vec<Option<u64>>> {
+        let _profile = crate::profiling::Timer::new("storage.tenant.allocate_vector_ids");
         let items = items
             .into_iter()
             .map(|(timestamp, memory_id, observation)| {
@@ -237,6 +249,7 @@ pub(crate) fn merge_router_records(
     existing: &SessionRouterRecord,
     incoming: &SessionRouterRecord,
 ) -> SessionRouterRecord {
+    let _profile = crate::profiling::Timer::new("storage.tenant.merge_router_records");
     let mut merged = existing.clone();
     merged.canonical_facts = dedupe_append(&merged.canonical_facts, &incoming.canonical_facts);
     merged.events = dedupe_append(&merged.events, &incoming.events);
@@ -267,6 +280,7 @@ pub(crate) fn merge_router_records(
 }
 
 pub(crate) fn contains_term_count(lower_haystack: &str, terms: &[String]) -> usize {
+    let _profile = crate::profiling::Timer::new("storage.tenant.contains_term_count");
     terms
         .iter()
         .filter(|term| {
@@ -292,6 +306,7 @@ pub struct GraphEdge {
 use serde::{Deserialize, Serialize};
 
 pub(crate) fn vec_f32_to_bytes(v: &[f32]) -> Vec<u8> {
+    let _profile = crate::profiling::Timer::new("storage.tenant.vec_f32_to_bytes");
     let mut bytes = Vec::with_capacity(v.len() * 4);
     for &x in v {
         bytes.extend_from_slice(&x.to_le_bytes());
@@ -300,6 +315,7 @@ pub(crate) fn vec_f32_to_bytes(v: &[f32]) -> Vec<u8> {
 }
 
 pub(crate) fn bytes_to_vec_f32(bytes: &[u8]) -> Vec<f32> {
+    let _profile = crate::profiling::Timer::new("storage.tenant.bytes_to_vec_f32");
     bytes
         .chunks_exact(4)
         .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
@@ -359,6 +375,7 @@ impl crate::vector_index::VectorSource for SqliteVectorSource {
 /// Whether two fact objects state the same value (whitespace, case and
 /// trailing punctuation ignored).
 pub(crate) fn same_fact_object(a: &str, b: &str) -> bool {
+    let _profile = crate::profiling::Timer::new("storage.tenant.same_fact_object");
     let normalize = |text: &str| {
         text.split_whitespace()
             .collect::<Vec<_>>()
@@ -375,6 +392,7 @@ pub(crate) type EdgeNeighbour = (String, f32, String);
 pub(crate) type MemoryTurnRow = (String, Option<String>, LedgerTurn);
 
 pub(crate) fn memory_turn_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryTurnRow> {
+    let _profile = crate::profiling::Timer::new("storage.tenant.memory_turn_row");
     let memory_id: String = row.get(0)?;
     let parent: Option<String> = row.get(1)?;
     let role: String = row.get(4)?;
@@ -399,6 +417,7 @@ pub(crate) fn memory_turn_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Memor
 }
 
 pub(crate) fn memory_card_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryCard> {
+    let _profile = crate::profiling::Timer::new("storage.tenant.memory_card_row");
     let lifecycle_str: Option<String> = row.get(17)?;
     Ok(MemoryCard {
         card_id: row.get(0)?,
@@ -434,6 +453,7 @@ pub(crate) fn merge_turn(
     key: String,
     turn: LedgerTurn,
 ) {
+    let _profile = crate::profiling::Timer::new("storage.tenant.merge_turn");
     match turns.entry(key) {
         std::collections::hash_map::Entry::Occupied(mut existing) => {
             let existing = existing.get_mut();

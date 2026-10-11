@@ -44,6 +44,7 @@ pub async fn current_fact_handler(
     Extension(principal): Extension<RequestPrincipal>,
     Query(params): Query<FactParams>,
 ) -> EngineResult<impl IntoResponse> {
+    let _profile = crate::profiling::Timer::new("api.handlers.facts.current_fact_handler");
     let (tenant, entity_id) = scope(&state, &principal, params.entity_id.as_deref())?;
     let history = tenant.fact_history(&entity_id, &params.fact_key).map_err(|err| {
         tracing::error!(error = ?err, "fact history read failed");
@@ -75,6 +76,7 @@ pub async fn fact_history_handler(
     Extension(principal): Extension<RequestPrincipal>,
     Query(params): Query<FactParams>,
 ) -> EngineResult<impl IntoResponse> {
+    let _profile = crate::profiling::Timer::new("api.handlers.facts.fact_history_handler");
     let (tenant, entity_id) = scope(&state, &principal, params.entity_id.as_deref())?;
     let history = tenant.fact_history(&entity_id, &params.fact_key).map_err(|err| {
         tracing::error!(error = ?err, "fact history read failed");

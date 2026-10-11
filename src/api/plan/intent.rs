@@ -6,6 +6,7 @@ pub fn classify_query_intent(
     query: &str,
     classifier: Option<&QueryIntentClassifier>,
 ) -> QueryIntent {
+    let _profile = crate::profiling::Timer::new("api.plan.intent.classify_query_intent");
     if let Some(ml) = classifier {
         if let Some(intent) = ml.predict(query) {
             return intent;
@@ -70,6 +71,7 @@ pub fn classify_query_intent(
 }
 
 pub fn extract_ordinal_rank(query: &str) -> Option<usize> {
+    let _profile = crate::profiling::Timer::new("api.plan.intent.extract_ordinal_rank");
     let lower = query.to_ascii_lowercase();
     for rank in 1..=10 {
         if let Some(word) = ordinal_word(rank) {
@@ -97,6 +99,7 @@ pub fn extract_ordinal_rank(query: &str) -> Option<usize> {
 }
 
 pub fn ordinal_word(rank: usize) -> Option<&'static str> {
+    let _profile = crate::profiling::Timer::new("api.plan.intent.ordinal_word");
     match rank {
         1 => Some("first"),
         2 => Some("second"),
@@ -114,6 +117,7 @@ pub fn ordinal_word(rank: usize) -> Option<&'static str> {
 
 pub fn strip_ordinal_tokens(query: &str) -> String {
     use crate::core::text::normalize_fact_text;
+    let _profile = crate::profiling::Timer::new("api.plan.intent.strip_ordinal_tokens");
     let drop = [
         "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth",
         "tenth", "1st", "2nd", "3rd", "4th", "5th", "6th", "7th", "8th", "9th", "10th",

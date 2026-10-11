@@ -41,6 +41,7 @@ fn require_global_principal(principal: &RequestPrincipal) -> EngineResult<()> {
 }
 
 pub async fn metrics_handler() -> impl IntoResponse {
+    let _profile = crate::profiling::Timer::new("api.handlers.system.metrics_handler");
     (StatusCode::OK, [("content-type", "text/plain; charset=utf-8")], metrics::render())
 }
 
@@ -48,6 +49,7 @@ pub async fn status_handler(
     State(state): State<EngineState>,
     Extension(principal): Extension<RequestPrincipal>,
 ) -> EngineResult<impl IntoResponse> {
+    let _profile = crate::profiling::Timer::new("api.handlers.system.status_handler");
     let tenant_id = principal_user_id(&principal).unwrap_or("default");
     let _tenant = state.tenant_store(tenant_id).map_err(internal_error)?;
     let status = EngineStatus {
@@ -63,6 +65,7 @@ pub async fn health_handler(
     State(state): State<EngineState>,
     Extension(principal): Extension<RequestPrincipal>,
 ) -> EngineResult<impl IntoResponse> {
+    let _profile = crate::profiling::Timer::new("api.handlers.system.health_handler");
     let device = crate::semantic::SemanticInference::device_label_static();
     let response = (
         StatusCode::OK,
@@ -78,6 +81,7 @@ pub async fn health_handler(
 }
 
 pub async fn healthz_handler() -> impl IntoResponse {
+    let _profile = crate::profiling::Timer::new("api.handlers.system.healthz_handler");
     (StatusCode::OK, Json(ProbeResponse { status: "ok" }))
 }
 
@@ -85,6 +89,7 @@ pub async fn version_handler(
     State(state): State<EngineState>,
     Extension(principal): Extension<RequestPrincipal>,
 ) -> EngineResult<impl IntoResponse> {
+    let _profile = crate::profiling::Timer::new("api.handlers.system.version_handler");
     let response = (
         StatusCode::OK,
         Json(VersionResponse {
@@ -119,10 +124,11 @@ pub async fn warmup_handler(
     State(state): State<EngineState>,
     Extension(principal): Extension<RequestPrincipal>,
 ) -> EngineResult<impl IntoResponse> {
+    let _profile = crate::profiling::Timer::new("api.handlers.system.warmup_handler");
     let semantic = state.semantic.clone();
     let started = Instant::now();
 
-    tokio::task::spawn_blocking(move || {
+    crate::profiling::spawn_blocking(move || {
         semantic
             .generate_query_embedding(WARMUP_PROBE_TEXT)
             .context("warmup embedding generation failed")?;
@@ -148,6 +154,7 @@ pub async fn reset_handler(
     Extension(principal): Extension<RequestPrincipal>,
     Json(payload): Json<ResetPayload>,
 ) -> EngineResult<impl IntoResponse> {
+    let _profile = crate::profiling::Timer::new("api.handlers.system.reset_handler");
     let tenant_id = principal_user_id(&principal).unwrap_or("default");
     let tenant = state.tenant_store(tenant_id).map_err(internal_error)?;
     let confirm = payload.confirm.as_deref();
@@ -171,9 +178,10 @@ pub async fn memory_inspect_handler(
     Extension(principal): Extension<RequestPrincipal>,
     Json(payload): Json<MemoryInspectPayload>,
 ) -> EngineResult<impl IntoResponse> {
+    let _profile = crate::profiling::Timer::new("api.handlers.system.memory_inspect_handler");
     let tenant_id = principal_user_id(&principal).unwrap_or("default");
     let tenant = state.tenant_store(tenant_id).map_err(internal_error)?;
-    let response = tokio::task::spawn_blocking(move || {
+    let response = crate::profiling::spawn_blocking(move || {
         let tenant = tenant.clone();
         let timestamp = tenant
             .lookup_by_memory_id(&payload.memory_id)
@@ -254,6 +262,7 @@ pub async fn memory_delete_handler(
     Extension(principal): Extension<RequestPrincipal>,
     Json(payload): Json<MemoryDeletePayload>,
 ) -> EngineResult<impl IntoResponse> {
+    let _profile = crate::profiling::Timer::new("api.handlers.system.memory_delete_handler");
     let tenant_id = principal_user_id(&principal).unwrap_or("default");
     let tenant = state.tenant_store(tenant_id).map_err(internal_error)?;
     let reason = payload
@@ -261,7 +270,7 @@ pub async fn memory_delete_handler(
         .clone()
         .filter(|reason| !reason.trim().is_empty())
         .unwrap_or_else(|| API_DELETE_REASON.to_string());
-    let response = tokio::task::spawn_blocking(move || {
+    let response = crate::profiling::spawn_blocking(move || {
         let tenant = tenant.clone();
         let timestamp = tenant
             .lookup_by_memory_id(&payload.memory_id)
@@ -380,6 +389,7 @@ pub async fn hardware_stats_handler(
     State(state): State<EngineState>,
     Extension(principal): Extension<RequestPrincipal>,
 ) -> EngineResult<impl IntoResponse> {
+    let _profile = crate::profiling::Timer::new("api.handlers.system.hardware_stats_handler");
     let (cpu_usage_percent, ram_total_mb, ram_used_mb) = get_system_metrics();
     let (storage_total_gb, storage_used_gb) = get_disk_metrics(&state.data_root);
 
@@ -408,6 +418,7 @@ pub async fn cluster_stats_handler(
     Extension(principal): Extension<RequestPrincipal>,
     axum::extract::Path(cluster_id): axum::extract::Path<String>,
 ) -> EngineResult<impl IntoResponse> {
+    let _profile = crate::profiling::Timer::new("api.handlers.system.cluster_stats_handler");
     require_global_principal(&principal)?;
 
     let tenant = state.tenant_store(&cluster_id).map_err(|err| {
@@ -434,6 +445,7 @@ pub async fn storage_stats_handler(
     Extension(principal): Extension<RequestPrincipal>,
     axum::extract::Path(cluster_id): axum::extract::Path<String>,
 ) -> EngineResult<impl IntoResponse> {
+    let _profile = crate::profiling::Timer::new("api.handlers.system.storage_stats_handler");
     require_global_principal(&principal)?;
     let tenant = state.tenant_store(&cluster_id).map_err(|err| {
         tracing::warn!(cluster_id = %cluster_id, error = ?err, "unknown or invalid cluster id");
@@ -451,6 +463,7 @@ pub async fn cluster_graph_handler(
     Extension(principal): Extension<RequestPrincipal>,
     axum::extract::Path(cluster_id): axum::extract::Path<String>,
 ) -> EngineResult<impl IntoResponse> {
+    let _profile = crate::profiling::Timer::new("api.handlers.system.cluster_graph_handler");
     require_global_principal(&principal)?;
     let tenant = state.tenant_store(&cluster_id).map_err(|err| {
         tracing::warn!(cluster_id = %cluster_id, error = ?err, "unknown or invalid cluster id");
@@ -468,6 +481,7 @@ pub async fn admin_inject_api_key_handler(
     Extension(principal): Extension<RequestPrincipal>,
     Json(payload): Json<AdminInjectApiKeyPayload>,
 ) -> EngineResult<impl IntoResponse> {
+    let _profile = crate::profiling::Timer::new("api.handlers.system.admin_inject_api_key_handler");
     require_global_principal(&principal)?;
 
     state
@@ -492,6 +506,7 @@ pub async fn admin_revoke_api_key_handler(
     Extension(principal): Extension<RequestPrincipal>,
     axum::extract::Path(key_id): axum::extract::Path<String>,
 ) -> EngineResult<impl IntoResponse> {
+    let _profile = crate::profiling::Timer::new("api.handlers.system.admin_revoke_api_key_handler");
     require_global_principal(&principal)?;
 
     state.platform.admin_revoke_api_key(&key_id).map_err(|err| {

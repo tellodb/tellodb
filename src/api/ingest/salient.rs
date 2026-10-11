@@ -7,6 +7,7 @@ use crate::core::text::{is_low_signal_keyword, normalize_fact_text, singularize_
 use crate::fts::tokenize_for_similarity;
 
 pub fn extract_named_phrases(lines: &[String]) -> Vec<String> {
+    let _profile = crate::profiling::Timer::new("api.ingest.salient.extract_named_phrases");
     let mut phrases = Vec::new();
 
     for line in lines {
@@ -54,6 +55,7 @@ fn dedupe_preserve_order(values: Vec<String>) -> Vec<String> {
 }
 
 pub fn build_keyword_companion_text(text: &str) -> Option<String> {
+    let _profile = crate::profiling::Timer::new("api.ingest.salient.build_keyword_companion_text");
     let dialogue_lines = extract_dialogue_messages(text);
     let content_lines = if dialogue_lines.is_empty() {
         text.lines()
@@ -127,6 +129,7 @@ pub fn build_keyword_companion_text(text: &str) -> Option<String> {
 }
 
 pub fn extract_salient_terms(text: &str, limit: usize) -> Vec<String> {
+    let _profile = crate::profiling::Timer::new("api.ingest.salient.extract_salient_terms");
     let mut counts = HashMap::new();
     for token in tokenize_for_similarity(text)
         .into_iter()
@@ -141,6 +144,7 @@ pub fn extract_salient_terms(text: &str, limit: usize) -> Vec<String> {
 }
 
 pub fn truncate_for_companion(text: &str, max_chars: usize) -> String {
+    let _profile = crate::profiling::Timer::new("api.ingest.salient.truncate_for_companion");
     let normalized = normalize_fact_text(text);
     if normalized.len() <= max_chars {
         normalized

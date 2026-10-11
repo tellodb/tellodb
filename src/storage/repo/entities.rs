@@ -2,6 +2,7 @@ use super::prelude::*;
 
 impl TenantStore {
     pub fn set_aliases_batch(&self, entity_id: &str, aliases: &[(String, String)]) -> Result<()> {
+        let _profile = crate::profiling::Timer::new("storage.repo.entities.set_aliases_batch");
         let mut conn = self.get_conn()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         {
@@ -17,6 +18,7 @@ impl TenantStore {
     }
 
     pub fn register_entity(&self, entity_id: &str, canonical_name: &str) -> Result<()> {
+        let _profile = crate::profiling::Timer::new("storage.repo.entities.register_entity");
         let now =
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
         let sk = crate::storage::entity_resolver::phonetic_key(canonical_name);
@@ -33,6 +35,7 @@ impl TenantStore {
         &self,
         entity_id: &str,
     ) -> Result<Vec<crate::storage::entity_resolver::EntityCandidate>> {
+        let _profile = crate::profiling::Timer::new("storage.repo.entities.load_entity_candidates");
         let conn = self.get_conn()?;
 
         let mut reg_stmt = conn.prepare_cached(
@@ -110,6 +113,7 @@ impl TenantStore {
     }
 
     fn proposal_id(entity_id: &str, from: &str, to: &str, now_ms: u64) -> String {
+        let _profile = crate::profiling::Timer::new("storage.repo.entities.proposal_id");
         format!("merge::{entity_id}::{from}::{to}::{now_ms}")
     }
 
@@ -121,6 +125,7 @@ impl TenantStore {
         tier: &str,
         confidence: f32,
     ) -> Result<Option<String>> {
+        let _profile = crate::profiling::Timer::new("storage.repo.entities.create_merge_proposal");
         let now =
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
         let pid = Self::proposal_id(entity_id, from_name, to_name, now);
@@ -144,6 +149,7 @@ impl TenantStore {
         name_embedding: Option<&[f32]>,
         config: &crate::storage::entity_resolver::ResolutionConfig,
     ) -> Result<crate::storage::entity_resolver::EntityResolution> {
+        let _profile = crate::profiling::Timer::new("storage.repo.entities.resolve_and_propose");
         let candidates = self.load_entity_candidates(entity_id)?;
         let resolution = crate::storage::entity_resolver::resolve_name(
             name,
@@ -172,6 +178,7 @@ impl TenantStore {
     }
 
     pub fn get_core_profile(&self, entity_id: &str) -> Result<Option<String>> {
+        let _profile = crate::profiling::Timer::new("storage.repo.entities.get_core_profile");
         let conn = self.get_conn()?;
         let mut stmt =
             conn.prepare_cached("SELECT profile_json FROM core_profiles WHERE entity_id = ?1")?;
@@ -188,6 +195,7 @@ impl TenantStore {
         entity_id: &str,
         update: impl FnOnce(Option<String>) -> Option<String>,
     ) -> Result<()> {
+        let _profile = crate::profiling::Timer::new("storage.repo.entities.update_core_profile");
         let mut conn = self.get_conn()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let current = match tx.query_row(
@@ -210,6 +218,7 @@ impl TenantStore {
     }
 
     pub fn set_core_profile(&self, entity_id: &str, profile_json: &str) -> Result<()> {
+        let _profile = crate::profiling::Timer::new("storage.repo.entities.set_core_profile");
         let conn = self.get_conn()?;
         let now = unix_timestamp_ms()?;
         conn.execute(

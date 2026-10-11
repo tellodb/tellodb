@@ -6,6 +6,8 @@ impl TenantStore {
         entity_id: &str,
         items: &[(String, f32)],
     ) -> Result<()> {
+        let _profile =
+            crate::profiling::Timer::new("storage.repo.prefs.set_preference_memories_batch");
         let mut conn = self.get_conn()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         {
@@ -25,6 +27,7 @@ impl TenantStore {
         entity_id: &str,
         limit: usize,
     ) -> Result<Vec<(String, f32)>> {
+        let _profile = crate::profiling::Timer::new("storage.repo.prefs.get_preference_memories");
         let conn = self.get_conn()?;
         let mut stmt =
             conn.prepare_cached("SELECT memory_id, strength FROM preferences WHERE entity_id = ?1 ORDER BY strength DESC LIMIT ?2")?;

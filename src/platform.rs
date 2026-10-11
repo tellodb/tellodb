@@ -106,6 +106,7 @@ pub struct ApiKeyAuth {
 
 impl PlatformStore {
     pub fn new(path: &str) -> Result<Self> {
+        let _profile = crate::profiling::Timer::new("platform.new");
         let manager = SqliteConnectionManager::file(path);
         let pool =
             Pool::new(manager).context("failed to create platform database connection pool")?;
@@ -170,10 +171,12 @@ impl PlatformStore {
     }
 
     fn get_conn(&self) -> Result<r2d2::PooledConnection<SqliteConnectionManager>> {
+        let _profile = crate::profiling::Timer::new("platform.get_conn");
         self.pool.get().context("Failed to get platform connection")
     }
 
     pub fn create_user(&self, username: &str, password: &str) -> Result<PublicUser> {
+        let _profile = crate::profiling::Timer::new("platform.create_user");
         let username = username.trim().to_ascii_lowercase();
         if username.len() > MAX_USERNAME_LENGTH {
             return Err(anyhow!("username must be at most {MAX_USERNAME_LENGTH} bytes"));
@@ -210,6 +213,7 @@ impl PlatformStore {
     }
 
     pub fn login(&self, username: &str, password: &str) -> Result<PublicUser> {
+        let _profile = crate::profiling::Timer::new("platform.login");
         let username = username.trim().to_ascii_lowercase();
         if username.len() > MAX_USERNAME_LENGTH {
             return Err(anyhow!("username must be at most {MAX_USERNAME_LENGTH} bytes"));
@@ -242,6 +246,7 @@ impl PlatformStore {
     }
 
     pub fn create_session(&self, user_id: &str, ttl_secs: u64) -> Result<String> {
+        let _profile = crate::profiling::Timer::new("platform.create_session");
         let now = now_ms()?;
         let token = format!("sess_{}", random_token(TOKEN_RANDOM_LENGTH));
         let expires_at_ms = now.saturating_add(ttl_secs.saturating_mul(1000));
@@ -255,6 +260,7 @@ impl PlatformStore {
     }
 
     pub fn resolve_session(&self, token: &str) -> Result<Option<PublicUser>> {
+        let _profile = crate::profiling::Timer::new("platform.resolve_session");
         let conn = self.get_conn()?;
         let mut stmt = conn
             .prepare(
@@ -288,6 +294,7 @@ impl PlatformStore {
     }
 
     pub fn delete_session(&self, token: &str) -> Result<()> {
+        let _profile = crate::profiling::Timer::new("platform.delete_session");
         let conn = self.get_conn()?;
         conn.execute("DELETE FROM sessions WHERE token = ?1", params![token])
             .context("failed to delete session")?;
@@ -295,12 +302,14 @@ impl PlatformStore {
     }
 
     pub fn purge_expired_sessions(&self, now_ms: u64) -> Result<usize> {
+        let _profile = crate::profiling::Timer::new("platform.purge_expired_sessions");
         let conn = self.get_conn()?;
         conn.execute("DELETE FROM sessions WHERE expires_at_ms <= ?1", params![now_ms])
             .context("failed to purge expired sessions")
     }
 
     pub fn create_api_key(&self, user_id: &str, name: &str) -> Result<(PublicApiKey, String)> {
+        let _profile = crate::profiling::Timer::new("platform.create_api_key");
         self.create_api_key_for_cluster(user_id, name, None).context("failed to create API key")
     }
 
@@ -310,6 +319,7 @@ impl PlatformStore {
         name: &str,
         cluster_id: Option<&str>,
     ) -> Result<(PublicApiKey, String)> {
+        let _profile = crate::profiling::Timer::new("platform.create_api_key_for_cluster");
         let now = now_ms()?;
         let key_id = format!("key_{}", random_token(USER_ID_RANDOM_LENGTH));
         let raw_key = format!("ak_{}", random_token(TOKEN_RANDOM_LENGTH));
@@ -344,6 +354,7 @@ impl PlatformStore {
         raw_key: &str,
         cluster_id: Option<&str>,
     ) -> Result<()> {
+        let _profile = crate::profiling::Timer::new("platform.inject_api_key");
         let now = now_ms()?;
         let key_hash = sha256_hex(raw_key);
         let key_prefix = raw_key.chars().take(API_KEY_PREFIX_LENGTH).collect::<String>();
@@ -358,6 +369,7 @@ impl PlatformStore {
     }
 
     pub fn list_api_keys(&self, user_id: &str) -> Result<Vec<PublicApiKey>> {
+        let _profile = crate::profiling::Timer::new("platform.list_api_keys");
         let conn = self.get_conn()?;
         let mut stmt = conn
             .prepare(
@@ -391,6 +403,7 @@ impl PlatformStore {
     }
 
     pub fn revoke_api_key(&self, user_id: &str, key_id: &str) -> Result<()> {
+        let _profile = crate::profiling::Timer::new("platform.revoke_api_key");
         let conn = self.get_conn()?;
         let count = conn
             .execute(
@@ -405,6 +418,7 @@ impl PlatformStore {
     }
 
     pub fn admin_revoke_api_key(&self, key_id: &str) -> Result<()> {
+        let _profile = crate::profiling::Timer::new("platform.admin_revoke_api_key");
         let conn = self.get_conn()?;
         let count = conn
             .execute("UPDATE api_keys SET disabled = 1 WHERE key_id = ?1", params![key_id])
@@ -416,6 +430,7 @@ impl PlatformStore {
     }
 
     pub fn authenticate_api_key(&self, raw_key: &str) -> Result<Option<ApiKeyAuth>> {
+        let _profile = crate::profiling::Timer::new("platform.authenticate_api_key");
         let key_hash = sha256_hex(raw_key);
         let conn = self.get_conn()?;
         let mut stmt = conn
@@ -442,10 +457,12 @@ impl PlatformStore {
     }
 
     pub fn record_usage(&self, user_id: &str, endpoint: &str) -> Result<()> {
+        let _profile = crate::profiling::Timer::new("platform.record_usage");
         self.record_usage_n(user_id, endpoint, 1)
     }
 
     pub fn record_usage_n(&self, user_id: &str, endpoint: &str, count: u64) -> Result<()> {
+        let _profile = crate::profiling::Timer::new("platform.record_usage_n");
         if count == 0 {
             return Ok(());
         }
@@ -510,6 +527,7 @@ impl PlatformStore {
     }
 
     pub fn usage_stats(&self, user_id: &str) -> Result<UsageStats> {
+        let _profile = crate::profiling::Timer::new("platform.usage_stats");
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare("
             SELECT request_count, ingest_count, query_count, temporal_query_count, reset_count, health_count, version_count, last_request_ms 
@@ -546,6 +564,7 @@ impl PlatformStore {
     }
 
     pub fn total_usage_stats(&self) -> Result<UsageStats> {
+        let _profile = crate::profiling::Timer::new("platform.total_usage_stats");
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare("
             SELECT SUM(request_count), SUM(ingest_count), SUM(query_count), SUM(temporal_query_count),
@@ -583,6 +602,7 @@ impl PlatformStore {
     }
 
     pub fn user_profile(&self, user_id: &str) -> Result<UserProfile> {
+        let _profile = crate::profiling::Timer::new("platform.user_profile");
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare("SELECT stable_facts, recent_activity, last_updated_ms FROM user_profiles WHERE user_id = ?1")
             .context("failed to prepare user profile query statement")?;
@@ -630,6 +650,7 @@ impl PlatformStore {
         timestamp_ms: u64,
         source: &str,
     ) -> Result<()> {
+        let _profile = crate::profiling::Timer::new("platform.update_profile_from_text");
         let stable_candidates = extract_profile_stable_facts(text);
         let activity_candidates = extract_profile_activity_facts(text);
         if stable_candidates.is_empty() && activity_candidates.is_empty() {

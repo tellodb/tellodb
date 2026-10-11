@@ -20,6 +20,7 @@ use std::collections::{BTreeMap, HashMap};
 /// A source turn is a memory as sent (or the first chunk of one), as opposed
 /// to derived records such as later chunks, companions and cards.
 pub fn is_source_turn(payload: &IngestPayload) -> bool {
+    let _profile = crate::profiling::Timer::new("api.ingest.embed_text.is_source_turn");
     if payload.kind.as_deref() == Some("synthetic_query") {
         return false;
     }
@@ -30,6 +31,7 @@ pub fn is_source_turn(payload: &IngestPayload) -> bool {
 }
 
 pub fn turn_line(role: &str, text: &str) -> String {
+    let _profile = crate::profiling::Timer::new("api.ingest.embed_text.turn_line");
     // A caller may prefix `[Session ID: ...]` / `[Session Date: ...]`. Those
     // are read for event time elsewhere and must not be embedded: this module
     // guarantees dates and session ids are not part of embedded text.
@@ -42,10 +44,12 @@ pub fn turn_line(role: &str, text: &str) -> String {
 }
 
 fn payload_line(payload: &IngestPayload) -> String {
+    let _profile = crate::profiling::Timer::new("api.ingest.embed_text.payload_line");
     turn_line(payload.role.as_deref().unwrap_or(""), &payload.textual_content)
 }
 
 fn window_text(turns: &BTreeMap<u32, String>, center: u32, window: u32) -> Option<String> {
+    let _profile = crate::profiling::Timer::new("api.ingest.embed_text.window_text");
     let current = turns.get(&center)?;
     let lo = center.saturating_sub(window);
     let hi = center.saturating_add(window);
@@ -75,6 +79,7 @@ pub fn build_embed_texts(
     payloads: &[IngestPayload],
     config: EmbedTextConfig,
 ) -> Result<ContextTexts> {
+    let _profile = crate::profiling::Timer::new("api.ingest.embed_text.build_embed_texts");
     let mut texts: Vec<String> = payloads
         .iter()
         .map(|p| if is_source_turn(p) { payload_line(p) } else { p.textual_content.clone() })

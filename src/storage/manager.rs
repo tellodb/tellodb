@@ -17,6 +17,7 @@ pub struct TenantDatabaseManager {
 /// Tenant ids become directory names, so only a safe character set is
 /// accepted (no path separators, `..`, or empty ids).
 pub fn validate_tenant_id(tenant_id: &str) -> Result<()> {
+    let _profile = crate::profiling::Timer::new("storage.manager.validate_tenant_id");
     let valid = !tenant_id.is_empty()
         && tenant_id.len() <= 128
         && tenant_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
@@ -28,6 +29,7 @@ pub fn validate_tenant_id(tenant_id: &str) -> Result<()> {
 
 impl TenantDatabaseManager {
     pub fn new(paths: RuntimePaths, vector_config: VectorConfig) -> Self {
+        let _profile = crate::profiling::Timer::new("storage.manager.new");
         let capacity = std::env::var("TELLODB_MAX_OPEN_TENANTS")
             .ok()
             .and_then(|value| value.parse().ok())
@@ -41,10 +43,12 @@ impl TenantDatabaseManager {
         vector_config: VectorConfig,
         capacity: NonZeroUsize,
     ) -> Self {
+        let _profile = crate::profiling::Timer::new("storage.manager.with_capacity");
         Self { paths, vector_config, tenants: RwLock::new(LruCache::new(capacity)) }
     }
 
     pub fn migrate_existing_tenants(&self) -> Result<usize> {
+        let _profile = crate::profiling::Timer::new("storage.manager.migrate_existing_tenants");
         let tenants_dir = self.paths.root().join("tenants");
         if !tenants_dir.exists() {
             return Ok(0);
@@ -69,6 +73,7 @@ impl TenantDatabaseManager {
     }
 
     pub fn get_tenant(&self, tenant_id: &str) -> Result<Arc<TenantStore>> {
+        let _profile = crate::profiling::Timer::new("storage.manager.get_tenant");
         validate_tenant_id(tenant_id)?;
         let mut write = self.tenants.write();
         if let Some(store) = write.get(tenant_id) {
@@ -92,11 +97,13 @@ impl TenantDatabaseManager {
     }
 
     pub fn all_tenants(&self) -> Vec<Arc<TenantStore>> {
+        let _profile = crate::profiling::Timer::new("storage.manager.all_tenants");
         let read = self.tenants.read();
         read.iter().map(|(_, store)| store.clone()).collect()
     }
 
     pub fn tenant_ids(&self) -> Result<Vec<String>> {
+        let _profile = crate::profiling::Timer::new("storage.manager.tenant_ids");
         let tenants_dir = self.paths.root().join("tenants");
         if !tenants_dir.exists() {
             return Ok(Vec::new());

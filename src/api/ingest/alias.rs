@@ -3,6 +3,7 @@ use crate::error::EngineResult;
 pub fn extract_aliases_from_text(text: &str, known_entities: &[String]) -> Vec<(String, String)> {
     const MAX_ALIASES_PER_ENTITY: usize = 10;
     const MAX_PREFIX_COLLISIONS: usize = 3;
+    let _profile = crate::profiling::Timer::new("api.ingest.alias.extract_aliases_from_text");
     let mut aliases = Vec::new();
     let lower = text.to_ascii_lowercase();
 
@@ -111,6 +112,7 @@ pub fn is_semantic_duplicate(
     embedding: &[f32],
     threshold: f32,
 ) -> EngineResult<bool> {
+    let _profile = crate::profiling::Timer::new("api.ingest.alias.is_semantic_duplicate");
     let candidates = vectors
         .search(Some(entity_id), embedding, 5)
         .map_err(|err| crate::error::EngineError::Other(anyhow::anyhow!(err)))?;

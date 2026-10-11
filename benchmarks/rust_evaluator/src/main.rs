@@ -699,6 +699,7 @@ pub struct QueryTimings {
 struct QueryResponse {
     results: Vec<QueryResult>,
     timings: QueryTimings,
+    request_id: u64,
 }
 
 struct PackedSession {
@@ -1265,6 +1266,18 @@ async fn run_recall(
             &instance.answer_session_ids,
             config.top_k,
         );
+        if std::env::var("PROFILE_LOGS").as_deref() == Ok("1") {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "event": "question_quality", "request_id": query.request_id,
+                    "question_id": eval_question_id, "question_type": question_type,
+                    "entity_id": entity_id, "expected_sessions": instance.answer_session_ids,
+                    "retrieved_sessions": retrieved_sessions, "hit_any": hit, "hit_all": hit_all,
+                    "ndcg": ndcg, "query_ms": query_ms,
+                })
+            );
+        }
         rows.push(QuestionRecord {
             question_id: eval_question_id.clone(),
             question_type: question_type.to_string(),
@@ -2318,6 +2331,7 @@ async fn query_engine(
     }
 
     let timings = parse_query_timings(response.headers());
+    let request_id = header_u64(response.headers(), "x-tm-request-id");
     let mut results =
         response.json::<Vec<QueryResult>>().await.context("Failed to decode query results")?;
     for result in &mut results {
@@ -2329,7 +2343,7 @@ async fn query_engine(
         }
     }
 
-    Ok(QueryResponse { results, timings })
+    Ok(QueryResponse { results, timings, request_id })
 }
 
 /// Bytes in use in the engine's default tenant database, if the key may read it.

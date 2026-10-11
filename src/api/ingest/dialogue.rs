@@ -3,6 +3,8 @@ use std::collections::HashSet;
 use crate::core::text::normalize_fact_text;
 
 pub fn extract_bracketed_header_value(text: &str, label: &str) -> Option<String> {
+    let _profile =
+        crate::profiling::Timer::new("api.ingest.dialogue.extract_bracketed_header_value");
     let needle = format!("[{}:", label.to_ascii_lowercase());
     for line in text.lines() {
         let trimmed = line.trim();
@@ -21,6 +23,7 @@ pub fn extract_bracketed_header_value(text: &str, label: &str) -> Option<String>
 }
 
 pub fn normalize_speaker_label(label: &str) -> Option<String> {
+    let _profile = crate::profiling::Timer::new("api.ingest.dialogue.normalize_speaker_label");
     let cleaned = label
         .trim()
         .trim_matches(|c: char| matches!(c, '"' | '\'' | '[' | ']' | '-' | '*' | '•' | ' '));
@@ -42,6 +45,8 @@ pub fn normalize_speaker_label(label: &str) -> Option<String> {
 }
 
 pub fn strip_leading_bracketed_prefixes(text: &str) -> &str {
+    let _profile =
+        crate::profiling::Timer::new("api.ingest.dialogue.strip_leading_bracketed_prefixes");
     let mut rest = text.trim();
     loop {
         if !rest.starts_with('[') {
@@ -67,10 +72,12 @@ pub fn strip_leading_bracketed_prefixes(text: &str) -> &str {
 /// A document that is nothing but headers is kept as-is rather than reduced
 /// to an empty, unsearchable memory.
 pub fn content_for_index(text: &str) -> &str {
+    let _profile = crate::profiling::Timer::new("api.ingest.dialogue.content_for_index");
     crate::core::text::content_for_index(text)
 }
 
 pub fn value_to_text(value: &serde_json::Value) -> Option<String> {
+    let _profile = crate::profiling::Timer::new("api.ingest.dialogue.value_to_text");
     match value {
         serde_json::Value::String(text) => {
             let normalized = normalize_fact_text(text);
@@ -98,6 +105,8 @@ pub fn collect_dialogue_messages_from_json(
     value: &serde_json::Value,
     messages: &mut Vec<(String, String)>,
 ) {
+    let _profile =
+        crate::profiling::Timer::new("api.ingest.dialogue.collect_dialogue_messages_from_json");
     match value {
         serde_json::Value::Array(items) => {
             for item in items {
@@ -125,6 +134,7 @@ pub fn collect_dialogue_messages_from_json(
 }
 
 pub fn parse_role_prefixed_line(line: &str) -> Option<(String, String)> {
+    let _profile = crate::profiling::Timer::new("api.ingest.dialogue.parse_role_prefixed_line");
     let trimmed = line.trim().trim_start_matches(['-', '*', '•', '>', ' ']);
     if trimmed.is_empty() {
         return None;
@@ -149,6 +159,7 @@ pub fn parse_role_prefixed_line(line: &str) -> Option<(String, String)> {
 }
 
 pub fn extract_dialogue_messages(text: &str) -> Vec<(String, String)> {
+    let _profile = crate::profiling::Timer::new("api.ingest.dialogue.extract_dialogue_messages");
     let mut messages = Vec::new();
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
         collect_dialogue_messages_from_json(&value, &mut messages);
@@ -168,6 +179,7 @@ pub fn extract_dialogue_messages(text: &str) -> Vec<(String, String)> {
 }
 
 pub fn is_fact_like_message(text: &str) -> bool {
+    let _profile = crate::profiling::Timer::new("api.ingest.dialogue.is_fact_like_message");
     let lower = format!(" {} ", text.to_ascii_lowercase());
     lower.contains(" i ")
         || lower.contains(" my ")
@@ -179,6 +191,7 @@ pub fn is_fact_like_message(text: &str) -> bool {
 }
 
 pub fn extract_companion_texts(text: &str) -> (Option<String>, Vec<String>) {
+    let _profile = crate::profiling::Timer::new("api.ingest.dialogue.extract_companion_texts");
     let dialogue_lines = extract_dialogue_messages(text);
 
     let gist = if dialogue_lines.is_empty() {

@@ -21,6 +21,7 @@ use crate::heuristics::Profile;
 use crate::ml::QueryIntentClassifier;
 
 pub fn build_query_plan(query: &str, classifier: Option<&QueryIntentClassifier>) -> QueryPlan {
+    let _profile = crate::profiling::Timer::new("api.plan.builder.build_query_plan");
     build_query_plan_with_profile(query, classifier, Profile::Generic)
 }
 
@@ -30,6 +31,7 @@ pub fn build_query_plan_with_profile(
     classifier: Option<&QueryIntentClassifier>,
     profile: Profile,
 ) -> QueryPlan {
+    let _profile = crate::profiling::Timer::new("api.plan.builder.build_query_plan_with_profile");
     build_query_plan_with_profile_and_rules(query, classifier, profile, ExpansionRules::builtin())
 }
 
@@ -40,6 +42,8 @@ pub fn build_query_plan_with_profile_and_rules(
     profile: Profile,
     rules: &ExpansionRules,
 ) -> QueryPlan {
+    let _profile =
+        crate::profiling::Timer::new("api.plan.builder.build_query_plan_with_profile_and_rules");
     let keyword_query = build_keyword_query(query);
     let subject_entities = extract_subject_entities(query);
     let ordinal_rank = extract_ordinal_rank(query);
@@ -215,6 +219,7 @@ pub fn query_prefers_latest(query: &str) -> bool {
         " still ",
         " anymore ",
     ];
+    let _profile = crate::profiling::Timer::new("api.plan.builder.query_prefers_latest");
     let lower = format!(" {} ", query.to_ascii_lowercase().replace(['?', '.', ',', '!'], " "));
     if PAST.iter().any(|cue| lower.contains(cue)) {
         return false;
@@ -228,6 +233,8 @@ mod prefers_latest_tests {
 
     #[test]
     fn detects_current_value_questions() {
+        let _profile =
+            crate::profiling::Timer::new("api.plan.builder.detects_current_value_questions");
         assert!(query_prefers_latest("Where do I currently live?"));
         assert!(query_prefers_latest("What city do I live in right now?"));
         assert!(query_prefers_latest("Is she still working at Acme?"));

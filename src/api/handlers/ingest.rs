@@ -239,6 +239,7 @@ pub async fn ingest_handler(
     Extension(principal): Extension<RequestPrincipal>,
     Json(payload): Json<IngestPayload>,
 ) -> Result<impl IntoResponse, EngineError> {
+    let _profile = crate::profiling::Timer::new("api.handlers.ingest.ingest_handler");
     batch_ingest_handler(
         State(state),
         Extension(principal),
@@ -252,6 +253,7 @@ pub async fn batch_ingest_handler(
     Extension(principal): Extension<RequestPrincipal>,
     Json(payload): Json<BatchIngestPayload>,
 ) -> Result<impl IntoResponse, EngineError> {
+    let _profile = crate::profiling::Timer::new("api.handlers.ingest.batch_ingest_handler");
     let profile_items = payload
         .items
         .iter()
@@ -283,6 +285,7 @@ pub async fn batch_ingest_handler(
 }
 
 fn ingest_timing_headers(diag: &IngestDiagnostics) -> HeaderMap {
+    let _profile = crate::profiling::Timer::new("api.handlers.ingest.ingest_timing_headers");
     let mut headers = HeaderMap::new();
     insert_stage_timing_headers(&mut headers, "x-tm-embed", diag.embed_ms, diag.embed_us);
     insert_stage_timing_headers(
@@ -314,11 +317,13 @@ pub(crate) async fn process_ingest_batch(
     tenant: &std::sync::Arc<TenantStore>,
     payloads: Vec<IngestPayload>,
 ) -> EngineResult<(Vec<ConsolidationTask>, IngestDiagnostics)> {
+    let _profile = crate::profiling::Timer::new("api.handlers.ingest.process_ingest_batch");
     execute_ingest_pipeline(state, tenant, payloads).await
 }
 
 /// Session of a (normalized) payload, if any.
 fn payload_session(payload: &IngestPayload) -> Option<String> {
+    let _profile = crate::profiling::Timer::new("api.handlers.ingest.payload_session");
     payload.session_id.clone().filter(|s| !s.is_empty())
 }
 
@@ -332,6 +337,7 @@ fn expand_and_enrich_payloads(
     embed_config: crate::config::EmbedTextConfig,
     profile: Profile,
 ) -> (Vec<IngestPayload>, Vec<String>) {
+    let _profile = crate::profiling::Timer::new("api.handlers.ingest.expand_and_enrich_payloads");
     let stage_start = Instant::now();
 
     let mut expanded_payloads = Vec::new();
@@ -458,6 +464,7 @@ async fn generate_embeddings(
     enriched_texts: &[String],
     diag: &mut IngestDiagnostics,
 ) -> EngineResult<Vec<Vec<f32>>> {
+    let _profile = crate::profiling::Timer::new("api.handlers.ingest.generate_embeddings");
     let spec_prep_start = Instant::now();
     let semantic_embed_specs: Vec<(EmbeddingMode, String)> = expanded_payloads
         .iter()
@@ -510,6 +517,7 @@ fn build_observations(
     features: Features,
     profile: Profile,
 ) -> EngineResult<Vec<PreparedRecord>> {
+    let _profile = crate::profiling::Timer::new("api.handlers.ingest.build_observations");
     let dedup_build_start = Instant::now();
 
     let mut prepared = Vec::new();
@@ -609,6 +617,7 @@ fn build_observations(
 }
 
 fn should_keep_payload(stored: Option<&(String, i64)>, content_hash: &str) -> bool {
+    let _profile = crate::profiling::Timer::new("api.handlers.ingest.should_keep_payload");
     match stored {
         Some((stored_hash, indexed)) => stored_hash != content_hash || *indexed == 0,
         None => true,
@@ -622,6 +631,7 @@ fn build_artifacts(
     diag: &mut IngestDiagnostics,
     features: Features,
 ) -> ArtifactBatches {
+    let _profile = crate::profiling::Timer::new("api.handlers.ingest.build_artifacts");
     let artifact_build_start = Instant::now();
     let mut batches = ArtifactBatches::default();
 
@@ -768,6 +778,7 @@ async fn commit_batches(
     batches: &mut ArtifactBatches,
     diag: &mut IngestDiagnostics,
 ) -> EngineResult<()> {
+    let _profile = crate::profiling::Timer::new("api.handlers.ingest.commit_batches");
     if !batches.retrospective_candidates.is_empty() {
         let stage_start = Instant::now();
         let retrospective_links = build_retrospective_links(
@@ -845,7 +856,7 @@ async fn commit_batches(
     let storage_start = Instant::now();
     let tenant_for_commit = tenant.clone();
     let outcome =
-        tokio::task::spawn_blocking(move || tenant_for_commit.commit_ingest(&storage_batches))
+        crate::profiling::spawn_blocking(move || tenant_for_commit.commit_ingest(&storage_batches))
             .await
             .map_err(anyhow::Error::from)
             .and_then(|result| result)
@@ -859,7 +870,7 @@ async fn commit_batches(
     let vector_batch = outcome.vector_batch;
     let indexed_memory_ids = outcome.indexed_memory_ids;
     let (res_fts, res_vix) = tokio::join!(
-        tokio::task::spawn_blocking({
+        crate::profiling::spawn_blocking({
             let tenant = tenant.clone();
             move || -> anyhow::Result<Duration> {
                 let start = Instant::now();
@@ -869,7 +880,7 @@ async fn commit_batches(
                 Ok(start.elapsed())
             }
         }),
-        tokio::task::spawn_blocking({
+        crate::profiling::spawn_blocking({
             let tenant = tenant.clone();
             move || -> anyhow::Result<Duration> {
                 let start = Instant::now();
@@ -898,7 +909,7 @@ async fn commit_batches(
             let failure = fts.err().or_else(|| vector.err()).expect("one indexing stage failed");
             let tenant_for_repair = tenant.clone();
             let ids_for_repair = indexed_memory_ids.clone();
-            if let Err(repair_error) = tokio::task::spawn_blocking(move || {
+            if let Err(repair_error) = crate::profiling::spawn_blocking(move || {
                 tenant_for_repair.reindex_memory_ids(&ids_for_repair)
             })
             .await
@@ -929,6 +940,8 @@ fn build_memory_card_from_payload(
     kind: MemoryKind,
     lifecycle: &LifecycleMetadata,
 ) -> Option<MemoryCard> {
+    let _profile =
+        crate::profiling::Timer::new("api.handlers.ingest.build_memory_card_from_payload");
     let source_memory_id =
         payload.source_memory_id.clone().unwrap_or_else(|| payload.memory_id.clone());
     let parsed_source_id = MemoryId::parse(&source_memory_id).ok();
@@ -1017,6 +1030,7 @@ fn build_memory_card_from_payload(
 }
 
 fn card_type_for_kind(kind: MemoryKind, text: &str) -> String {
+    let _profile = crate::profiling::Timer::new("api.handlers.ingest.card_type_for_kind");
     let lower = text.to_ascii_lowercase();
     match kind {
         MemoryKind::Preference => "preference",
@@ -1037,6 +1051,7 @@ fn card_type_for_kind(kind: MemoryKind, text: &str) -> String {
 }
 
 fn is_static_profile_card(predicate: &str, text: &str, kind: MemoryKind) -> bool {
+    let _profile = crate::profiling::Timer::new("api.handlers.ingest.is_static_profile_card");
     if matches!(kind, MemoryKind::Preference | MemoryKind::Decision) {
         return true;
     }
@@ -1064,6 +1079,9 @@ fn build_session_router_update_from_payload(
     payload: &IngestPayload,
     kind: MemoryKind,
 ) -> Option<SessionRouterRecord> {
+    let _profile = crate::profiling::Timer::new(
+        "api.handlers.ingest.build_session_router_update_from_payload",
+    );
     let session_id = payload_session(payload)?;
     let document_time_ms = extract_document_time_ms(&payload.textual_content, payload.timestamp);
     let session_date = extract_bracketed_header_value(&payload.textual_content, "Session Date")
@@ -1133,6 +1151,7 @@ fn build_session_router_update_from_payload(
 }
 
 fn truncate_router_value(text: &str, max_chars: usize) -> String {
+    let _profile = crate::profiling::Timer::new("api.handlers.ingest.truncate_router_value");
     if text.chars().count() <= max_chars {
         text.to_string()
     } else {
@@ -1145,6 +1164,7 @@ fn build_retrospective_links(
     tenant: &dyn RetrospectiveRepo,
     candidates: &[RetrospectiveCandidate],
 ) -> EngineResult<Vec<(String, String, String)>> {
+    let _profile = crate::profiling::Timer::new("api.handlers.ingest.build_retrospective_links");
     let mut links = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
@@ -1242,6 +1262,7 @@ fn classify_retrospective_link(
     current_timestamp: u64,
     target_timestamp: u64,
 ) -> (&'static str, &'static str) {
+    let _profile = crate::profiling::Timer::new("api.handlers.ingest.classify_retrospective_link");
     let current_lower = current_text.to_ascii_lowercase();
     let target_lower = target_text.to_ascii_lowercase();
     let contradiction_markers = ["actually", "turns out", "not ", "never ", "instead", "wrong"];
@@ -1272,11 +1293,12 @@ fn classify_retrospective_link(
 }
 
 pub(crate) fn spawn_consolidation_tasks(tenant: Arc<TenantStore>, tasks: Vec<ConsolidationTask>) {
+    let _profile = crate::profiling::Timer::new("api.handlers.ingest.spawn_consolidation_tasks");
     if tasks.is_empty() {
         return;
     }
     // One blocking task per batch; each profile update is its own transaction.
-    tokio::task::spawn_blocking(move || {
+    crate::profiling::spawn_blocking(move || {
         for task in &tasks {
             if let Err(err) = update_core_profile_heuristic(&tenant, task) {
                 tracing::warn!(entity_id = %task.entity_id, error = ?err, "core profile update failed");
@@ -1288,6 +1310,7 @@ pub(crate) fn spawn_consolidation_tasks(tenant: Arc<TenantStore>, tasks: Vec<Con
 }
 
 pub fn run_pending_consolidations(tenant: &TenantStore, limit: usize) -> anyhow::Result<usize> {
+    let _profile = crate::profiling::Timer::new("api.handlers.ingest.run_pending_consolidations");
     let tasks = tenant.pending_consolidation_tasks(limit)?;
     let mut completed = 0;
     for task in tasks {
@@ -1312,6 +1335,8 @@ fn update_core_profile_heuristic(
     task: &ConsolidationTask,
 ) -> anyhow::Result<()> {
     const MAX_PROFILE_FACTS: usize = 24;
+    let _profile =
+        crate::profiling::Timer::new("api.handlers.ingest.update_core_profile_heuristic");
     let excerpt = truncate_router_value(&normalize_fact_text(&task.textual_content), 280);
     if excerpt.is_empty() {
         return Ok(());
@@ -1359,6 +1384,7 @@ async fn execute_ingest_pipeline(
     tenant: &std::sync::Arc<TenantStore>,
     payloads: Vec<IngestPayload>,
 ) -> EngineResult<(Vec<ConsolidationTask>, IngestDiagnostics)> {
+    let _profile = crate::profiling::Timer::new("api.handlers.ingest.execute_ingest_pipeline");
     let mut diag = IngestDiagnostics::default();
     let total_start = Instant::now();
 
@@ -1367,6 +1393,8 @@ async fn execute_ingest_pipeline(
     }
 
     diag.input_count = payloads.len();
+    tracing::debug!(target: "tellodb::profile", event = "ingest_input",
+        inputs = payloads.len(), input_bytes = payloads.iter().map(|p| p.textual_content.len()).sum::<usize>());
 
     // Numeric memory is extracted from the memories as sent, not from chunks
     // or derived companions (which restate the same numbers).
@@ -1395,7 +1423,7 @@ async fn execute_ingest_pipeline(
     let mut neighbour_updates = Vec::new();
     if embed_config.mode != crate::api::ingest::embed_text::EmbedTextMode::Legacy {
         let (tenant_for_text, payloads_for_text) = (tenant.clone(), expanded_payloads.clone());
-        let built = tokio::task::spawn_blocking(move || {
+        let built = crate::profiling::spawn_blocking(move || {
             crate::api::ingest::embed_text::build_embed_texts(
                 &tenant_for_text,
                 &payloads_for_text,
@@ -1438,6 +1466,8 @@ async fn execute_ingest_pipeline(
         expanded_payloads.retain(|_| *kept.next().expect("aligned"));
         let mut kept = keep.iter();
         enriched_texts.retain(|_| *kept.next().expect("aligned"));
+        tracing::debug!(target: "tellodb::profile", event = "content_dedup",
+            examined = keep.len(), skipped = keep.iter().filter(|keep| !**keep).count(), kept = expanded_payloads.len());
         diag.dedup_build_ms += stage_start.elapsed().as_millis() as u64;
     }
 
@@ -1494,6 +1524,11 @@ async fn execute_ingest_pipeline(
     commit_batches(tenant, state, &mut batches, &mut diag).await?;
 
     (diag.total_ms, diag.total_us) = elapsed_ms_and_us(total_start);
+    tracing::debug!(target: "tellodb::profile", event = "ingest_output", total_us = diag.total_us,
+        inputs = diag.input_count, expanded = diag.expanded_count, embedded = diag.embedded_count,
+        structures = ?diag.structure_counts, embed_us = diag.embed_us, storage_us = diag.storage_us,
+        fts_us = diag.fts_us, vector_us = diag.vector_us,
+        consolidation_tasks = batches.consolidation_tasks.len());
     tracing::debug!("[CP] final: μs={}", total_start.elapsed().as_micros());
     if tracing::enabled!(tracing::Level::DEBUG) {
         diag.log_table();

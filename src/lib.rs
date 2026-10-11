@@ -17,6 +17,7 @@ pub mod mcp_stdio;
 pub mod metrics;
 pub mod ml;
 pub mod platform;
+pub(crate) mod profiling;
 pub mod query;
 pub mod retrieval;
 pub mod runtime_paths;
@@ -43,7 +44,11 @@ pub fn init_tracing_with_default_level(level: tracing::Level) {
         .with_file(true)
         .with_line_number(true);
 
-    let subscriber = Registry::default().with(env_filter).with(fmt_layer);
-
-    let _ = tracing::subscriber::set_global_default(subscriber);
+    if std::env::var("TELLODB_LOG_FORMAT").as_deref() == Ok("json") {
+        let subscriber = Registry::default().with(env_filter).with(fmt_layer.json());
+        let _ = tracing::subscriber::set_global_default(subscriber);
+    } else {
+        let subscriber = Registry::default().with(env_filter).with(fmt_layer);
+        let _ = tracing::subscriber::set_global_default(subscriber);
+    }
 }

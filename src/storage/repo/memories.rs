@@ -5,6 +5,8 @@ impl TenantStore {
         &self,
         items: &[(u64, String, AgentObservation)],
     ) -> Result<Vec<Option<u64>>> {
+        let _profile =
+            crate::profiling::Timer::new("storage.repo.memories.insert_observations_batch");
         self.allocate_vector_ids(items.iter().map(|(timestamp, memory_id, observation)| {
             (*timestamp, memory_id.as_str(), observation)
         }))
@@ -16,11 +18,13 @@ impl TenantStore {
         memory_id: &str,
         obs: &AgentObservation,
     ) -> Result<()> {
+        let _profile = crate::profiling::Timer::new("storage.repo.memories.insert_observation");
         self.allocate_vector_ids(std::iter::once((timestamp, memory_id, obs)))?;
         Ok(())
     }
 
     pub fn lookup_by_memory_id(&self, memory_id: &str) -> Result<Option<(u64, Option<u64>)>> {
+        let _profile = crate::profiling::Timer::new("storage.repo.memories.lookup_by_memory_id");
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT m.created_at_ms, v.vector_id
@@ -42,6 +46,8 @@ impl TenantStore {
         &self,
         vector_ids: &[u64],
     ) -> Result<Vec<Option<(u64, String)>>> {
+        let _profile =
+            crate::profiling::Timer::new("storage.repo.memories.lookup_by_vector_ids_batch");
         self.lookup_by_vector_ids_batch_at(vector_ids, None, None)
     }
 
@@ -51,6 +57,8 @@ impl TenantStore {
         point_in_time_ms: Option<u64>,
         known_as_of_ms: Option<u64>,
     ) -> Result<Vec<Option<(u64, String)>>> {
+        let _profile =
+            crate::profiling::Timer::new("storage.repo.memories.lookup_by_vector_ids_batch_at");
         if vector_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -101,6 +109,8 @@ impl TenantStore {
         &self,
         memory_ids: &[String],
     ) -> Result<std::collections::HashMap<String, (u64, u64)>> {
+        let _profile =
+            crate::profiling::Timer::new("storage.repo.memories.lookup_by_memory_ids_batch");
         // Values are `(created_at_ms, vector_id)`; every caller reads the first
         // element as the memory timestamp. (They used to be swapped, which fed
         // vector ids into recency scoring as timestamps.)
@@ -139,6 +149,7 @@ impl TenantStore {
         &self,
         memory_ids: &[String],
     ) -> Result<HashMap<String, (String, u32)>> {
+        let _profile = crate::profiling::Timer::new("storage.repo.memories.memory_identity_batch");
         let mut out = HashMap::with_capacity(memory_ids.len());
         if memory_ids.is_empty() {
             return Ok(out);
@@ -166,6 +177,7 @@ impl TenantStore {
         _timestamp: u64,
         memory_id: &str,
     ) -> Result<Option<AgentObservation>> {
+        let _profile = crate::profiling::Timer::new("storage.repo.memories.get_observation");
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT entity_id, content, kind, created_at_ms, session_id, turn_index, role,
@@ -199,6 +211,7 @@ impl TenantStore {
         &self,
         keys: &[(u64, String)],
     ) -> Result<std::collections::HashMap<String, AgentObservation>> {
+        let _profile = crate::profiling::Timer::new("storage.repo.memories.get_observations_batch");
         if keys.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
@@ -242,6 +255,7 @@ impl TenantStore {
     }
 
     pub fn stored_content_hashes(&self, memory_ids: &[String]) -> Result<HashMap<String, String>> {
+        let _profile = crate::profiling::Timer::new("storage.repo.memories.stored_content_hashes");
         let mut out = HashMap::with_capacity(memory_ids.len());
         let conn = self.get_conn()?;
         for chunk in memory_ids.chunks(IN_CHUNK) {
@@ -265,6 +279,7 @@ impl TenantStore {
         &self,
         memory_ids: &[String],
     ) -> Result<HashMap<String, (String, i64)>> {
+        let _profile = crate::profiling::Timer::new("storage.repo.memories.stored_content_states");
         let mut out = HashMap::with_capacity(memory_ids.len());
         let conn = self.get_conn()?;
         for chunk in memory_ids.chunks(IN_CHUNK) {
@@ -288,6 +303,7 @@ impl TenantStore {
         &self,
         updates: &[(String, Vec<f32>)],
     ) -> Result<Vec<(u64, String, Vec<f32>)>> {
+        let _profile = crate::profiling::Timer::new("storage.repo.memories.update_embeddings");
         let mut conn = self.get_conn()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let mut applied = Vec::with_capacity(updates.len());
@@ -317,6 +333,8 @@ impl TenantStore {
         &self,
         hashes: &[String],
     ) -> Result<std::collections::HashSet<String>> {
+        let _profile =
+            crate::profiling::Timer::new("storage.repo.memories.existing_content_hashes");
         let conn = self.get_conn()?;
         let mut found = std::collections::HashSet::new();
         for chunk in hashes.chunks(IN_CHUNK) {
@@ -340,6 +358,7 @@ impl TenantStore {
         memory_id: &str,
         reason: &str,
     ) -> Result<DeletedObservation> {
+        let _profile = crate::profiling::Timer::new("storage.repo.memories.delete_observation");
         let mut conn = self.get_conn()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
@@ -542,6 +561,8 @@ fn remove_deleted_from_core_profiles(
     memory_id: &str,
     derived_prefix: &str,
 ) -> Result<()> {
+    let _profile =
+        crate::profiling::Timer::new("storage.repo.memories.remove_deleted_from_core_profiles");
     let profiles = {
         let mut stmt = tx.prepare_cached("SELECT entity_id, profile_json FROM core_profiles")?;
         let rows =
@@ -579,6 +600,8 @@ fn rebuild_fact_chain_after_delete(
     fact_key: &str,
     entity_id: &str,
 ) -> Result<()> {
+    let _profile =
+        crate::profiling::Timer::new("storage.repo.memories.rebuild_fact_chain_after_delete");
     let chain: Vec<(String, u64)> = {
         let mut stmt = tx.prepare_cached(
             "SELECT memory_id, timestamp_ms FROM fact_versions
@@ -666,6 +689,8 @@ fn rebuild_router_after_delete(
     session_id: &str,
     entity_id: &str,
 ) -> Result<()> {
+    let _profile =
+        crate::profiling::Timer::new("storage.repo.memories.rebuild_router_after_delete");
     let fragments: Vec<SessionRouterRecord> = {
         let mut stmt = tx.prepare_cached(
             "SELECT record_json FROM session_router_sources
@@ -746,6 +771,7 @@ fn rebuild_router_after_delete(
 /// so a failure names the leak instead of just asserting a count.
 #[cfg(test)]
 fn residue_sweep(conn: &rusqlite::Connection, token: &str) -> Vec<(String, String, i64)> {
+    let _profile = crate::profiling::Timer::new("storage.repo.memories.residue_sweep");
     let pattern = format!("%{token}%");
     let mut tables: Vec<String> = conn
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")

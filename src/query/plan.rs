@@ -8,6 +8,7 @@ use super::{
 const SEMANTIC_TOP_DEFAULT: usize = 100;
 
 fn deterministic_subqueries(query: &str) -> Vec<String> {
+    let _profile = crate::profiling::Timer::new("query.plan.deterministic_subqueries");
     let normalized = query
         .replace(" and ", " | ")
         .replace(" or ", " | ")
@@ -25,6 +26,7 @@ fn deterministic_subqueries(query: &str) -> Vec<String> {
 }
 
 fn promote_query_variant(queries: &mut Vec<String>, candidate: &str) {
+    let _profile = crate::profiling::Timer::new("query.plan.promote_query_variant");
     let candidate = candidate.trim().to_string();
     if candidate.is_empty() {
         return;
@@ -47,6 +49,7 @@ pub(crate) fn lifecycle_rank_adjustment(
     kind: MemoryKind,
     now_ms: u64,
 ) -> Option<f32> {
+    let _profile = crate::profiling::Timer::new("query.plan.lifecycle_rank_adjustment");
     if matches!(
         lifecycle.lifecycle_state,
         crate::lifecycle::LifecycleState::Expired
@@ -94,6 +97,7 @@ pub(crate) fn attractor_negative_penalty(
     temporal_hits: usize,
     facet_mask: u64,
 ) -> f32 {
+    let _profile = crate::profiling::Timer::new("query.plan.attractor_negative_penalty");
     let query_lower = query_text.to_ascii_lowercase();
     let attractors = [
         "dog", "dogs", "pet", "pets", "animal", "nature", "trail", "hike", "book", "game", "music",
@@ -132,6 +136,7 @@ pub(crate) fn attractor_negative_penalty(
 }
 
 pub(crate) fn query_allows_stale_cards(query: &str, plan: &QueryPlan) -> bool {
+    let _profile = crate::profiling::Timer::new("query.plan.query_allows_stale_cards");
     let lower = query.to_ascii_lowercase();
     matches!(plan.intent, QueryIntent::TemporalAggregation)
         || (matches!(plan.intent, QueryIntent::Inference) && plan.needs_decomposition)
@@ -161,6 +166,7 @@ pub(crate) struct RetrievalBudget {
 }
 
 pub(crate) fn retrieval_profile(config: &crate::config::Config) -> RetrievalProfile {
+    let _profile = crate::profiling::Timer::new("query.plan.retrieval_profile");
     config.retrieval.profile
 }
 
@@ -168,6 +174,7 @@ pub(crate) fn auto_rerank_enabled(
     config: &crate::config::Config,
     profile: RetrievalProfile,
 ) -> bool {
+    let _profile = crate::profiling::Timer::new("query.plan.auto_rerank_enabled");
     config.retrieval.auto_rerank.unwrap_or(matches!(profile, RetrievalProfile::Research))
 }
 
@@ -181,6 +188,7 @@ pub(crate) enum QueryShape {
 }
 
 fn query_shape(plan: &QueryPlan) -> QueryShape {
+    let _profile = crate::profiling::Timer::new("query.plan.query_shape");
     let hard = plan.needs_decomposition
         || plan.cross_entity
         || plan.coverage_mode
@@ -361,12 +369,14 @@ pub(crate) fn retrieval_budget_for_plan(
     plan: &QueryPlan,
     profile: RetrievalProfile,
 ) -> RetrievalBudget {
+    let _profile = crate::profiling::Timer::new("query.plan.retrieval_budget_for_plan");
     BUDGETS[profile as usize][query_shape(plan) as usize]
 }
 
 #[allow(clippy::too_many_lines)]
 pub(crate) fn plan_phase(s: &mut QueryPipelineState) {
-    s.raw_query_text = s.payload.textual_query.clone();
+    let _profile = crate::profiling::Timer::new("query.plan.plan_phase");
+    s.data.raw_query_text.clone_from(&s.payload.textual_query);
     s.query_text = rewrite_query_for_retrieval(&s.raw_query_text);
     s.include_evidence =
         s.payload.include_evidence.unwrap_or(false) || s.payload.verify_evidence.unwrap_or(false);
@@ -465,13 +475,15 @@ pub(crate) fn plan_phase(s: &mut QueryPipelineState) {
                 let l = lexical_for_routes.clone();
                 let t = temporal_for_routes.clone();
                 let s_e = subject_for_routes.clone();
-                sc.spawn(move || {
+                crate::profiling::spawn_scoped(sc, move || {
                     if !router_on {
                         return Vec::new();
                     }
                     tenant
                         .search_session_router(&eid, &q, &l, &t, &s_e, session_router_limit)
-                        .unwrap_or_default()
+                        .unwrap_or_else(|error| {
+                            crate::profiling::fallback("plan.optional_lookup", error)
+                        })
                 })
             };
             let h_win = {
@@ -479,11 +491,13 @@ pub(crate) fn plan_phase(s: &mut QueryPipelineState) {
                 let eid = entity_for_routes.clone();
                 let q = query_text_for_routes.clone();
                 let ref_time = s.now_ms;
-                sc.spawn(move || {
+                crate::profiling::spawn_scoped(sc, move || {
                     if !router_on {
                         Vec::new()
                     } else if let Some((st, en)) = parse_temporal_window(&q, Some(ref_time)) {
-                        tenant.sessions_in_time_window(&eid, st, en).unwrap_or_default()
+                        tenant.sessions_in_time_window(&eid, st, en).unwrap_or_else(|error| {
+                            crate::profiling::fallback("plan.optional_lookup", error)
+                        })
                     } else {
                         Vec::new()
                     }
@@ -493,9 +507,11 @@ pub(crate) fn plan_phase(s: &mut QueryPipelineState) {
                 let tenant = tenant_for_routes.clone();
                 let eid = entity_for_routes.clone();
                 let s_e = subject_for_routes.clone();
-                sc.spawn(move || {
+                crate::profiling::spawn_scoped(sc, move || {
                     if router_on && !s_e.is_empty() {
-                        tenant.entity_pivot_sessions(&eid, &s_e).unwrap_or_default()
+                        tenant.entity_pivot_sessions(&eid, &s_e).unwrap_or_else(|error| {
+                            crate::profiling::fallback("plan.optional_lookup", error)
+                        })
                     } else {
                         Vec::new()
                     }
@@ -503,9 +519,15 @@ pub(crate) fn plan_phase(s: &mut QueryPipelineState) {
             };
 
             (
-                h_sr.join().unwrap_or_default(),
-                h_win.join().unwrap_or_default(),
-                h_pivot.join().unwrap_or_default(),
+                h_sr.join().unwrap_or_else(|error| {
+                    crate::profiling::fallback("plan.optional_lookup", error)
+                }),
+                h_win.join().unwrap_or_else(|error| {
+                    crate::profiling::fallback("plan.optional_lookup", error)
+                }),
+                h_pivot.join().unwrap_or_else(|error| {
+                    crate::profiling::fallback("plan.optional_lookup", error)
+                }),
             )
         });
 

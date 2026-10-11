@@ -4,6 +4,7 @@ type Incident = HashMap<String, Vec<(String, f32, String)>>;
 
 impl TenantStore {
     pub fn set_memory_links_batch(&self, links: &[(String, String, String)]) -> Result<()> {
+        let _profile = crate::profiling::Timer::new("storage.repo.graph.set_memory_links_batch");
         let mut conn = self.get_conn()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         {
@@ -20,6 +21,7 @@ impl TenantStore {
     }
 
     pub fn get_linked_memories(&self, memory_id: &str) -> Result<Vec<String>> {
+        let _profile = crate::profiling::Timer::new("storage.repo.graph.get_linked_memories");
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT target_memory_id FROM memory_links WHERE source_memory_id = ?1
@@ -39,6 +41,7 @@ impl TenantStore {
         seed_memory_id: &str,
         max_depth: usize,
     ) -> Result<HashMap<String, f32>> {
+        let _profile = crate::profiling::Timer::new("storage.repo.graph.get_link_cluster_scores");
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
             "WITH RECURSIVE
@@ -74,6 +77,8 @@ impl TenantStore {
         edge_type_filter: Option<&str>,
         limit: usize,
     ) -> Result<Vec<(String, f32)>> {
+        let _profile =
+            crate::profiling::Timer::new("storage.repo.graph.get_edge_cluster_neighbors");
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
             "WITH seed_nodes AS (
@@ -107,6 +112,8 @@ impl TenantStore {
         limit: usize,
         max_node_degree: usize,
     ) -> Result<Vec<(String, f32, String)>> {
+        let _profile =
+            crate::profiling::Timer::new("storage.repo.graph.get_edge_cluster_neighbors_typed");
         let conn = self.get_conn()?;
         // Nodes with more than `max_node_degree` edges are not traversed. Such
         // hubs (the entity id, speaker labels like "assistant", header words
@@ -161,6 +168,8 @@ impl TenantStore {
         limit: usize,
         max_node_degree: usize,
     ) -> Result<HashMap<String, Vec<EdgeNeighbour>>> {
+        let _profile =
+            crate::profiling::Timer::new("storage.repo.graph.get_edge_cluster_neighbors_batch");
         let conn = self.get_conn()?;
 
         // Node multiset per memory (a node listed once per edge endpoint).
@@ -269,6 +278,7 @@ impl TenantStore {
     }
 
     pub fn graph_upsert_memory_batch(&self, batch: &GraphEdgeBatch<'_>) -> Result<()> {
+        let _profile = crate::profiling::Timer::new("storage.repo.graph.graph_upsert_memory_batch");
         let mut conn = self.get_conn()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         {
@@ -306,6 +316,7 @@ impl TenantStore {
         &self,
         edges: &[(&str, &str, &str, &str, u64)],
     ) -> Result<usize> {
+        let _profile = crate::profiling::Timer::new("storage.repo.graph.graph_insert_edges_batch");
         let mut written = 0;
         if edges.is_empty() {
             return Ok(written);
@@ -341,6 +352,8 @@ impl TenantStore {
         _entity_id: &str,
         batch: &GraphEdgeBatch<'_>,
     ) -> Result<()> {
+        let _profile =
+            crate::profiling::Timer::new("storage.repo.graph.graph_upsert_fact_status_batch");
         self.graph_upsert_memory_batch(batch)
     }
 
@@ -350,6 +363,8 @@ impl TenantStore {
         label: &str,
         limit: usize,
     ) -> Result<Vec<String>> {
+        let _profile =
+            crate::profiling::Timer::new("storage.repo.graph.graph_edge_summaries_for_label");
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT label FROM edges WHERE (source = ?1 OR target = ?1) AND label LIKE ?2 LIMIT ?3",
@@ -372,6 +387,7 @@ impl TenantStore {
         direction: crate::graph::Direction,
         limit: usize,
     ) -> Result<Vec<GraphEdge>> {
+        let _profile = crate::profiling::Timer::new("storage.repo.graph.graph_query_edges");
         let conn = self.get_conn()?;
         let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match direction {
             crate::graph::Direction::In => (
@@ -419,18 +435,21 @@ impl TenantStore {
     }
 
     pub fn graph_remove_memory(&self, memory_id: &str) -> Result<usize> {
+        let _profile = crate::profiling::Timer::new("storage.repo.graph.graph_remove_memory");
         let conn = self.get_conn()?;
         let count = conn.execute("DELETE FROM edges WHERE memory_id = ?1", params![memory_id])?;
         Ok(count)
     }
 
     pub fn graph_clear(&self) -> Result<()> {
+        let _profile = crate::profiling::Timer::new("storage.repo.graph.graph_clear");
         let conn = self.get_conn()?;
         conn.execute("DELETE FROM edges", [])?;
         Ok(())
     }
 
     pub fn get_all_edges(&self, limit: usize) -> Result<Vec<GraphEdge>> {
+        let _profile = crate::profiling::Timer::new("storage.repo.graph.get_all_edges");
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT edge_id, source, target, edge_type, label, weight, timestamp_ms, memory_id FROM edges ORDER BY weight DESC LIMIT ?1"

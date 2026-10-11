@@ -16,6 +16,7 @@ pub async fn build_state(
     auth: api::AuthConfig,
     mut config: Config,
 ) -> Result<EngineState> {
+    let _profile = crate::profiling::Timer::new("engine.build_state");
     paths.ensure_dirs()?;
     paths.apply_process_env_defaults();
     info!(root = %paths.root().display(), "Runtime data root");

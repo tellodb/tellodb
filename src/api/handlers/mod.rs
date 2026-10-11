@@ -74,6 +74,31 @@ async fn deprecation_middleware(req: Request, next: Next) -> Response {
     response
 }
 
+async fn profiling_middleware(req: Request, next: Next) -> Response {
+    use tracing::Instrument;
+    let request_id = crate::profiling::next_id();
+    // Matched route templates exclude arbitrary URL parameters and query strings.
+    let route = req
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map_or_else(|| "unmatched".into(), |path| path.as_str().to_string());
+    let span = tracing::debug_span!(target: "tellodb::profile", "request",
+        request_id, method = %req.method(), route = %route);
+    async move {
+        let start = std::time::Instant::now();
+        tracing::debug!(target: "tellodb::profile", event = "request_enter");
+        let mut response = next.run(req).await;
+        tracing::debug!(target: "tellodb::profile", event = "request_exit",
+            status = response.status().as_u16(), elapsed_us = start.elapsed().as_micros() as u64);
+        if let Ok(value) = HeaderValue::from_str(&request_id.to_string()) {
+            response.headers_mut().insert("x-tm-request-id", value);
+        }
+        response
+    }
+    .instrument(span)
+    .await
+}
+
 async fn rate_limit_middleware(
     State(state): State<EngineState>,
     req: Request,
@@ -176,6 +201,7 @@ pub fn build_api(state: EngineState) -> Router {
         .layer(middleware::from_fn(deprecation_middleware))
         .layer(middleware::from_fn_with_state(state.clone(), request_timeout_middleware))
         .layer(auth::build_cors_layer(&state.config.server.cors_origins))
+        .layer(middleware::from_fn(profiling_middleware))
         .with_state(state)
 }
 

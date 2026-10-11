@@ -38,6 +38,7 @@ pub struct EngineState {
 
 impl EngineState {
     pub fn tenant_store(&self, tenant_id: &str) -> Result<Arc<TenantStore>, anyhow::Error> {
+        let _profile = crate::profiling::Timer::new("api.mod.tenant_store");
         self.tenant_manager.get_tenant(tenant_id)
     }
 }
@@ -49,8 +50,9 @@ pub enum PlatformWriteOp {
 }
 
 pub fn start_platform_writer(platform: Arc<PlatformStore>) -> Sender<PlatformWriteOp> {
+    let _profile = crate::profiling::Timer::new("api.mod.start_platform_writer");
     let (tx, mut rx): (Sender<PlatformWriteOp>, Receiver<PlatformWriteOp>) = channel(4096);
-    tokio::spawn(async move {
+    crate::profiling::spawn(async move {
         let mut ticker = interval(Duration::from_millis(100));
         let mut pending_usage: HashMap<(String, String), u64> = HashMap::new();
         let mut pending_profiles: Vec<(String, String, u64, String)> = Vec::new();
@@ -94,9 +96,10 @@ async fn flush_platform_writes(
     pending_usage: &mut HashMap<(String, String), u64>,
     pending_profiles: &mut Vec<(String, String, u64, String)>,
 ) {
+    let _profile = crate::profiling::Timer::new("api.mod.flush_platform_writes");
     let usage = std::mem::take(pending_usage);
     let profiles = std::mem::take(pending_profiles);
-    let _ = tokio::task::spawn_blocking(move || {
+    let _ = crate::profiling::spawn_blocking(move || {
         for ((user_id, endpoint), count) in usage {
             if let Err(err) = platform.record_usage_n(user_id.as_str(), endpoint.as_str(), count) {
                 tracing::warn!(

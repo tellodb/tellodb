@@ -180,6 +180,7 @@ pub fn evaluate_lifecycle(
     confidence_hint: Option<f32>,
     is_inference: bool,
 ) -> LifecycleMetadata {
+    let _profile = crate::profiling::Timer::new("lifecycle.evaluate_lifecycle");
     let lower = text.to_ascii_lowercase();
     let token_count = lower.split_whitespace().count();
     let mut reasons = Vec::new();

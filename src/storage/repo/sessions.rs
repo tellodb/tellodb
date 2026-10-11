@@ -8,6 +8,7 @@ impl TenantStore {
         lo: u32,
         hi: u32,
     ) -> Result<Vec<(String, u32, String, String)>> {
+        let _profile = crate::profiling::Timer::new("storage.repo.sessions.session_turn_window");
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT memory_id, turn_index, role, content FROM memories
@@ -25,6 +26,9 @@ impl TenantStore {
         &self,
         updates: &[SessionRouterRecord],
     ) -> Result<Vec<SessionRouterRecord>> {
+        let _profile = crate::profiling::Timer::new(
+            "storage.repo.sessions.merge_session_router_records_batch",
+        );
         let mut conn = self.get_conn()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         // merge_router_records_tx now writes the router FTS document into
@@ -45,6 +49,7 @@ impl TenantStore {
         entities: &[String],
         limit: usize,
     ) -> Result<Vec<SessionRouterSearchHit>> {
+        let _profile = crate::profiling::Timer::new("storage.repo.sessions.search_session_router");
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -107,6 +112,8 @@ impl TenantStore {
         temporal_terms: &[String],
         entities: &[String],
     ) -> Vec<SessionRouterSearchHit> {
+        let _profile =
+            crate::profiling::Timer::new("storage.repo.sessions.score_session_router_rows");
         let mut hits = Vec::new();
         for row in rows {
             let Ok(json) = row else { continue };
@@ -181,6 +188,8 @@ impl TenantStore {
         start_ms: u64,
         end_ms: u64,
     ) -> Result<Vec<SessionRouterSearchHit>> {
+        let _profile =
+            crate::profiling::Timer::new("storage.repo.sessions.sessions_in_time_window");
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT record_json FROM session_router
@@ -210,6 +219,7 @@ impl TenantStore {
         entity_id: &str,
         subject_entities: &[String],
     ) -> Result<Vec<SessionRouterSearchHit>> {
+        let _profile = crate::profiling::Timer::new("storage.repo.sessions.entity_pivot_sessions");
         if subject_entities.is_empty() {
             return Ok(Vec::new());
         }
@@ -296,6 +306,7 @@ impl TenantStore {
         &self,
         turn_ids: &[String],
     ) -> Result<std::collections::HashMap<String, LedgerTurn>> {
+        let _profile = crate::profiling::Timer::new("storage.repo.sessions.get_ledger_turns_batch");
         let mut result = std::collections::HashMap::new();
         if turn_ids.is_empty() {
             return Ok(result);
@@ -341,6 +352,7 @@ impl TenantStore {
         turn_index: u32,
         radius: u32,
     ) -> Result<Vec<LedgerTurn>> {
+        let _profile = crate::profiling::Timer::new("storage.repo.sessions.get_turn_window");
         let conn = self.get_conn()?;
         let min_idx = turn_index.saturating_sub(radius);
         let max_idx = turn_index.saturating_add(radius);

@@ -12,6 +12,7 @@ use crate::core::text::normalize_fact_text;
 use crate::heuristics::Profile;
 
 pub fn build_event_companion_text(payload: &IngestPayload) -> Option<String> {
+    let _profile = crate::profiling::Timer::new("api.ingest.companion.build_event_companion_text");
     let dialogue_lines =
         crate::api::ingest::dialogue::extract_dialogue_messages(&payload.textual_content);
     let source_lines = if dialogue_lines.is_empty() {
@@ -62,6 +63,8 @@ pub fn build_event_companion_text(payload: &IngestPayload) -> Option<String> {
 }
 
 pub fn build_relation_companion_payloads(payload: &IngestPayload) -> Vec<IngestPayload> {
+    let _profile =
+        crate::profiling::Timer::new("api.ingest.companion.build_relation_companion_payloads");
     payload
         .relations
         .iter()
@@ -95,6 +98,7 @@ pub fn build_relation_companion_payloads(payload: &IngestPayload) -> Vec<IngestP
 }
 
 pub fn build_companion_payloads(payload: &IngestPayload) -> Vec<IngestPayload> {
+    let _profile = crate::profiling::Timer::new("api.ingest.companion.build_companion_payloads");
     build_companion_payloads_with_profile(payload, Profile::Generic)
 }
 
@@ -103,6 +107,8 @@ pub fn build_companion_payloads_with_profile(
     payload: &IngestPayload,
     profile: Profile,
 ) -> Vec<IngestPayload> {
+    let _profile =
+        crate::profiling::Timer::new("api.ingest.companion.build_companion_payloads_with_profile");
     // Companions are per conversation turn; memories outside a session get none.
     if payload.session_id.as_deref().map_or(true, str::is_empty) {
         return Vec::new();
@@ -239,6 +245,7 @@ pub fn build_companion_payloads_with_profile(
 }
 
 pub fn build_context_header(prev_text: Option<&str>, next_text: Option<&str>) -> String {
+    let _profile = crate::profiling::Timer::new("api.ingest.companion.build_context_header");
     let mut parts = Vec::new();
     if let Some(prev) = prev_text {
         let entities = extract_named_phrases(&[prev.to_string()]);
@@ -281,6 +288,9 @@ mod identity_tests {
 
     #[test]
     fn opaque_memory_ids_get_companions_from_explicit_identity() {
+        let _profile = crate::profiling::Timer::new(
+            "api.ingest.companion.opaque_memory_ids_get_companions_from_explicit_identity",
+        );
         let text = "I just moved to Denver and started a new job at Acme Corp.";
         let conventional = IngestPayload {
             entity_id: "alice".into(),

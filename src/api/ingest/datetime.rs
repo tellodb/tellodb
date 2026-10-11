@@ -1,12 +1,14 @@
 use super::dialogue::extract_bracketed_header_value;
 
 pub fn extract_document_time_ms(text: &str, fallback_ms: u64) -> u64 {
+    let _profile = crate::profiling::Timer::new("api.ingest.datetime.extract_document_time_ms");
     extract_bracketed_header_value(text, "Session Date")
         .and_then(|date| parse_date_to_epoch_ms(&date, fallback_ms))
         .unwrap_or(fallback_ms)
 }
 
 pub fn extract_event_time_ms(text: &str, document_time_ms: u64) -> Option<u64> {
+    let _profile = crate::profiling::Timer::new("api.ingest.datetime.extract_event_time_ms");
     if let Some(date_ms) = parse_date_to_epoch_ms(text, document_time_ms) {
         return Some(date_ms);
     }
@@ -33,6 +35,7 @@ pub fn extract_event_time_ms(text: &str, document_time_ms: u64) -> Option<u64> {
 }
 
 pub fn parse_date_to_epoch_ms(text: &str, reference_ms: u64) -> Option<u64> {
+    let _profile = crate::profiling::Timer::new("api.ingest.datetime.parse_date_to_epoch_ms");
     for raw in text.split_whitespace() {
         let token = raw.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-');
         if let Some((year, month, day)) = parse_iso_date(token) {
@@ -110,6 +113,7 @@ pub fn parse_date_to_epoch_ms(text: &str, reference_ms: u64) -> Option<u64> {
 }
 
 pub fn parse_iso_date(token: &str) -> Option<(i32, u32, u32)> {
+    let _profile = crate::profiling::Timer::new("api.ingest.datetime.parse_iso_date");
     let parts = token.split('-').collect::<Vec<_>>();
     if parts.len() != 3 {
         return None;
@@ -124,6 +128,7 @@ pub fn parse_iso_date(token: &str) -> Option<(i32, u32, u32)> {
 }
 
 pub fn month_number(token: &str) -> Option<u32> {
+    let _profile = crate::profiling::Timer::new("api.ingest.datetime.month_number");
     match token {
         "jan" | "january" => Some(1),
         "feb" | "february" => Some(2),
@@ -142,6 +147,7 @@ pub fn month_number(token: &str) -> Option<u32> {
 }
 
 pub fn epoch_ms_from_ymd(year: i32, month: u32, day: u32) -> Option<u64> {
+    let _profile = crate::profiling::Timer::new("api.ingest.datetime.epoch_ms_from_ymd");
     if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return None;
     }
@@ -153,10 +159,12 @@ pub fn epoch_ms_from_ymd(year: i32, month: u32, day: u32) -> Option<u64> {
 }
 
 pub fn civil_from_epoch_ms(ms: u64) -> (i32, u32, u32) {
+    let _profile = crate::profiling::Timer::new("api.ingest.datetime.civil_from_epoch_ms");
     civil_from_days((ms / 86_400_000) as i64)
 }
 
 pub fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let _profile = crate::profiling::Timer::new("api.ingest.datetime.days_from_civil");
     let year = year - i32::from(month <= 2);
     let era = if year >= 0 { year } else { year - 399 } / 400;
     let yoe = year - era * 400;
@@ -167,6 +175,7 @@ pub fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
 }
 
 pub fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
+    let _profile = crate::profiling::Timer::new("api.ingest.datetime.civil_from_days");
     let z = days_since_epoch + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097;

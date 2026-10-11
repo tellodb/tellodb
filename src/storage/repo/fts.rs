@@ -5,6 +5,7 @@ fn ensure_fts_rowid_available(
     rowid: i64,
     memory_id: &str,
 ) -> Result<()> {
+    let _profile = crate::profiling::Timer::new("storage.repo.fts.ensure_fts_rowid_available");
     let existing = match conn.query_row(
         "SELECT memory_id FROM fts_memories WHERE rowid = ?1",
         params![rowid],
@@ -27,6 +28,7 @@ impl TenantStore {
         limit: usize,
         entity_id: Option<&str>,
     ) -> Result<Vec<(String, f32)>> {
+        let _profile = crate::profiling::Timer::new("storage.repo.fts.fts_search");
         self.fts_search_at(query, limit, entity_id, None, None)
     }
 
@@ -38,6 +40,7 @@ impl TenantStore {
         point_in_time_ms: Option<u64>,
         known_as_of_ms: Option<u64>,
     ) -> Result<Vec<(String, f32)>> {
+        let _profile = crate::profiling::Timer::new("storage.repo.fts.fts_search_at");
         let conn = self.get_conn()?;
 
         let cleaned = query.replace(|c: char| !c.is_alphanumeric() && c != ' ', " ");
@@ -97,6 +100,7 @@ impl TenantStore {
     }
 
     pub fn fts_index_text(&self, memory_id: &str, content: &str, entity_id: &str) -> Result<()> {
+        let _profile = crate::profiling::Timer::new("storage.repo.fts.fts_index_text");
         let conn = self.get_conn()?;
         ensure_fts_rowid_available(&conn, fts_rowid(memory_id), memory_id)?;
         conn.execute(
@@ -114,6 +118,7 @@ impl TenantStore {
     }
 
     pub fn fts_index_batch(&self, batch: &[(String, String, String)]) -> Result<()> {
+        let _profile = crate::profiling::Timer::new("storage.repo.fts.fts_index_batch");
         let mut conn = self.get_conn()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         {
@@ -137,12 +142,14 @@ impl TenantStore {
     }
 
     pub fn fts_remove_document(&self, memory_id: &str) -> Result<()> {
+        let _profile = crate::profiling::Timer::new("storage.repo.fts.fts_remove_document");
         let conn = self.get_conn()?;
         conn.execute("DELETE FROM fts_memories WHERE rowid = ?1", params![fts_rowid(memory_id)])?;
         Ok(())
     }
 
     pub fn fts_clear(&self) -> Result<()> {
+        let _profile = crate::profiling::Timer::new("storage.repo.fts.fts_clear");
         let conn = self.get_conn()?;
         conn.execute("DELETE FROM fts_memories", [])?;
         Ok(())
