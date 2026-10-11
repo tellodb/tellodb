@@ -562,7 +562,9 @@ pub(super) fn merge_router_records_tx(
     updates: &[SessionRouterRecord],
 ) -> Result<Vec<SessionRouterRecord>> {
     let _profile = crate::profiling::Timer::new("storage.repo.ingest.merge_router_records_tx");
-    let mut merged_records = Vec::with_capacity(updates.len());
+    let mut merged_records: Vec<SessionRouterRecord> = Vec::with_capacity(updates.len());
+    let mut latest: HashMap<(String, String), usize> = HashMap::new();
+    let mut keys = Vec::new();
     let mut select_stmt = tx.prepare_cached(
         "SELECT record_json FROM session_router WHERE session_id = ?1 AND entity_id = ?2",
     )?;
@@ -580,9 +582,6 @@ pub(super) fn merge_router_records_tx(
         "INSERT OR REPLACE INTO fts_session_router
             (rowid, session_id, entity_id, router_text)
          VALUES (?1, ?2, ?3, ?4)",
-    )?;
-    let mut delete_fts_stmt = tx.prepare_cached(
-        "DELETE FROM fts_session_router WHERE session_id = ?1 AND entity_id = ?2",
     )?;
     // Router documents have no row in `memories`, so `reindex_unindexed`
     // (which scans `memories WHERE indexed = 0`) can never find or rebuild
@@ -613,16 +612,30 @@ pub(super) fn merge_router_records_tx(
                 source_json
             ])?;
         }
-        let merged = match select_stmt
-            .query_row(params![record.session_id, record.entity_id], |row| row.get::<_, String>(0))
-        {
-            Ok(existing) => serde_json::from_str::<SessionRouterRecord>(&existing).map_or_else(
-                |_| record.clone(),
-                |previous| merge_router_records(&previous, record),
-            ),
-            Err(_) => record.clone(),
+        let key = (record.session_id.clone(), record.entity_id.clone());
+        let merged = if let Some(&index) = latest.get(&key) {
+            merge_router_records(&merged_records[index], record)
+        } else {
+            keys.push(key.clone());
+            match select_stmt.query_row(params![record.session_id, record.entity_id], |row| {
+                row.get::<_, String>(0)
+            }) {
+                Ok(existing) => serde_json::from_str::<SessionRouterRecord>(&existing).map_or_else(
+                    |_| record.clone(),
+                    |previous| merge_router_records(&previous, record),
+                ),
+                Err(rusqlite::Error::QueryReturnedNoRows) => record.clone(),
+                Err(error) => return Err(error.into()),
+            }
         };
-        let json = serde_json::to_string(&merged)?;
+        latest.insert(key, merged_records.len());
+        merged_records.push(merged);
+    }
+    // Keep each intermediate result for callers and each source fragment for
+    // deletion rebuilds, but persist only the final document for each session.
+    for key in keys {
+        let merged = &merged_records[latest[&key]];
+        let json = serde_json::to_string(merged)?;
         upsert_stmt.query_row(
             params![
                 merged.session_id,
@@ -634,7 +647,6 @@ pub(super) fn merge_router_records_tx(
             ],
             |row| row.get::<_, i64>(0),
         )?;
-        delete_fts_stmt.execute(params![merged.session_id, merged.entity_id])?;
         fts_stmt.execute(params![
             fts_rowid(&format!("router::{}::{}", merged.entity_id, merged.session_id)),
             merged.session_id,
@@ -654,8 +666,8 @@ pub(super) fn merge_router_records_tx(
                 merged.router_text
             ])?;
         }
-        merged_records.push(merged);
     }
+    tracing::debug!(target: "tellodb::profile", event = "router_batch", updates = updates.len(), persisted_sessions = latest.len());
     Ok(merged_records)
 }
 
@@ -1153,5 +1165,103 @@ mod tests {
             .iter()
             .any(|(_, _, text)| text.contains("routerdurabilitytoken")));
         assert_eq!(store.fts_search("routerdurabilitytoken", 10, Some("alice")).unwrap().len(), 1);
+    }
+    #[test]
+    fn router_batch_preserves_intermediate_results_and_source_fragments() {
+        let dir = tempdir().unwrap();
+        let store = TenantStore::new(&dir.path().join("tenant.db")).unwrap();
+        {
+            let conn = store.get_conn().unwrap();
+            conn.execute_batch("CREATE TABLE router_writes (kind TEXT); CREATE TRIGGER count_router_insert AFTER INSERT ON session_router BEGIN INSERT INTO router_writes VALUES ('insert'); END; CREATE TRIGGER count_router_update AFTER UPDATE ON session_router BEGIN INSERT INTO router_writes VALUES ('update'); END;").unwrap();
+        }
+        let first = SessionRouterRecord {
+            session_id: "session".into(),
+            entity_id: "alice".into(),
+            canonical_facts: vec!["firsttoken".into()],
+            source_memory_ids: vec!["m1".into()],
+            ..Default::default()
+        };
+        let second = SessionRouterRecord {
+            canonical_facts: vec!["secondtoken".into()],
+            source_memory_ids: vec!["m2".into()],
+            ..first.clone()
+        };
+        let other = SessionRouterRecord { session_id: "other".into(), ..first.clone() };
+        let results = store
+            .merge_session_router_records_batch(&[first.clone(), other, second.clone()])
+            .unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].canonical_facts, first.canonical_facts);
+        assert_eq!(results[2].canonical_facts, vec!["firsttoken", "secondtoken"]);
+        let conn = store.get_conn().unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM fts_session_router WHERE session_id = 'session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        let writes: i64 =
+            conn.query_row("SELECT COUNT(*) FROM router_writes", [], |row| row.get(0)).unwrap();
+        assert_eq!(writes, 2, "three fragments must persist only two sessions");
+        let source: String = conn.query_row("SELECT record_json FROM session_router_sources WHERE session_id = 'session' AND memory_id = 'm1'", [], |row| row.get(0)).unwrap();
+        assert_eq!(
+            serde_json::from_str::<SessionRouterRecord>(&source).unwrap().canonical_facts,
+            first.canonical_facts
+        );
+        drop(conn);
+        store.merge_session_router_records_batch(&[second]).unwrap();
+        let conn = store.get_conn().unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM fts_session_router WHERE session_id = 'session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        drop(conn);
+        store.delete_observation(1000, "m1", "regression test").unwrap();
+        let conn = store.get_conn().unwrap();
+        let text: String = conn
+            .query_row(
+                "SELECT router_text FROM session_router WHERE session_id = 'session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(text.contains("secondtoken"));
+        assert!(!text.contains("firsttoken"));
+        drop(conn);
+        store.delete_observation(1000, "m2", "regression test").unwrap();
+        let conn = store.get_conn().unwrap();
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM fts_session_router", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn migration_normalizes_legacy_router_fts_rowids_without_losing_searchability() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tenant.db");
+        {
+            let store = TenantStore::new(&path).unwrap();
+            store
+                .merge_session_router_records_batch(&[SessionRouterRecord {
+                    session_id: "session".into(),
+                    entity_id: "alice".into(),
+                    router_text: "legacyroutertoken".into(),
+                    ..Default::default()
+                }])
+                .unwrap();
+            let conn = store.get_conn().unwrap();
+            conn.execute_batch("DELETE FROM fts_session_router; INSERT INTO fts_session_router (rowid, session_id, entity_id, router_text) VALUES (42, 'session', 'alice', 'legacyroutertoken'); PRAGMA user_version = 7;").unwrap();
+        }
+        let store = TenantStore::new(&path).unwrap();
+        let conn = store.get_conn().unwrap();
+        let rowid: i64 = conn.query_row("SELECT rowid FROM fts_session_router WHERE fts_session_router MATCH 'legacyroutertoken'", [], |row| row.get(0)).unwrap();
+        assert_eq!(rowid, crate::storage::tenant::fts_rowid("router::alice::session"));
     }
 }

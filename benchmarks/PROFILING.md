@@ -66,3 +66,16 @@ them does not give end-to-end time. Percentiles use bounded-memory power-of-two
 microsecond buckets and report their upper bounds. Heavy diagnostic logging
 affects throughput and latency; compare profiling runs with each other. A fresh
 profiled baseline is preferable to reusing earlier unprofiled latency results.
+
+The `router_batch` event reports input `updates` and `persisted_sessions` after
+coalescing session-router writes within each transaction. Source fragments and
+intermediate return values retain their original order and deletion provenance.
+Schema v8 normalizes legacy router FTS row IDs once on opening a database; this
+allows replacement and deletion by stable row ID without per-update index scans.
+
+Runs before the card-query fix can contain `retrieve.optional_lookup` warnings
+for ambiguous `created_at_ms` in the card search join. Those runs effectively
+had an empty memory-card retrieval lane. Use a fresh baseline when comparing
+card ablations after the fix; do not interpret those older runs as evidence that
+cards provide no quality benefit. Ranking and temporal-gate changes still need
+controlled experiments; the storage fixes alone do not establish a recall gain.

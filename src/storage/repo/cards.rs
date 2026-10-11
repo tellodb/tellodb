@@ -101,8 +101,8 @@ impl TenantStore {
         }
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
-            "SELECT card_id, source_memory_id, source_session_id, subject, predicate, object,
-                    memory_text, card_type, confidence, is_latest, expires_at, created_at_ms
+            "SELECT c.card_id, c.source_memory_id, c.source_session_id, c.subject, c.predicate, c.object,
+                    c.memory_text, c.card_type, c.confidence, c.is_latest, c.expires_at, c.created_at_ms
              FROM memory_cards c
              LEFT JOIN memories m ON m.memory_id = c.card_id
              WHERE c.entity_id = ?1
@@ -277,5 +277,47 @@ impl TenantStore {
             }
         }
         Ok(results)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn card_search_join_respects_creation_and_recording_cutoffs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TenantStore::new(&dir.path().join("cards.db")).unwrap();
+        {
+            let conn = store.get_conn().unwrap();
+            for id in ["joined", "standalone"] {
+                conn.execute("INSERT INTO memory_cards (card_id, entity_id, source_memory_id, source_session_id, subject, predicate, object, memory_text, card_type, confidence, created_at_ms) VALUES (?1, 'alice', ?1, 'session', 'alice', 'likes', 'cycling', 'cycling', 'Fact', 0.9, 100)", params![id]).unwrap();
+            }
+            conn.execute("INSERT INTO memories (memory_id, entity_id, content, kind, created_at_ms, recorded_at_ms) VALUES ('joined', 'alice', 'cycling', 'Fact', 100, 300)", []).unwrap();
+        }
+        let terms = vec!["cycling".to_string()];
+        let routes = std::collections::HashSet::new();
+        let mut query = MemoryCardSearchInput {
+            entity_id: "alice",
+            lexical_terms: &terms,
+            temporal_terms: &[],
+            entities: &[],
+            route_sessions: &routes,
+            include_stale: false,
+            point_in_time_ms: None,
+            known_as_of_ms: None,
+            now_ms: 400,
+            limit: 10,
+        };
+        assert_eq!(store.search_memory_cards(&query).unwrap().len(), 2);
+        query.known_as_of_ms = Some(200);
+        let hits = store.search_memory_cards(&query).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].card_id, "standalone");
+        query.point_in_time_ms = Some(99);
+        assert!(store.search_memory_cards(&query).unwrap().is_empty());
+        query.point_in_time_ms = Some(100);
+        query.known_as_of_ms = Some(300);
+        assert_eq!(store.search_memory_cards(&query).unwrap().len(), 2);
     }
 }

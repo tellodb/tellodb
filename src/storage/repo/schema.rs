@@ -466,6 +466,35 @@ impl TenantStore {
             )?;
             tx.commit()?;
         }
+        if version < 8 {
+            // Normalize legacy rowids once so updates and deletes can use direct
+            // rowid lookups without scanning the FTS table's unindexed columns.
+            let tx = conn.unchecked_transaction()?;
+            tx.execute("DELETE FROM fts_session_router", [])?;
+            {
+                let mut rows =
+                    tx.prepare("SELECT session_id, entity_id, router_text FROM session_router")?;
+                let records = rows.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?;
+                let mut insert = tx.prepare("INSERT INTO fts_session_router (rowid, session_id, entity_id, router_text) VALUES (?1, ?2, ?3, ?4)")?;
+                for record in records {
+                    let (session, entity, text) = record?;
+                    insert.execute(params![
+                        fts_rowid(&format!("router::{entity}::{session}")),
+                        session,
+                        entity,
+                        text
+                    ])?;
+                }
+            }
+            tx.execute_batch("PRAGMA user_version = 8;")?;
+            tx.commit()?;
+        }
         if version < SCHEMA_VERSION {
             conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
         }

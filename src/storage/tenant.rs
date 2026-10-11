@@ -127,7 +127,7 @@ pub(crate) fn fts_rowid(key: &str) -> i64 {
 }
 
 /// Schema version recorded in `PRAGMA user_version`.
-pub(crate) const SCHEMA_VERSION: i64 = 7;
+pub(crate) const SCHEMA_VERSION: i64 = 8;
 
 impl TenantStore {
     pub fn new(path: &Path) -> Result<Self> {

@@ -705,10 +705,7 @@ fn rebuild_router_after_delete(
         .as_str()
         .to_string();
     if fragments.is_empty() {
-        tx.execute(
-            "DELETE FROM fts_session_router WHERE session_id = ?1 AND entity_id = ?2",
-            params![session_id, entity_id],
-        )?;
+        tx.execute("DELETE FROM fts_session_router WHERE rowid = ?1", params![router_fts_rowid])?;
         tx.execute(
             "DELETE FROM session_router WHERE session_id = ?1 AND entity_id = ?2",
             params![session_id, entity_id],
@@ -741,10 +738,6 @@ fn rebuild_router_after_delete(
             merged.updated_at_ms
         ],
         |row| row.get::<_, i64>(0),
-    )?;
-    tx.execute(
-        "DELETE FROM fts_session_router WHERE session_id = ?1 AND entity_id = ?2",
-        params![session_id, entity_id],
     )?;
     tx.execute(
         "INSERT OR REPLACE INTO fts_session_router
