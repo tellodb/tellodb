@@ -25,6 +25,11 @@ pub mod semantic;
 pub mod storage;
 pub mod vector_index;
 
+/// Flush outstanding profiling aggregates before shutting down an embedded engine.
+pub fn flush_profile_logs() {
+    profiling::flush();
+}
+
 pub fn init_tracing_subscriber() {
     init_tracing_with_default_level(tracing::Level::INFO);
 }

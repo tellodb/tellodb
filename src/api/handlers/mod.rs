@@ -90,6 +90,7 @@ async fn profiling_middleware(req: Request, next: Next) -> Response {
         let mut response = next.run(req).await;
         tracing::debug!(target: "tellodb::profile", event = "request_exit",
             status = response.status().as_u16(), elapsed_us = start.elapsed().as_micros() as u64);
+        crate::profiling::flush();
         if let Ok(value) = HeaderValue::from_str(&request_id.to_string()) {
             response.headers_mut().insert("x-tm-request-id", value);
         }

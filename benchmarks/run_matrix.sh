@@ -111,8 +111,9 @@ if [[ "${PROFILE_LOGS:-0}" == 1 ]]; then
     export TELLODB_LOG_FORMAT=json
     # Always enable the profiling target, even when the shell has RUST_LOG=warn.
     export RUST_LOG="${RUST_LOG:-warn,tellodb=debug,ort=warn},tellodb::profile=debug"
-    printf 'TELLODB_LOG_FORMAT=%s\nRUST_LOG=%s\nWORK_ROOT=%s\nCONCURRENCY=%s\nRUNS=%s\n' \
-        "$TELLODB_LOG_FORMAT" "$RUST_LOG" "$WORK_ROOT" "$CONCURRENCY" "$RUNS" > "$RUNS_DIR/PROFILE_CONFIG.txt"
+    export TELLODB_PROFILE_SAMPLE_EVERY="${TELLODB_PROFILE_SAMPLE_EVERY:-100}"
+    printf 'TELLODB_LOG_FORMAT=%s\nRUST_LOG=%s\nWORK_ROOT=%s\nCONCURRENCY=%s\nRUNS=%s\nTELLODB_PROFILE_SAMPLE_EVERY=%s\n' \
+        "$TELLODB_LOG_FORMAT" "$RUST_LOG" "$WORK_ROOT" "$CONCURRENCY" "$RUNS" "$TELLODB_PROFILE_SAMPLE_EVERY" > "$RUNS_DIR/PROFILE_CONFIG.txt"
 fi
 
 stop_engine() {

@@ -22,6 +22,13 @@ cache access, SQLite operations, FTS, vector indexing, routing, retrieval,
 fusion, scoring, proofs, authentication, and background work. Timing scopes
 emit `stage_enter` and `stage_exit` with matching `call_id`, inclusive
 microseconds, and panic state. Exit means the scope ended, not that it succeeded.
+Every call contributes to `stage_aggregate` counts, total/max durations and
+histograms, flushed in process-wide windows after HTTP requests. Windows can
+include background work and concurrent requests and have no request parent.
+Fast individual calls are sampled every 100 calls by default; every call taking
+at least 1 ms and every panicking call emits an exit event. Set
+`TELLODB_PROFILE_SAMPLE_EVERY=1` for every individual event (very large logs).
+The summary uses aggregate windows rather than double-counting sampled exits.
 
 HTTP spans carry a process-local `request_id`, returned as `x-tm-request-id`.
 Blocking-pool and scoped workers inherit it. `blocking_queue` measures delay

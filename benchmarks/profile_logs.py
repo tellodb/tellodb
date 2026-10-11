@@ -14,6 +14,7 @@ import time
 
 def summarize(source, output):
     stages = collections.defaultdict(lambda: [0, 0, 0, collections.Counter()])
+    aggregates = collections.defaultdict(lambda: [0, 0, 0, collections.Counter()])
     events, failures = collections.Counter(), collections.Counter()
     pending = set()
     malformed = correlated = 0
@@ -33,6 +34,15 @@ def summarize(source, output):
                 failures[(record.get("level"), fields.get("stage", fields.get("message", "unknown")))] += 1
             if event == "stage_enter":
                 pending.add(fields["call_id"])
+            if event == "stage_aggregate":
+                row = aggregates[fields["operation"]]
+                row[0] += int(fields["calls"])
+                row[1] += int(fields["total_us"])
+                row[2] = max(row[2], int(fields["max_us"]))
+                histogram = fields["histogram"]
+                if isinstance(histogram, str):
+                    histogram = json.loads(histogram)
+                row[3].update({int(bucket): int(count) for bucket, count in histogram.items()})
             if event in ("stage_exit", "blocking_queue"):
                 pending.discard(fields.get("call_id"))
                 name = fields.get("operation", f"blocking_queue:{fields.get('file')}:{fields.get('line')}")
@@ -42,6 +52,10 @@ def summarize(source, output):
                 row[1] += elapsed
                 row[2] = max(row[2], elapsed)
                 row[3][0 if elapsed == 0 else elapsed.bit_length()] += 1
+
+    # Aggregate windows cover every call; sampled individual events are already
+    # included in those totals and must not be counted twice.
+    stages.update(aggregates)
 
     def quantile(row, fraction):
         target = math.ceil(row[0] * fraction)

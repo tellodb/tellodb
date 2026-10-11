@@ -272,6 +272,7 @@ async fn serve(paths: &RuntimePaths) -> anyhow::Result<()> {
     })
     .await?;
 
+    tellodb::flush_profile_logs();
     Ok(())
 }
 
