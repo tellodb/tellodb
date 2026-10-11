@@ -109,7 +109,8 @@ SAMPLER_PID=""
 
 if [[ "${PROFILE_LOGS:-0}" == 1 ]]; then
     export TELLODB_LOG_FORMAT=json
-    export RUST_LOG="${RUST_LOG:-warn,tellodb=debug,tellodb::profile=debug,ort=warn}"
+    # Always enable the profiling target, even when the shell has RUST_LOG=warn.
+    export RUST_LOG="${RUST_LOG:-warn,tellodb=debug,ort=warn},tellodb::profile=debug"
     printf 'TELLODB_LOG_FORMAT=%s\nRUST_LOG=%s\nWORK_ROOT=%s\nCONCURRENCY=%s\nRUNS=%s\n' \
         "$TELLODB_LOG_FORMAT" "$RUST_LOG" "$WORK_ROOT" "$CONCURRENCY" "$RUNS" > "$RUNS_DIR/PROFILE_CONFIG.txt"
 fi
@@ -220,6 +221,10 @@ start_engine() {
         if curl -sf "${ENGINE_URL}/healthz" >/dev/null 2>&1; then
             assert_cuda_live "$log"
             curl -s -X POST "${ENGINE_URL}/warmup" -H "x-api-key: ${ENGINE_API_KEY}" >/dev/null
+            if [[ "${PROFILE_LOGS:-0}" == 1 ]] && ! grep -q '"event":"stage_exit"' "$log"; then
+                echo "FATAL: profiling requested but no stage timing events were emitted." >&2
+                exit 1
+            fi
             return 0
         fi
         if ! kill -0 "$ENGINE_PID" 2>/dev/null; then

@@ -13,7 +13,7 @@ Each finished arm deletes its scratch database. Original run records and logs
 remain in `benchmarks/runs/<timestamp>_dev_ablation/`.
 
 Profiling is opt-in. `PROFILE_LOGS=1` sets JSON logging and enables
-`tellodb::profile=debug` (unless `RUST_LOG` is explicitly set). Set
+`tellodb::profile=debug`, appending that target to any existing `RUST_LOG`. Set
 `TELLODB_LOG_FORMAT=json RUST_LOG=warn,tellodb::profile=debug` when running the
 engine directly. Default engine logging retains its previous text format.
 
